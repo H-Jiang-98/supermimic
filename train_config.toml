@@ -1,0 +1,44 @@
+# SuperMimic 训练起始配置（train.py 使用，默认策略为 Actor-Critic）。
+# 用法：uv run src/supermimic/scripts/train.py SuperMimic-GenCoord-G1 --config train_config.toml
+# 优先级：命令行显式参数 > 本文件 > 代码默认值；未列出的参数沿用代码默认值。
+# 每项注释中的“默认”指代码原始默认值，赋值为此前建议的较小规模起始配置。
+# 路径相对于运行命令时的工作目录；请在 supermimic/ 仓库根目录启动。
+# 多动作训练可改为 "data/motions/*.npz"，部分动作可用逗号分隔路径。
+
+num_envs = 1024 # 默认：4096；并行仿真环境数。
+motion_file = "data/motions/run1_subject5.npz" # 默认：None；未指定本地文件时使用 W&B registry。
+eager = false # 默认：false；true 关闭 PyTorch 编译和 learner CUDA graphs，供短程排查。
+# device = "cuda:0" # 默认：None；自动选择可用的 CUDA，否则 CPU。
+
+[runner]
+run_name = "lafan1_single_baseline" # 默认：None；自动生成运行名称。
+buffer_size = 1000 # 默认：1000；每个环境的历史步数，总容量随 num_envs 成比例增长。
+max_iterations = 100000 # 默认：1000000；采集循环次数，每次所有环境各走一步，不是 epoch。
+replay_ratio = 16 # 默认：16；学习量/采集量比例，实际更新频率还取决于 WM batch 和 horizon。
+sampling_mode = "return" # 默认："return"；其他可选值：uniform、adaptive、start。
+log_interval = 10 # 默认：10；每多少个采集步输出日志。
+save_interval = 1000 # 默认：1000；每多少个采集步保存本地 checkpoint。
+headless = true # 默认：true；训练时不打开可视化窗口。
+cuda_graphs = true # 默认：true；预热后捕获 learner CUDA graphs；eager=true 时会关闭。
+
+[runner.wm]
+lr = 2e-4 # 默认：2e-4；世界模型学习率。
+batch_size = 512 # 默认：2048；每个 minibatch 的序列数。
+num_batches = 10 # 默认：10；一次世界模型更新包含的 minibatch 数。
+horizon = 8 # 默认：8；序列帧数，当前实现计算其中 7 步预测损失；不能超过 buffer_size。
+
+[runner.policy]
+lr = 2e-4 # 默认：2e-4；策略和 critic 的学习率。
+batch_size = 1024 # 默认：4096；世界模型中的并行 rollout 数。
+num_batches = 1 # 默认：1；一次策略更新包含的 rollout batch 数。
+horizon = 32 # 默认：32；每条 rollout 的步数，50 Hz 下为 0.64 秒。
+gamma = 0.99 # 默认：0.99（Actor-Critic）；回报折扣因子。
+lam = 0.95 # 默认：0.95（Actor-Critic）；critic 的 GAE lambda。
+noise = 0.1 # 默认：0.1；仿真采集时的动作探索噪声。
+survival_masking = true # 默认：true；根据存活概率衰减 rollout 后续奖励。
+beta2 = 0.95 # 默认：0.95；策略 Adam 优化器的二阶矩衰减系数。
+grad_clip_value = 0.1 # 默认：0.1；策略梯度的逐元素裁剪阈值。
+
+[env.sim.mujoco]
+iterations = 20 # 当前任务默认：10； 约束求解器的外层迭代上限。
+ls_iterations = 50 # 当前任务默认：20；每次线搜索的迭代上限。

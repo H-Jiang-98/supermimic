@@ -462,10 +462,18 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     raise NotImplementedError
 
   def _create_log_dir(self, *extra_parts: str) -> Path:
-    """Create and return a timestamped log directory."""
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = Path("logs", self.task_id, *extra_parts, timestamp)
-    log_dir.mkdir(parents=True, exist_ok=True)
+    """Use the configured run name, falling back to a timestamp when unset."""
+    name = self.cfg.run_name or datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    if Path(name).name != name or name in (".", ".."):
+      raise ValueError("runner.run_name must be a single directory name")
+    log_dir = Path("logs", self.task_id, *extra_parts, name)
+    try:
+      log_dir.mkdir(parents=True, exist_ok=False)
+    except FileExistsError as error:
+      raise FileExistsError(
+        f"Log directory already exists: {log_dir}. "
+        "Choose a different runner.run_name to preserve existing checkpoints."
+      ) from error
     print(f"[INFO] Logging to {log_dir}")
     return log_dir
 
