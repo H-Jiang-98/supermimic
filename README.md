@@ -126,6 +126,70 @@ uv run src/supermimic/scripts/train.py SuperMimic-GenCoord-G1 \
   --config train_config.toml --help
 ```
 
+## 快速开始：W&B
+
+项目已接入 W&B，可在线记录训练配置、指标和模型 checkpoint。先完成下方
+[Setup](#setup)，并按前面的数据处理步骤准备
+`data/motions/run1_subject5.npz`。以下命令在 `supermimic/` 仓库根目录执行。
+
+### 1. 登录 W&B
+
+在浏览器登录 [W&B 设置页面](https://wandb.ai/settings)，创建并复制 API Key，
+然后在终端执行：
+
+```bash
+cd ~/Github_Repos/WBC/supermimic_ws/supermimic
+WANDB_MODE=online uv run wandb login
+```
+
+按终端提示粘贴 API Key 并回车。更换账号时执行
+`WANDB_MODE=online uv run wandb login --relogin`。
+登录方式见 [W&B 官方说明](https://github.com/wandb/wandb#quickstart)。
+
+### 2. 启动训练并上传指标
+
+若需要指定 W&B 团队，在启动训练前执行以下命令，将占位内容替换为你有写入权限的
+团队标识；不设置时使用账号的默认归属：
+
+```bash
+export WANDB_ENTITY="你的团队标识"
+```
+
+使用当前配置训练动作，并将指标上传到 `supermimic` 项目：
+```bash
+CUDA_VISIBLE_DEVICES=0 WANDB_MODE=online \
+  uv run src/supermimic/scripts/train.py SuperMimic-GenCoord-G1 \
+  --config train_config.toml \
+  --runner.wandb-project supermimic \
+  --runner.run-name "lafan1_all_$(date +%Y%m%d_%H%M%S)"
+```
+
+**在线训练应使用 `WANDB_MODE=online`，不要沿用前面示例的 `WANDB_MODE=disabled`。**
+运行名附加时间戳，以免与已有日志目录重名；当前代码会拒绝复用同名目录。
+
+### 3. 查看训练结果
+
+启动后，打开终端打印的 **`View run at ...`** 链接，即可查看该次训练的配置和曲线。
+主要指标包括世界模型预测损失（`Loss/*`）、策略与价值函数指标（`Policy/*`）、
+仿真回报与回合长度（`Train/*`）、动作跟踪误差（`Metrics/motion/*`）、
+奖励分项（`Episode_Reward/*`）、终止原因（`Episode_Termination/*`）和性能（`Perf/*`）。
+
+默认配置下，本地运行目录如下：
+
+```text
+logs/SuperMimic-GenCoord-G1/<运行名>/
+├── world_model.pt
+├── actor.pt
+├── critic.pt
+└── wandb/
+```
+
+修改 `[runner].log_root` 或传入 `--runner.log-root /path/to/training_logs`
+可更换根目录；W&B 本地文件也保存在该运行目录下。
+第一次世界模型和策略更新需要编译，可能几分钟没有新的训练日志；
+终端会打印首次更新的开始和完成提示。排查方式见
+[Diagnosing startup stalls](#diagnosing-startup-stalls)。
+
 ## Setup
 
 Install [uv](https://docs.astral.sh/uv/):
