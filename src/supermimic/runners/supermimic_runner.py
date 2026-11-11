@@ -48,6 +48,8 @@ class BaseRunnerCfg:
 
   wandb_project: str = "supermimic"
   run_name: str | None = None
+  log_root: str = "logs"
+  """Root directory for run logs and checkpoints; relative to the working directory."""
   wandb_run_path: str | None = None
   headless: bool = True
   cuda_graphs: bool = True
@@ -462,11 +464,13 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     raise NotImplementedError
 
   def _create_log_dir(self, *extra_parts: str) -> Path:
-    """Use the configured run name, falling back to a timestamp when unset."""
+    """Create a run directory under log_root, using a timestamp if no name is set."""
     name = self.cfg.run_name or datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     if Path(name).name != name or name in (".", ".."):
       raise ValueError("runner.run_name must be a single directory name")
-    log_dir = Path("logs", self.task_id, *extra_parts, name)
+    log_dir = (
+      Path(self.cfg.log_root).expanduser().joinpath(self.task_id, *extra_parts, name)
+    )
     try:
       log_dir.mkdir(parents=True, exist_ok=False)
     except FileExistsError as error:
@@ -488,6 +492,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     wandb.init(
       project=self.cfg.wandb_project,
       name=self.cfg.run_name or default_name,
+      dir=str(log_dir),
       config=wandb_config,
     )
 

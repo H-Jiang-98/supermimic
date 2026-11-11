@@ -12,6 +12,8 @@ eager = false # 默认：false；true 关闭 PyTorch 编译和 learner CUDA grap
 
 [runner]
 run_name = "lafan1_single_baseline" # 默认：None；自动生成运行名称。
+log_root = "logs" # 默认："logs"；日志和 checkpoint 根目录，支持绝对路径、相对路径和 ~。
+# 输出目录：<log_root>/<任务名>/<run_name>/；未设置 run_name 时使用时间戳。
 buffer_size = 1000 # 默认：1000；每个环境的历史步数，总容量随 num_envs 成比例增长。
 max_iterations = 100000 # 默认：1000000；采集循环次数，每次所有环境各走一步，不是 epoch。
 replay_ratio = 16 # 默认：16；学习量/采集量比例，实际更新频率还取决于 WM batch 和 horizon。

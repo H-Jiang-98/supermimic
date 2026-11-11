@@ -88,6 +88,22 @@ TOML 使用下划线键名（如 `batch_size`），命令行使用连字符
 （如 `--runner.wm.batch-size`）。配置文件和 motion 文件的相对路径均相对于
 运行命令时的工作目录；省略 `--config` 时保留原来的代码默认行为。
 
+在配置文件的 `[runner]` 中设置 `log_root` 可以指定日志和 checkpoint 的根目录：
+
+```toml
+[runner]
+log_root = "/path/to/training_logs" # 默认："logs"；也支持相对路径和 ~。
+run_name = "lafan1_single_baseline"
+```
+
+实际保存目录为 `<log_root>/<任务名>/<run_name>/`，未设置 `run_name` 时使用时间戳。
+例如上面的配置会写入
+`/path/to/training_logs/SuperMimic-GenCoord-G1/lafan1_single_baseline/`，
+W&B 启用时的本地文件也保存在该运行目录下。
+相对 `log_root` 以启动命令的工作目录为基准；也可通过
+`--runner.log-root /path/to/training_logs` 临时覆盖。
+同名运行目录已存在时会报错，以免覆盖已有 checkpoint。
+
 先用小规模配置验证采样及世界模型、策略更新：
 
 ```bash
