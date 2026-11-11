@@ -22,10 +22,10 @@ from mjlab.utils.lab_api.math import (
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
-  from mjlab.tasks.tracking.mdp.commands import MotionLoader
-  from mjlab.utils.forward_kinematics import ForwardKinematics
 
+  from supermimic.motion_loader import MotionLoader
   from supermimic.sim_context import SimContext
+  from supermimic.utils.forward_kinematics import ForwardKinematics
 
 from supermimic.utils.analytic_ik import AnalyticIK
 from supermimic.utils.gencoord_helpers import (

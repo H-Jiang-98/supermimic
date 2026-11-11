@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+from dataclasses import fields
 from typing import cast
 
 import mjlab.envs.mdp as mdp
 import torch
 from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
-from mjlab.managers import ObservationGroupCfg, ObservationTermCfg
+from mjlab.managers import ObservationGroupCfg, ObservationTermCfg, TerminationTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.tasks.tracking.config.g1.env_cfgs import unitree_g1_flat_tracking_env_cfg
 from mjlab.tasks.tracking.mdp.commands import MotionCommand
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 
+from supermimic.motion_command import MotionCommandCfg, motion_end
 from supermimic.representations import (
   PROPRIO_NOISE_HALF_WIDTHS,
   assemble_anchor_window,
@@ -163,7 +165,16 @@ def gencoord_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   """Create generalized-coordinate world model environment configuration based on G1 tracking."""
   cfg = unitree_g1_flat_tracking_env_cfg(play=play)
 
+  base_motion = cfg.commands["motion"]
+  cfg.commands["motion"] = MotionCommandCfg(
+    **{
+      field.name: getattr(base_motion, field.name)
+      for field in fields(base_motion)
+      if field.init
+    }
+  )
   cfg.commands["motion"].anchor_body_name = "pelvis"
+  cfg.terminations["motion_end"] = TerminationTermCfg(func=motion_end, time_out=True)
 
   cfg.observations["actor"] = _sensor_actor_group()
 

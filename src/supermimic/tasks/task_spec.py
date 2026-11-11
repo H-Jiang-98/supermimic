@@ -20,8 +20,7 @@ from tensordict import TensorDict
 from supermimic.representations import actor_goal_dim
 
 if TYPE_CHECKING:
-  from mjlab.tasks.tracking.mdp.commands import MotionLoader
-
+  from supermimic.motion_loader import MotionLoader
   from supermimic.representations import StateRepresentation
 
 

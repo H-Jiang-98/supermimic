@@ -26,6 +26,7 @@ from supermimic.tasks.task_spec import (
   TaskSpec,
   build_actor_obs_td,
 )
+from supermimic.utils.ghost_model import set_ghost_body_poses
 
 
 def create_wm_vis_model(base_model: mujoco.MjModel) -> mujoco.MjModel:
@@ -179,20 +180,26 @@ class SuperMimicViewerMixin:
         return
       if isinstance(self.representation, MaxCoordRepresentation):
         if self.wm_vis_xpos is not None:
-          viz.add_ghost_bodies(
+          qpos = set_ghost_body_poses(
+            self.wm_vis_model,
+            self.mj_body_ids,
+            self.wm_vis_xpos,
+            self.wm_vis_xquat,
+          )
+          viz.add_ghost_mesh(
+            qpos,
             model=self.wm_vis_model,
-            body_ids=self.mj_body_ids,
-            body_xpos=self.wm_vis_xpos,
-            body_xquat=self.wm_vis_xquat,
+            alpha=0.8,
             label="wm_prediction",
           )
       else:
         if self.wm_vis_qpos is not None:
-          viz.add_ghost_entity(
+          viz.add_ghost_mesh(
             self.wm_vis_qpos,
             model=self.wm_vis_model,
             mocap_pos=self.wm_vis_mocap_pos,
             mocap_quat=self.wm_vis_mocap_quat,
+            alpha=0.8,
             label="wm_prediction",
           )
 

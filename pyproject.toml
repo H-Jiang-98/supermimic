@@ -11,13 +11,17 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.13,<3.14"
 dependencies = [
-    "mjlab",
+    "mjlab==1.6.0",
     "ruff>=0.14.10",
     "viser>=1.0.24",
 ]
 
+[tool.uv]
+# Keep the validated PyTorch/CUDA 13.0 and Warp versions reproducible.
+constraint-dependencies = ["torch==2.14.0", "warp-lang==1.18.0"]
+
 [tool.uv.sources]
-mjlab = { path = "../mjlab_research", editable = true }
+mjlab = { path = "../mjlab_for_supermimic", editable = true }
 
 [tool.ruff]
 src = ["src"]
