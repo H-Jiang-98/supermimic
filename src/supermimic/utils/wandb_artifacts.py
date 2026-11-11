@@ -46,14 +46,20 @@ def download_artifact_cached(artifact: Any) -> Path:
   return Path(path)
 
 
-def download_model_dir(run: Any) -> Path:
-  """Local dir of a run's ``:latest`` model-checkpoint artifact (digest-cached)."""
+def download_model_dir(run: Any, checkpoint: str = "latest") -> Path:
+  """Download a model version or alias logged by this run (digest-cached)."""
+  models = [a for a in run.logged_artifacts() if a.type == "model"]
   artifact = next(
-    (a for a in run.logged_artifacts() if a.type == "model" and "latest" in a.aliases),
+    (a for a in models if a.version == checkpoint or checkpoint in a.aliases),
     None,
   )
   if artifact is None:
-    raise RuntimeError(f"No 'model' artifact found for run {run.id}")
+    available = ", ".join(a.name for a in sorted(models, key=_version_index)) or "none"
+    raise RuntimeError(
+      f"No 'model' checkpoint {checkpoint!r} found for run {run.id}. "
+      f"Available models: {available}"
+    )
+  print(f"[INFO] Loading model checkpoint: {artifact.name} (requested: {checkpoint})")
   return download_artifact_cached(artifact)
 
 

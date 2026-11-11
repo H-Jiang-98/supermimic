@@ -167,12 +167,9 @@ CUDA_VISIBLE_DEVICES=0 WANDB_MODE=online \
 **在线训练应使用 `WANDB_MODE=online`，不要沿用前面示例的 `WANDB_MODE=disabled`。**
 运行名附加时间戳，以免与已有日志目录重名；当前代码会拒绝复用同名目录。
 
-### 3. 查看训练结果
+### 3. 日志与训练结果
 
-启动后，打开终端打印的 **`View run at ...`** 链接，即可查看该次训练的配置和曲线。
-主要指标包括世界模型预测损失（`Loss/*`）、策略与价值函数指标（`Policy/*`）、
-仿真回报与回合长度（`Train/*`）、动作跟踪误差（`Metrics/motion/*`）、
-奖励分项（`Episode_Reward/*`）、终止原因（`Episode_Termination/*`）和性能（`Perf/*`）。
+训练曲线、checkpoint 选择及可视化用法见 [评估与可视化](README_eval.md)。
 
 默认配置下，本地运行目录如下：
 
@@ -247,8 +244,6 @@ This checkout implements the required extensions in SuperMimic:
 - `motion_command.py`: external sampling distributions used by the default
   return-based sampler, clip-end truncation, and reset updates that preserve the
   sampled frame and do not advance unrelated environments.
-- Playback uses public mjlab's `add_ghost_mesh()` for both representations;
-  maximal-coordinate predictions set rest poses on a visualization-only model.
 - ONNX exports use public mjlab's per-observation metadata, with the actor's
   sensor history length and one sample per goal. The legacy history-length key
   is retained as a matching alias for existing deployment tools.
@@ -283,7 +278,6 @@ check. To inspect the training options:
 
 ```bash
 uv run src/supermimic/scripts/train.py SuperMimic-GenCoord-G1 --help
-uv run src/supermimic/scripts/play.py SuperMimic-GenCoord-G1 --help
 ```
 
 Training needs either access to the default W&B motion artifact or a local
@@ -334,12 +328,10 @@ CUDA_VISIBLE_DEVICES=<GPU_ID> uv run src/supermimic/scripts/train.py \
   <TASK_ID> --runner.run_name <description>
 ```
 
-Play back a trained model:
+## 评估与可视化
 
-```bash
-uv run src/supermimic/scripts/play.py \
-  <TASK_ID> --wandb-path <RUN_PATH>
-```
+播放配置、W&B checkpoint 选择、三个机器人的含义及仿真警告排查，
+统一见 [README_eval.md](README_eval.md)。
 
 ## Acknowledgements
 

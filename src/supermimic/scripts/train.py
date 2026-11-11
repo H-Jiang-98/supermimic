@@ -5,9 +5,9 @@ from __future__ import annotations
 import argparse
 import os
 import tomllib
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 
 import mjlab.tasks  # noqa: F401
 import torch
@@ -18,6 +18,7 @@ from mjlab.tasks.registry import list_tasks, load_env_cfg
 import supermimic.tasks  # noqa: F401
 from supermimic.motion_command import MotionCommandCfg
 from supermimic.runners.supermimic_runner import SuperMimicRunner, SuperMimicRunnerCfg
+from supermimic.scripts.config_utils import config_args as _config_args
 from supermimic.scripts.train_utils import (
   create_env,
   download_registry_motions,
@@ -51,34 +52,6 @@ class TrainConfig:
       env=env_cfg,
       runner=SuperMimicRunnerCfg(),
     )
-
-
-def _config_args(values: dict[str, Any], defaults: Any, prefix: str = "") -> list[str]:
-  """Translate TOML settings to typed CLI inputs, keeping Tyro's validation."""
-  if is_dataclass(defaults) and not isinstance(defaults, type):
-    known = {field.name: getattr(defaults, field.name) for field in fields(defaults)}
-  elif isinstance(defaults, dict):
-    known = defaults
-  else:
-    raise ValueError(f"{prefix.rstrip('.')} is not a settings table")
-
-  args: list[str] = []
-  for key, value in values.items():
-    name = f"{prefix}{key}"
-    if key not in known or name == "config":
-      raise ValueError(f"Unknown training setting: {name}")
-    if isinstance(value, dict):
-      args.extend(_config_args(value, known[key], f"{name}."))
-      continue
-    if isinstance(value, list):
-      # TOML has only arrays; Tyro distinguishes Python tuples from lists.
-      value = repr(tuple(value) if isinstance(known[key], tuple) else value)
-    elif isinstance(value, (str, bool, int, float)):
-      value = str(value)
-    else:
-      raise ValueError(f"Unsupported value for training setting: {name}")
-    args.extend([f"--{name.replace('_', '-')}", value])
-  return args
 
 
 def parse_train_args(argv: list[str] | None = None) -> tuple[str, TrainConfig]:

@@ -1,0 +1,21 @@
+# SuperMimic 播放配置。在仓库根目录执行：
+# uv run src/supermimic/scripts/play.py SuperMimic-GenCoord-G1 --config play_config.toml
+# 优先级：命令行显式参数 > 本文件 > 播放默认值。
+# 相对路径以启动命令的工作目录为准；本文件不会自动加载，需传 --config。
+
+wandb_path = "YOUR_ENTITY/supermimic/91lwm1v7" # 将 YOUR_ENTITY 改为 W&B 用户名或团队名。
+checkpoint = "latest" # W&B model artifact 的版本或别名，例如 "v25"、"v32"、"latest"。
+motion_file = "data/motions/*.npz" # 单条 NPZ 或 glob；注释掉时使用 run 关联的 motion artifacts。
+viewer = "viser" # 可选：viser（网页）、native（本地窗口）、auto。
+initial_task = "motion" # 可选：motion、velocity；仅选择实际训练过的任务分支。
+# device = "cuda:0" # 未设置时自动选择 CUDA，否则 CPU。
+num_steps_rollout = 1000000 # 世界模型预测重置间隔，不是播放总步数。
+
+[sim]
+nconmax = 256 # 单环境接触/碰撞候选容量；BROADPHASE 溢出时继续提高。
+# njmax = 1024 # 可选：约束容量；未设置时沿用 run 保存值或任务默认值。
+
+[sim.mujoco]
+iterations = 100 # 求解器迭代上限。
+ls_iterations = 50 # 线搜索迭代上限；仍报警时可继续提高，例如 100。
+# 注释掉上述求解器参数时，优先恢复 run 保存值，再回退到任务默认值。
