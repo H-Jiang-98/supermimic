@@ -98,16 +98,21 @@ class CapturedUpdate:
     fn: Callable[[TensorDict], dict[str, torch.Tensor]],
     state: Callable[[], list[torch.Tensor]],
     warmup: int = 3,
+    *,
+    enabled: bool = True,
   ):
     self._fn = fn
     self._state = state
     self._warmup = warmup
+    self._enabled = enabled
     self._inputs: TensorDict | None = None
     self._graph: torch.cuda.CUDAGraph | None = None
     self._identity: list[int] = []
     self._outputs: dict[str, torch.Tensor] = {}
 
   def __call__(self, inputs: TensorDict) -> dict[str, torch.Tensor]:
+    if not self._enabled:
+      return self._fn(inputs)
     state = self._state()
     if not state[0].is_cuda:
       return self._fn(inputs)
@@ -125,10 +130,12 @@ class CapturedUpdate:
         torch.cuda.current_stream().wait_stream(stream)
         return outputs
       if self._graph is None:
+        print(f"[INFO] Capturing CUDA graph: {self._fn.__qualname__}", flush=True)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, pool=pool, stream=stream):
           self._outputs = self._fn(self._inputs)
         self._graph, self._identity = graph, _identity(self._state())
+        print(f"[INFO] CUDA graph ready: {self._fn.__qualname__}", flush=True)
       elif _identity(state) != self._identity:
         raise RuntimeError("a captured tensor moved")
       self._graph.replay()

@@ -6,6 +6,7 @@ import os
 from dataclasses import dataclass
 
 import mjlab.tasks  # noqa: F401
+import torch
 import tyro
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.tasks.registry import list_tasks, load_env_cfg
@@ -29,6 +30,11 @@ class TrainConfig:
   device: str | None = None
   registry_name: str | None = "supermimic/wandb-registry-motions/lafan_run1_subject5"
   motion_file: str | None = None
+  eager: bool = False
+  """Diagnose startup stalls without torch.compile or learner CUDA graphs.
+
+  MuJoCo/Warp simulator kernel compilation is still required.
+  """
 
   @staticmethod
   def from_task(task_id: str) -> "TrainConfig":
@@ -56,6 +62,10 @@ def main() -> None:
   )
 
   device = setup_device(args.device)
+  if args.eager:
+    torch.compiler.set_stance("force_eager")
+    args.runner.cuda_graphs = False
+    print("[INFO] Eager diagnostics: torch.compile and learner CUDA graphs disabled.")
   print(f"[INFO] Loading environment: {chosen_task}")
 
   if args.motion_file:

@@ -52,6 +52,8 @@ class WorldModelLearner:
     representation: StateRepresentation,
     cfg: WorldModelLearnerCfg,
     device: str = "cpu",
+    *,
+    cuda_graphs: bool = True,
   ) -> None:
     self.dynamics = dynamics
     self.representation = representation
@@ -73,6 +75,7 @@ class WorldModelLearner:
     self._captured_update = CapturedUpdate(
       self._update_from,
       lambda: graph_state([dynamics, representation], self.optimizers),
+      enabled=cuda_graphs,
     )
 
   def update_normalization(self, states: torch.Tensor, actions: torch.Tensor) -> None:

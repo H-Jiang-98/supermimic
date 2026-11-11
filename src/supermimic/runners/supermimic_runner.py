@@ -50,6 +50,8 @@ class BaseRunnerCfg:
   run_name: str | None = None
   wandb_run_path: str | None = None
   headless: bool = True
+  cuda_graphs: bool = True
+  """Capture learner updates as CUDA graphs after warmup."""
   buffer_size: int = 1000
   representation: str = "gencoord"  # "gencoord" or "maxcoord"
   actor_obs: str = "rep_state"  # "rep_state" or "proprio"
@@ -283,7 +285,11 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       device=self.device,
     )
     self.world_model_learner = WorldModelLearner(
-      self._dynamics, self._representation, self.cfg.wm, device=self.device
+      self._dynamics,
+      self._representation,
+      self.cfg.wm,
+      device=self.device,
+      cuda_graphs=self.cfg.cuda_graphs,
     )
 
     self._pending_norm_updates: list[tuple] = []
@@ -542,11 +548,20 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
 
     if isinstance(policy_cfg, ActorCriticPolicyLearnerCfg):
       self.policy_learner = ActorCriticPolicyLearner(
-        actor, critic, self.wm_env, policy_cfg, device=self.device
+        actor,
+        critic,
+        self.wm_env,
+        policy_cfg,
+        device=self.device,
+        cuda_graphs=self.cfg.cuda_graphs,
       )
     else:
       self.policy_learner = BpttPolicyLearner(
-        actor, self.wm_env, policy_cfg, device=self.device
+        actor,
+        self.wm_env,
+        policy_cfg,
+        device=self.device,
+        cuda_graphs=self.cfg.cuda_graphs,
       )
 
   def _build_sim_obs_td(
@@ -676,6 +691,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     log_count = 0
     uploader = ThreadPoolExecutor(max_workers=1)
     upload: Future | None = None
+    first_update = True
 
     for step in range(self.cfg.max_iterations):
       num_collected_steps += self.step()
@@ -690,12 +706,26 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         )
 
         start_wm_time = time.time()
+        if first_update:
+          print(
+            f"[INFO] First world-model update at simulation step {step}; "
+            "initialization/compilation may take several minutes.",
+            flush=True,
+          )
         wm_logs = self.world_model_learner.update(data)
         wm_learn_time += time.time() - start_wm_time
 
         start_policy_time = time.time()
+        if first_update:
+          print(
+            "[INFO] First world-model update returned; starting first policy update.",
+            flush=True,
+          )
         policy_logs = self.policy_learner.update()
         policy_learn_time += time.time() - start_policy_time
+        if first_update:
+          print("[INFO] First policy update returned.", flush=True)
+          first_update = False
 
         loss_dict.update(wm_logs)
         loss_dict.update(policy_logs)

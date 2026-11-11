@@ -67,6 +67,8 @@ class BpttPolicyLearner:
     wm_env: WorldModelEnv,
     cfg: BpttPolicyLearnerCfg,
     device: str = "cpu",
+    *,
+    cuda_graphs: bool = True,
   ):
     self.actor = policy
     self.wm_env = wm_env
@@ -78,7 +80,9 @@ class BpttPolicyLearner:
     self._rollout_actor = (
       torch.compile(self.actor) if torch.device(device).type == "cuda" else self.actor
     )
-    self._captured_update = CapturedUpdate(self._update_from, self._graph_state)
+    self._captured_update = CapturedUpdate(
+      self._update_from, self._graph_state, enabled=cuda_graphs
+    )
 
   def update(self) -> dict[str, torch.Tensor]:
     self.actor.train()
@@ -156,8 +160,10 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
     wm_env: WorldModelEnv,
     cfg: ActorCriticPolicyLearnerCfg,
     device: str = "cpu",
+    *,
+    cuda_graphs: bool = True,
   ):
-    super().__init__(policy, wm_env, cfg, device)
+    super().__init__(policy, wm_env, cfg, device, cuda_graphs=cuda_graphs)
     self.critic = critic
     self.critic_optimizers = build_optimizers([critic], self.cfg.lr, device=device)
     self._v_max = self.wm_env.max_step_reward / (1 - self.cfg.gamma)
