@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import copy
 import os
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 import torch.nn as nn
@@ -30,6 +30,9 @@ from mjlab.tasks.tracking.mdp import MotionCommand
 
 from supermimic.models import MultiEncoderAE
 from supermimic.representations import term_major_to_temporal
+
+if TYPE_CHECKING:
+  from mjlab.managers import ObservationTermCfg
 
 
 def _export_onnx(
@@ -197,6 +200,42 @@ def _tracking_metadata(env: ManagerBasedRlEnv, run_name: str) -> dict:
   return metadata
 
 
+def _observation_metadata(
+  env: ManagerBasedRlEnv,
+  history_length: int,
+  goal_terms: tuple[tuple[str, ObservationTermCfg | None], ...] = (),
+) -> dict[str, list]:
+  """Describe the exported flat, term-major input rather than env history.
+
+  The runner owns sensor history, so the actor's window overrides the env's
+  per-term history settings. Goals use one current sample; a synthetic goal
+  (the velocity command) has no observation config and passes through unchanged.
+  """
+  manager = env.observation_manager
+  terms = [
+    (name, manager.get_term_cfg("actor", name), history_length)
+    for name in manager.active_terms["actor"]
+  ] + [(name, cfg, 1) for name, cfg in goal_terms]
+  scales, clips = [], []
+  for _, cfg, _ in terms:
+    scale = cfg.scale if cfg is not None else None
+    if isinstance(scale, torch.Tensor):
+      scale = scale.detach().cpu().tolist()
+    scales.append(1.0 if scale is None else scale)
+    clip = cfg.clip if cfg is not None else None
+    clips.append([float("-inf"), float("inf")] if clip is None else list(clip))
+  histories = [history for _, _, history in terms]
+  return {
+    "observation_names": [name for name, _, _ in terms],
+    "observation_terms_scale": scales,
+    "observation_terms_clip": clips,
+    "observation_terms_history_length": histories,
+    "observation_terms_flatten_history_dim": [True] * len(terms),
+    # Keep the private-fork deployment key consistent for existing consumers.
+    "observation_history_lengths": histories.copy(),
+  }
+
+
 def _export_motion_graph(
   wrapper: _MotionDeployWrapper,
   path: str,
@@ -223,16 +262,12 @@ def _export_motion(
   wrapper = _MotionDeployWrapper(actor, env, "motion", term_widths)
   onnx_path = _export_motion_graph(wrapper, path, filename)
   metadata = _tracking_metadata(env, run_name)
-  actor_terms = list(metadata["observation_names"])
-  actor_goal_names = [
-    n
+  goal_terms = tuple(
+    (n, env.observation_manager.get_term_cfg("goal", n))
     for n in env.observation_manager.active_terms["goal"]
     if n != "motion_anchor_pos_b"
-  ]
-  metadata["observation_names"] = actor_terms + actor_goal_names
-  metadata["observation_history_lengths"] = [actor.history_length] * len(
-    actor_terms
-  ) + [1] * len(actor_goal_names)
+  )
+  metadata.update(_observation_metadata(env, actor.history_length, goal_terms))
   attach_metadata_to_onnx(onnx_path, metadata)
 
 
@@ -252,9 +287,7 @@ def _export_velocity_replay(
   wrapper = _MotionDeployWrapper(actor, env, "velocity", term_widths, command_table)
   onnx_path = _export_motion_graph(wrapper, path, filename)
   metadata = _tracking_metadata(env, run_name)
-  metadata["observation_history_lengths"] = [actor.history_length] * len(
-    metadata["observation_names"]
-  )
+  metadata.update(_observation_metadata(env, actor.history_length))
   attach_metadata_to_onnx(onnx_path, metadata)
   return onnx_path
 
@@ -277,12 +310,10 @@ def _export_velocity(
     filename,
   )
   metadata = get_base_metadata(env, run_name)
-  actor_terms = list(metadata["observation_names"])
-  metadata["observation_names"] = actor_terms + ["command"]
   metadata["command_names"] = ["twist"]
-  metadata["observation_history_lengths"] = [actor.history_length] * len(
-    actor_terms
-  ) + [1]
+  metadata.update(
+    _observation_metadata(env, actor.history_length, (("command", None),))
+  )
   attach_metadata_to_onnx(onnx_path, metadata)
 
 
