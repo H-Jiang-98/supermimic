@@ -69,14 +69,21 @@ def log_model_artifact(
   Named ``model-{run.id}``: artifact names are project-level keys and run names
   may repeat. Keeps the newest ``keep_last`` versions, every
   ``milestone_every``-th version, and any aliased version; deletes the rest.
+  Disabled runs keep only the caller's local checkpoints. Offline runs queue
+  artifacts for later sync, without querying or pruning the online registry.
   """
-  assert wandb.run is not None, "log_model_artifact needs an active wandb run"
+  run = wandb.run
+  assert run is not None, "log_model_artifact needs an active wandb run"
+  if run.disabled:
+    return
   try:
-    artifact = wandb.Artifact(f"model-{wandb.run.id}", type="model")
+    artifact = wandb.Artifact(f"model-{run.id}", type="model")
     for path in files:
       artifact.add_file(path)
-    wandb.run.log_artifact(artifact)
-    collection = f"{wandb.run.entity}/{wandb.run.project}/model-{wandb.run.id}"
+    run.log_artifact(artifact)
+    if run.offline:
+      return
+    collection = f"{run.entity}/{run.project}/model-{run.id}"
     versions = sorted(wandb.Api().artifacts("model", collection), key=_version_index)
     for stale in versions[:-keep_last]:
       if _version_index(stale) % milestone_every != 0 and not stale.aliases:
