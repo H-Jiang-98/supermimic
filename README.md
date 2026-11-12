@@ -202,12 +202,31 @@ logs/SuperMimic-GenCoord-G1/<运行名>/
 
 ```bash
 WANDB_MODE=online uv run wandb login
-WANDB_MODE=online uv run wandb sync \
+WANDB_MODE=online uv run wandb beta sync \
+  --entity "你的账号或团队标识" \
+  --project supermimic \
+  --no-skip-synced \
+  --verbose \
   "logs/SuperMimic-GenCoord-G1/<运行名>/wandb/offline-run-<时间>-<ID>"
 ```
 
 该命令上传离线记录的指标、配置和模型 artifacts。`WANDB_MODE=disabled`
 不会生成可供后续同步的 W&B 离线记录。
+
+通过本地 `download_training.sh` 完整下载日志和 artifacts 后，脚本会校验模型
+文件的大小及 MD5，并将 `.wandb` 中的服务器暂存路径映射为本地绝对路径，打印
+可在本机执行的同步命令。原始记录保留为 `*.wandb.before-path-map`；模型文件
+和训练指标保持原样，脚本本身不上传数据。`--logs-only` 不处理这些路径。
+
+已经下载的训练结果可直接处理，无需再次连接服务器：
+
+```bash
+bash download_training.sh --map-only --dry-run # 校验文件和待映射路径
+bash download_training.sh --map-only           # 映射并打印本机同步命令
+```
+
+修改脚本顶部的 `LOCAL_DOWNLOAD_ROOT`、`TASK_ID`、`RUN_NAME` 可选择其他运行；
+`PYTHON_BIN` 默认使用项目 `.venv/bin/python`，需已安装 W&B。
 
 ## Setup
 

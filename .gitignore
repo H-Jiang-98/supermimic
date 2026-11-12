@@ -222,3 +222,6 @@ __marimo__/
 # Local motion datasets, robot assets and generated clips.
 /data/
 tests/*
+downloads/*
+
+download_training.sh

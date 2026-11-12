@@ -25,13 +25,13 @@ from supermimic.runners.run_config import check_representation_matches, load_run
 from supermimic.runners.supermimic_runner import build_actor, build_world_model
 from supermimic.scripts.config_utils import config_args
 from supermimic.scripts.viewers import (
-  SuperMimicNativeViewer,
-  SuperMimicViserViewer,
-  create_wm_vis_model,
+  SuperMimicNativeViewer, # 提供本地窗口
+  SuperMimicViserViewer,  # 提供网页显示
+  create_wm_vis_model,    # 创建用于显示世界模型预测的模型副本
 )
 from supermimic.utils.wandb_artifacts import (
-  download_artifact_cached,
-  download_model_dir,
+  download_artifact_cached,  
+  download_model_dir,        
 )
 
 
@@ -113,8 +113,8 @@ def play(task_id: str, cfg: PlayConfig) -> None:
 
   print(f"[INFO] Connecting to WandB run: {cfg.wandb_path}")
   run = wandb.Api().run(cfg.wandb_path)
-  runner_cfg = load_runner_cfg(run.config)
-  check_representation_matches(task_id, runner_cfg.representation)
+  runner_cfg = load_runner_cfg(run.config)   # 从训练记录中恢复配置  
+  check_representation_matches(task_id, runner_cfg.representation)   # 检查任务与模型是否匹配 
   configure_play_simulation(env_cfg.sim, cfg.sim, run.config)
 
   motion_artifacts = [a for a in run.used_artifacts() if a.type == "motions"]
@@ -149,7 +149,7 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   wm = build_world_model(runner_cfg, env, device)
   representation = wm.representation
   dynamics = wm.dynamics
-
+  # bundle["dynamics"] 动力学网络参数， bundle["sim_context"] 仿真上下文
   wm.load_bundle(torch.load(model_dir / "world_model.pt", map_location=device))
   dynamics.eval()
 
