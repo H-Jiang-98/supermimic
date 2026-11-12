@@ -41,7 +41,7 @@ def _make_asset_obs_fn(attr_name: str, *, subtract_origins: bool = False):
 root_pos = _make_asset_obs_fn("root_link_pos_w", subtract_origins=True)
 root_ori = _make_asset_obs_fn("root_link_quat_w")
 root_lin_vel = _make_asset_obs_fn("root_link_lin_vel_w")
-root_ang_vel = _make_asset_obs_fn("root_link_ang_vel_w")
+root_ang_vel = _make_asset_obs_fn("root_link_ang_vel_b")
 joint_pos = _make_asset_obs_fn("joint_pos")
 joint_vel = _make_asset_obs_fn("joint_vel")
 
@@ -178,7 +178,8 @@ def gencoord_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
   cfg.observations["actor"] = _sensor_actor_group()
 
-  # Add full state observation group
+  # GenCoord full state: world-frame pose/linear velocity, body-frame angular
+  # velocity, and joint positions/velocities. Keep the concatenation order.
   cfg.observations["full_state"] = ObservationGroupCfg(
     terms={
       "root_pos": ObservationTermCfg(func=root_pos),

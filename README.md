@@ -302,6 +302,33 @@ with forward kinematics to agree with the world-model reward. The clip must
 already match the control frequency (50 Hz for these tasks); an optional `fps`
 field is checked, and mismatches are rejected instead of silently changing speed.
 
+### GenCoord state frames
+
+GenCoord is different from the original supermimic definition, with root angular velocity 
+in the root body frame (the pelvis for G1). The packed layout is unchanged:
+
+```text
+full_state = [p_w(3), quat_wxyz(4), qj(N), v_w(3), omega_b(3), vj(N)]
+rep_state  = [z(1), g_b(3), v_b(3), omega_b(3), qj(N), vj(N)]
+prediction = [delta_v_b(3), delta_omega_b(3), delta_vj(N)]
+```
+
+The `full_state` observation's `root_ang_vel` term reads `root_link_ang_vel_b`.
+Representation and reconstruction pass this angular velocity through directly;
+only linear velocity changes frame. Predicted velocity increments are expressed
+in the current root frame; integration transports angular velocity to the next
+root frame as `omega_b_next = E.T @ (omega_b + delta_omega_b)`, where
+`E = Exp(dt * (omega_b + c * delta_omega_b))` and `c = (m + 1) / (2 * m)` for
+`m` simulation substeps. FK and tracking rewards still use world-frame velocities,
+with `omega_w = R @ omega_b` at the FK boundary. Motion-file fields ending in `_w`
+and MaxCoord retain their world-frame convention.
+
+Network inputs, prediction semantics, parameter shapes, and current-architecture
+checkpoints are unchanged. Newly collected replay states use body-frame angular
+velocity. Any externally saved GenCoord full states from the previous convention
+must first convert their angular block using `omega_b = R.T @ omega_w`; the
+identical tensor shape cannot identify the old convention automatically.
+
 ### Verification
 
 ```bash

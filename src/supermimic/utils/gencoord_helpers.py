@@ -2,6 +2,9 @@
 
 Full state: [root_pos(3), root_quat(4), qj(N), root_lin_vel(3), root_ang_vel(3), vj(N)]
 Rep state:  [z(1), g_b(3), v_b(3), w_b(3), qj(N), vj(N)]
+
+Full-state position, orientation (wxyz quaternion), and linear velocity are in
+the world frame; angular velocity is in the root body frame in both layouts.
 """
 
 import torch
@@ -30,7 +33,7 @@ def rep_state_dim_from_state_dim(state_dim: int) -> int:
 
 
 def full_state_offsets(num_joints: int) -> tuple[int, int, int, int]:
-  """Returns start offsets for [qj, root_lin_vel, root_ang_vel, vj] in full state."""
+  """Start offsets for [qj, root_lin_vel_w, root_ang_vel_b, vj] in full state."""
   idx_qj = 7
   idx_lin = idx_qj + num_joints
   idx_ang = idx_lin + 3
@@ -50,7 +53,7 @@ def decompose_state(
 ) -> tuple[
   torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
-  """Decomposes full state into canonical components."""
+  """Return (pos_w, quat_w, qj, lin_vel_w, ang_vel_b, vj)."""
   num_joints = infer_num_joints_from_state_dim(full_state.shape[-1])
 
   idx_qj, idx_lin, idx_ang, idx_vj = full_state_offsets(num_joints)
@@ -58,10 +61,10 @@ def decompose_state(
   root_pos = full_state[..., 0:3]
   root_quat = full_state[..., 3:7]
   qj = full_state[..., idx_qj:idx_lin]
-  root_lin_vel = full_state[..., idx_lin:idx_ang]
-  root_ang_vel = full_state[..., idx_ang:idx_vj]
+  root_lin_vel_w = full_state[..., idx_lin:idx_ang]
+  root_ang_vel_b = full_state[..., idx_ang:idx_vj]
   vj = full_state[..., idx_vj : idx_vj + num_joints]
-  return root_pos, root_quat, qj, root_lin_vel, root_ang_vel, vj
+  return root_pos, root_quat, qj, root_lin_vel_w, root_ang_vel_b, vj
 
 
 def decompose_rep_state(
@@ -91,23 +94,22 @@ def decompose_rep_state(
 def compute_gencoord_state(full_state: torch.Tensor) -> torch.Tensor:
   """Converts raw full state to gencoord representation.
 
-  Uses root body frame for velocities (no heading alignment).
-  This avoids all singularities since we're just rotating to body frame.
+  Rotate world-frame linear velocity and gravity into the root body frame
+  (no heading alignment). Angular velocity is already in that frame.
   """
   (
     root_pos,
     root_quat,
     qj,
-    root_lin_vel,
-    root_ang_vel,
+    root_lin_vel_w,
+    root_ang_vel_b,
     vj,
   ) = decompose_state(full_state)
 
   z = root_pos[..., 2:3]
-  world_down = torch.zeros_like(root_lin_vel)
+  world_down = torch.zeros_like(root_lin_vel_w)
   world_down[..., 2] = -1.0
   g_b = quat_apply_inverse(root_quat, world_down)
-  v_b = quat_apply_inverse(root_quat, root_lin_vel)
-  w_b = quat_apply_inverse(root_quat, root_ang_vel)
+  v_b = quat_apply_inverse(root_quat, root_lin_vel_w)
 
-  return torch.cat([z, g_b, v_b, w_b, qj, vj], dim=-1)
+  return torch.cat([z, g_b, v_b, root_ang_vel_b, qj, vj], dim=-1)

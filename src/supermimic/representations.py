@@ -470,6 +470,8 @@ class GenCoordRepresentation(StateRepresentation):
   """Generalized-coordinate (joint-space) representation.
 
   Full state: [root_pos(3), root_quat(4), qj(N), root_lin_vel(3), root_ang_vel(3), vj(N)]
+  Full-state pose and linear velocity use the world frame; angular velocity
+  uses the root body frame. Quaternions are wxyz.
   Rep state:  [z(1), g_b(3), v_b(3), w_b(3), qj(N), vj(N)]
   Prediction: [Δv_b(3), Δw_b(3), Δvj(N)] — accel-level deltas in the current
   root frame; poses and derived channels are integrated analytically.
@@ -518,6 +520,11 @@ class GenCoordRepresentation(StateRepresentation):
     consistent state. Pose updates weight the delta by ``substep_coeff``
     to match how the sim composes its substeps; velocity states advance
     by the full delta.
+
+    This implements main_v1 Eq. (3), with c = (m + 1) / (2m):
+    E = Exp(dt * (w_b + c * dw_b)), R_next = R * E, and
+    w_b_next = E.T * (w_b + dw_b). The world-frame intermediate and
+    left-multiplied quaternion update below are equivalent to R * E.
     """
     N = self.num_joints
     c = self.substep_coeff
@@ -556,14 +563,14 @@ class GenCoordRepresentation(StateRepresentation):
   def reconstruct_full_state(
     self, aux_state: torch.Tensor, rep_state: torch.Tensor
   ) -> torch.Tensor:
+    """Rebuild world-frame pose/linear velocity and body-frame angular velocity."""
     z, _, v_b, w_b, qj, vj = decompose_rep_state(rep_state)
     root_pos = aux_state[..., :3]
     root_quat = aux_state[..., 3:7]
     # Override root Z with rep_state's z
     root_pos = torch.cat([root_pos[..., :2], z], dim=-1)
     v_global = quat_apply(root_quat, v_b)
-    w_global = quat_apply(root_quat, w_b)
-    parts = [root_pos, root_quat, qj, v_global, w_global, vj]
+    parts = [root_pos, root_quat, qj, v_global, w_b, vj]
     return torch.cat(parts, dim=-1)
 
   def loss_blocks(
@@ -582,6 +589,7 @@ class GenCoordRepresentation(StateRepresentation):
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     _, _, v_b, w_b, qj, vj = decompose_rep_state(rep_state)
     root_pos, root_quat = aux_state[..., :3], aux_state[..., 3:7]
+    # FK and tracking rewards consume world-frame velocities at this boundary.
     pos, quat, lin_vel, ang_vel = self.fk(
       root_pos,
       root_quat,
