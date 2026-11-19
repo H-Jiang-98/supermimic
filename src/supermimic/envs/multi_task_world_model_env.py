@@ -8,6 +8,7 @@ import torch
 from tensordict import TensorDict
 
 from supermimic.envs.world_model_env import WorldModelEnv
+from supermimic.estimator_inputs import EITInputConfig, PosteriorProvider
 from supermimic.tasks.task_spec import build_actor_obs_td
 
 if TYPE_CHECKING:
@@ -26,6 +27,8 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
   slot range. The obs-history ring (history_length > 1) lives in the base.
   """
 
+  _supports_estimator_inputs = True
+
   def __init__(
     self,
     dynamics: Dynamics,
@@ -37,9 +40,17 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
     history_length: int,
     termination_softness: float,
     device: str = "cpu",
+    estimator_input_config: EITInputConfig | None = None,
+    posterior_provider: PosteriorProvider | None = None,
   ) -> None:
     self.task_specs = task_specs
     assert task_specs[0].name == "motion", "task_specs[0] must be the motion task"
+    if estimator_input_config is not None and (
+      len(task_specs) != 1 or task_specs[0].goal_dim != 700
+    ):
+      raise ValueError(
+        "Estimator input v1 supports only the 700-dimensional motion task"
+      )
     super().__init__(
       dynamics=dynamics,
       representation=representation,
@@ -49,6 +60,8 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
       history_length=history_length,
       termination_softness=termination_softness,
       device=device,
+      estimator_input_config=estimator_input_config,
+      posterior_provider=posterior_provider,
     )
 
   def _build_task_goals(self) -> None:
@@ -61,6 +74,9 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
       ).clone()
 
   def get_observations(self) -> TensorDict:
-    return build_actor_obs_td(
+    obs = build_actor_obs_td(
       self._task_goal_obs, self._sensor_history(), critic=self._critic_obs()
     )
+    if self._task_uncertainty is not None:
+      obs["task_uncertainty"] = self._task_uncertainty
+    return obs

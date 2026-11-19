@@ -47,6 +47,8 @@ def benchmark(cfg: BenchmarkConfig) -> None:
   print(f"[INFO] Connecting to WandB run: {cfg.wandb_path}")
   run = wandb.Api().run(cfg.wandb_path)
   runner_cfg = load_runner_cfg(run.config)
+  if runner_cfg.estimator_inputs is not None:
+    raise NotImplementedError("benchmark does not yet provide eit_rpv_v1 posteriors")
   check_representation_matches(cfg.task_id, runner_cfg.representation)
 
   model_dir = download_model_dir(run)

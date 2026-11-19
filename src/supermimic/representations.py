@@ -20,6 +20,15 @@ from mjlab.utils.lab_api.math import (
   subtract_frame_transforms,
 )
 
+from supermimic.estimator_inputs import (
+  EpisodeAlignment,
+  GaussianMeasurementConfig,
+  ReferenceWindow,
+  RpvState,
+  apply_alignment,
+  sample_proprio,
+)
+
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
 
@@ -351,7 +360,35 @@ class StateRepresentation(nn.Module, ABC):
   def add_proprio_noise(self, obs: torch.Tensor) -> torch.Tensor:
     """Add per-dim uniform proprio jitter — the single noise site shared by the
     synthesized sensor and the real-sim / imagination history rings."""
+    measurement_config = getattr(self, "measurement_config", None)
+    if measurement_config is not None:
+      return sample_proprio(obs, measurement_config)
     return obs + ((torch.rand_like(obs) * 2 - 1) * self._proprio_noise_bounds).detach()
+
+  def configure_estimator_measurement(self, config: GaussianMeasurementConfig) -> None:
+    """Opt in to the versioned, single Gaussian measurement path."""
+    if not isinstance(self, GenCoordRepresentation) or self.num_joints != 29:
+      raise ValueError("Estimator inputs currently require G1 GenCoord (29 joints)")
+    if self.actor_obs_mode != "proprio":
+      raise ValueError("Estimator inputs require actor_obs='proprio'")
+    self.measurement_config = config
+
+  def reference_window(
+    self,
+    motion: MotionLoader,
+    motion_times: torch.Tensor,
+    alignment: EpisodeAlignment | None = None,
+  ) -> ReferenceWindow:
+    """All four goal blocks use the same clip-clamped reference indices."""
+    idx = goal_window_indices(motion, motion_times)
+    reference = ReferenceWindow(
+      joint_pos=motion.joint_pos[idx],
+      joint_vel=motion.joint_vel[idx],
+      rotation=matrix_from_quat(motion.root_quat_w[idx]),
+      position=motion.root_pos_w[idx],
+      velocity=motion.root_lin_vel_w[idx],
+    )
+    return reference if alignment is None else apply_alignment(reference, alignment)
 
   def compute_actor_sensor(
     self,
@@ -503,6 +540,16 @@ class GenCoordRepresentation(StateRepresentation):
 
   def extract_aux_state(self, full_state: torch.Tensor) -> torch.Tensor:
     return full_state[..., :7]
+
+  def true_rpv(self, aux_state: torch.Tensor, rep_state: torch.Tensor) -> RpvState:
+    """Explicit privileged R/p/v source; callers select truth or posterior."""
+    _, _, v_b, _, _, _ = decompose_rep_state(rep_state)
+    rotation = matrix_from_quat(aux_state[..., 3:7])
+    return RpvState(
+      rotation=rotation,
+      position=aux_state[..., :3],
+      velocity=(rotation @ v_b.unsqueeze(-1)).squeeze(-1),
+    )
 
   def apply_prediction(
     self,

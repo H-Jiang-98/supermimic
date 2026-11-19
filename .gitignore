@@ -222,6 +222,7 @@ __marimo__/
 # Local motion datasets, robot assets and generated clips.
 /data/
 tests/*
+!tests/test_estimator_*.py
 downloads/*
 
 download_training.sh

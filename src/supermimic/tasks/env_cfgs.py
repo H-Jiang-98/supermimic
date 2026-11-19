@@ -11,10 +11,9 @@ from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 from mjlab.managers import ObservationGroupCfg, ObservationTermCfg, TerminationTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.tasks.tracking.config.g1.env_cfgs import unitree_g1_flat_tracking_env_cfg
-from mjlab.tasks.tracking.mdp.commands import MotionCommand
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 
-from supermimic.motion_command import MotionCommandCfg, motion_end
+from supermimic.motion_command import MotionCommand, MotionCommandCfg, motion_end
 from supermimic.representations import (
   PROPRIO_NOISE_HALF_WIDTHS,
   assemble_anchor_window,
@@ -88,6 +87,8 @@ def _motion_anchor_rel(
   """
   command = cast(MotionCommand, env.command_manager.get_term(command_name))
   target_pos, target_quat = motion_anchor_window(command.motion, command.time_steps)
+  target_pos = command.align_reference_positions(target_pos)
+  target_quat = command.align_reference_quaternions(target_quat)
   target_pos = target_pos + env.scene.env_origins[:, None, :]
   return assemble_anchor_window(
     command.robot_anchor_pos_w, command.robot_anchor_quat_w, target_pos, target_quat
@@ -159,6 +160,33 @@ def _goal_obs_group() -> ObservationGroupCfg:
     concatenate_terms=True,
     enable_corruption=False,
   )
+
+
+def configure_estimator_env_cfg(cfg: ManagerBasedRlEnvCfg) -> ManagerBasedRlEnvCfg:
+  """Prepare the G1 GenCoord environment for the versioned estimator actor.
+
+  The runner owns the single Gaussian measurement draw. These terms expose its
+  clean mean in the same root/body coordinates as the synthetic sensor model.
+  Known encoder bias is compensated by reading unbiased joint position here.
+  Call before constructing the environment, not on a live observation manager.
+  """
+  motion = cfg.commands.get("motion")
+  if not isinstance(motion, MotionCommandCfg):
+    raise ValueError("Estimator inputs require the SuperMimic MotionCommandCfg")
+  full_state = cfg.observations.get("full_state")
+  if full_state is None or "root_pos" not in full_state.terms:
+    raise ValueError("Estimator inputs require the GenCoord full-state layout")
+  motion.fixed_reference_alignment = True
+  actor = cfg.observations["actor"]
+  actor.enable_corruption = False
+  for term in actor.terms.values():
+    term.noise = None
+  actor.terms["base_ang_vel"] = ObservationTermCfg(func=root_ang_vel)
+  actor.terms["joint_pos"] = ObservationTermCfg(
+    func=mdp.joint_pos_rel, params={"biased": False}
+  )
+  actor.terms["joint_vel"] = ObservationTermCfg(func=joint_vel)
+  return cfg
 
 
 def gencoord_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:

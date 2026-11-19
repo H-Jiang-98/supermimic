@@ -116,6 +116,8 @@ class MultiEncoderAE(nn.Module):
                                        decoder input
     ``obs_td[f"goal_{task.name}"]``  — full-batch goal per task; only the
                                        task's slot range is read
+    ``obs_td["task_uncertainty"]``  — task covariance features (B, uncertainty_dim),
+                                       required only when FiLM is enabled
   """
 
   def __init__(
@@ -128,15 +130,26 @@ class MultiEncoderAE(nn.Module):
     hidden_dims: tuple[int, ...],
     latent_bc_weight: float,
     history_length: int,
+    uncertainty_dim: int = 0,
+    film_hidden_dims: tuple[int, ...] = (128, 64),
+    input_version: str = "legacy",
   ):
     super().__init__()
     if not task_specs:
       raise ValueError("task_specs must be non-empty")
+    if history_length < 1:
+      raise ValueError("history_length must be positive")
+    if uncertainty_dim < 0:
+      raise ValueError("uncertainty_dim must be non-negative")
+    if uncertainty_dim and (not hidden_dims or not film_hidden_dims):
+      raise ValueError("FiLM requires decoder and uncertainty hidden layers")
     self.obs_dim = obs_dim
     self.history_length = history_length
     self.latent_dim = latent_dim
     self.latent_bc_weight = latent_bc_weight
     self.task_specs = task_specs
+    self.uncertainty_dim = uncertainty_dim
+    self.input_version = input_version
     self._task_names = [ts.name for ts in task_specs]
     # Anchor: the first task. The aux-loss hook regularizes each non-anchor
     # encoder against the anchor encoder on the same state.
@@ -158,8 +171,48 @@ class MultiEncoderAE(nn.Module):
       hidden_dims,
       output_dim=action_dim,
     )
+    # A/B have no uncertainty parameters and never access the uncertainty input.
+    # Keep the base decoder Sequential intact for legacy checkpoints; C applies
+    # its modulation between that decoder's first LayerNorm and GELU.
+    self.film: nn.Sequential | None = None
+    if uncertainty_dim:
+      self.film = build_mlp(
+        uncertainty_dim, film_hidden_dims, output_dim=2 * hidden_dims[0]
+      )
+      nn.init.zeros_(self.film[-1].weight)
+      nn.init.zeros_(self.film[-1].bias)
 
     self.set_slot_mix(slot_mix)
+
+  @torch.jit.unused
+  def copy_common_initialization_from(self, source: MultiEncoderAE) -> None:
+    """Copy base parameters and normalization buffers, without sharing storage.
+
+    Call before creating each group's optimizer. FiLM remains independently
+    initialized, so copying a B base into C preserves C's identity modulation.
+    Input-version checks prevent equal-width but differently ordered layouts
+    from being treated as compatible. The runner persists the full input config.
+    """
+    signature = (
+      "obs_dim",
+      "history_length",
+      "latent_dim",
+      "input_version",
+      "_task_names",
+    )
+    if any(getattr(self, key) != getattr(source, key) for key in signature):
+      raise ValueError(
+        "Cannot copy common initialization across different actor inputs"
+      )
+    for name in ("obs_normalizer", "goal_normalizers", "encoders", "decoder"):
+      dst_state = getattr(self, name).state_dict()
+      src_state = getattr(source, name).state_dict()
+      if dst_state.keys() != src_state.keys() or any(
+        dst_state[key].shape != src_state[key].shape for key in dst_state
+      ):
+        raise ValueError(f"Cannot copy common initialization: incompatible {name}")
+    for name in ("obs_normalizer", "goal_normalizers", "encoders", "decoder"):
+      getattr(self, name).load_state_dict(getattr(source, name).state_dict())
 
   def set_slot_mix(self, slot_mix: dict[str, float]) -> None:
     """Set fractional slot allocation per task. Missing entries default to 0."""
@@ -186,6 +239,12 @@ class MultiEncoderAE(nn.Module):
     return ranges
 
   def forward(self, obs_td: TensorDict) -> torch.Tensor:
+    history = obs_td["history"]
+    if history.shape[1:] != (self.history_length, self.obs_dim):
+      raise ValueError(
+        "Actor history must have shape "
+        f"(batch, {self.history_length}, {self.obs_dim}); got {tuple(history.shape)}"
+      )
     slots = self.slot_ranges(obs_td.shape[0])
     enc_outs: list[torch.Tensor] = []
     for name, (lo, hi) in zip(self._task_names, slots, strict=True):
@@ -197,8 +256,24 @@ class MultiEncoderAE(nn.Module):
     self._aux_loss = self._compute_aux_loss(obs_td, slots)
 
     z = torch.cat([torch.tanh(eo) for eo in enc_outs], dim=0)
-    history_n = self.obs_normalizer(obs_td["history"])
-    return self.decoder(torch.cat([z, history_n.flatten(start_dim=1)], dim=-1))
+    history_n = self.obs_normalizer(history)
+    decoder_input = torch.cat([z, history_n.flatten(start_dim=1)], dim=-1)
+    if self.film is None:
+      return self.decoder(decoder_input)
+    if "task_uncertainty" not in obs_td.keys():
+      raise ValueError("FiLM actor requires task_uncertainty input")
+    uncertainty = obs_td["task_uncertainty"]
+    if uncertainty.shape != (history.shape[0], self.uncertainty_dim):
+      raise ValueError(
+        "task_uncertainty must have shape "
+        f"(batch, {self.uncertainty_dim}); got {tuple(uncertainty.shape)}"
+      )
+    gamma, beta = self.film(uncertainty).chunk(2, dim=-1)
+    hidden = self.decoder[1](self.decoder[0](decoder_input))
+    hidden = (1.0 + gamma) * hidden + beta
+    for layer in self.decoder[2:]:
+      hidden = layer(hidden)
+    return hidden
 
   def _compute_aux_loss(
     self, obs_td: TensorDict, slots: list[tuple[int, int]]

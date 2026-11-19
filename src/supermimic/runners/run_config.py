@@ -6,6 +6,7 @@ import dataclasses
 import types
 from typing import Any, Union, get_args, get_origin, get_type_hints
 
+from supermimic.estimator_inputs import EITInputConfig
 from supermimic.runners.supermimic_runner import SuperMimicRunnerCfg
 
 
@@ -61,6 +62,9 @@ def _coerce(hint: Any, value: Any, defaulted: list[str], prefix: str) -> Any:
   is_union = origin is Union or origin is types.UnionType
   candidates = get_args(hint) if is_union else (hint,)
   variants = [c for c in candidates if _is_cfg_type(c)]
+  if EITInputConfig in variants and isinstance(value, dict):
+    # A versioned sensor/goal contract must never be silently filled from new defaults.
+    return EITInputConfig.from_dict(value)
   if variants and isinstance(value, dict):
     return _rebuild(_pick_variant(variants, value), value, defaulted, prefix)
   return value

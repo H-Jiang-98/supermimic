@@ -90,6 +90,10 @@ class _SingleEncoderOnnx(nn.Module):
     self, actor: MultiEncoderAE, task_name: str, term_widths: list[int]
   ) -> None:
     super().__init__()
+    if actor.input_version != "legacy" or actor.film is not None:
+      raise NotImplementedError(
+        "ONNX encoder wrapper does not yet support estimator inputs"
+      )
     self.obs_normalizer = actor.obs_normalizer
     self.goal_normalizer = actor.goal_normalizers[task_name]
     self.encoder = actor.encoders[task_name]
@@ -335,6 +339,13 @@ def export_actor_as_onnx(
   Returns the list of file paths produced. Unknown task names are skipped
   with a warning rather than erroring.
   """
+  if (
+    getattr(actor, "input_version", "legacy") != "legacy"
+    or getattr(actor, "film", None) is not None
+  ):
+    raise NotImplementedError(
+      "ONNX exporter does not yet support estimator input targets and FiLM"
+    )
   written: list[str] = []
   for ts in actor.task_specs:
     fn = _TASK_EXPORTERS.get(ts.name)

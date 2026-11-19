@@ -46,6 +46,8 @@ class SuperMimicViewerMixin:
     task_specs: list[TaskSpec],
     initial_task: str = "motion",
   ) -> None:
+    if getattr(self.policy, "input_version", "legacy") != "legacy":
+      raise NotImplementedError("Viewer requires an eit_rpv_v1 posterior adapter")
     self.dynamics = dynamics
     self.representation = representation
     self.num_steps_rollout = num_steps_rollout

@@ -401,6 +401,61 @@ CUDA_VISIBLE_DEVICES=<GPU_ID> uv run src/supermimic/scripts/train.py \
 播放配置、W&B checkpoint 选择、三个机器人的含义及仿真警告排查，
 统一见 [README_eval.md](README_eval.md)。
 
+## Estimator 输入第一步
+
+`eit_rpv_v1` 实现 [plan_step1.md](plan_step1.md) 的输入与网络阶段：默认
+5×93 本体历史、700 维 motion 目标、C 组 450 维任务 covariance 编码及
+decoder 首层 LayerNorm 后的 FiLM。A/B 完全旁路 FiLM。旧配置保持原有行为。
+
+奖励保留全局骨盆跟踪与相对身体形态跟踪的混合定义。actor 和全局奖励使用
+固定 episode 参考；刚体位姿奖励在评分时按当前真值根位姿的水平位置和 yaw
+重新对齐参考，两条 rollout 采用相同规则，评分不改变 actor 的参考轨迹。
+
+使用 `SuperMimicRunnerCfg.for_estimator_inputs("C")` 创建新配置，也可选择
+`"A"` 或 `"B"`。创建仿真环境前调用
+`supermimic.tasks.env_cfgs.configure_estimator_env_cfg(env_cfg)`，以统一测量定义、
+关闭重复 corruption 并启用固定 episode 参考对齐。motion sampling mode 仍需
+与 runner 一致（`return` 对应 `external`）。新路径仅支持 G1 GenCoord、29 个
+关节和 50 Hz，默认 eager 执行。
+
+后验通过 `estimator_inputs.PosteriorInput` 注入：`mean` 是矩阵朝向、世界系
+位置和线速度组成的 `RpvState`；C 还需要按 `[theta, rho, nu]` 排列的右局部
+9×9 `covariance_rpv`。A 训练使用真值，A 评估与 B/C 必须提供后验均值。
+`EITInputConfig(mode="eval")` 控制信息来源；`actor.eval()` 仅控制网络模式。
+
+真实采集入口为 `runner.reset_collection()`、`runner.step(posterior=...)`。
+再次调用 `reset_collection()` 会将 replay 中尚未结束的 episode 标记为截断，
+保留已有数据，同时防止恢复历史或采样训练序列时跨越手动 reset。
+也可在构造 runner 时提供 `posterior_provider`，其每个时间点只调用一次，
+关键字参数是 `measurement`（64 维）、`previous_action`（29 维）和
+`reset_mask`。actor、provider 和 replay 共用同一次高斯测量。
+`imagined_posterior_provider` 应为独立实例；想象入口
+`runner.wm_env.reset(batch, posterior=...)` 和 `step(action, posterior=...)`
+支持逐步注入，不会沿用上一时刻的注入后验。reset 的 batch 可由
+`sample_initial_states()` 从 replay 生成，其中保存原测量历史及 episode 对齐。
+想象环境先校验后验和下一帧输入，再提交时间、状态与历史；校验失败时保留
+原环境状态，补齐后验后可重试。直接注入无效后验不会消耗测量噪声；外部
+provider 自身的状态更新及其调用前的噪声采样不在环境回滚范围内。
+这里的 provider reset 只是接口初始化，尚未实现完整滤波后验恢复。
+
+`build_ablation_actors(cfg, wm, device)` 显式复制三组共同网络权重及归一化状态，
+各组参数存储独立。用 `actor_checkpoint(actor, cfg)` 保存包含输入版本、
+噪声配置、结构及归一化状态的 checkpoint，再用 `load_actor_checkpoint` 恢复。
+从训练配置切换到 `mode="eval"` 时显式传入 `for_evaluation=True`；其余配置
+仍严格匹配。世界模型和估计器后续也须从相同初始权重建立独立实例。
+
+本阶段可运行采集和短序列计算图验证，`run()` / learner `update()` 明确拒绝
+完整训练，避免将尚未接入 belief 的 critic 当成 B/C 基线。真实滤波器、
+均值与噪声头联合训练、完整 critic 和闭环控制性能验证仍属于后续阶段。
+现有 play、viewer、benchmark 和 ONNX exporter 对新版本明确报错。
+
+CPU 验收测试（无需完整 MuJoCo 闭环）：
+
+```bash
+OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
+  .venv/bin/python -m pytest -q tests/test_estimator_*.py
+```
+
 ## Acknowledgements
 
 SuperMimic contains code inspired by these projects:

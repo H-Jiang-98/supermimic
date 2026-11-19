@@ -67,6 +67,16 @@ class ReturnSampler:
     """Frame -> bin, as the motion command bins its adaptive-sampling failures."""
     return frames * self.bin_count // self.frame_count
 
+  def truncate_open_episodes(self) -> None:
+    """Keep a pending return window from spanning an explicit collector reset."""
+    if self._step == 0:
+      return
+    last = self._step - 1
+    ended = (
+      self._terminated[:, last] | self._clip_end[:, last] | self._timed_out[:, last]
+    )
+    self._timed_out[:, last].logical_or_(~ended)
+
   def record(
     self,
     frames: torch.Tensor,

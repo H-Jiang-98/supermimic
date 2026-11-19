@@ -17,16 +17,33 @@ single-actor policy and the multi-encoder actor, and may override
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
+from mjlab.utils.lab_api.math import quat_mul
 from tensordict import TensorDict
 
+from supermimic.estimator_inputs import (
+  EITInputConfig,
+  EpisodeAlignment,
+  PosteriorInput,
+  PosteriorProvider,
+  build_actor_features,
+  sample_proprio,
+)
 from supermimic.replay_buffer import ReplayBuffer
+from supermimic.utils.helpers import matrix_to_quat, normalized_action_limits
 
 if TYPE_CHECKING:
   from supermimic.models import Dynamics
   from supermimic.representations import StateRepresentation
+
+
+class _EstimatorGoals(NamedTuple):
+  body_state: tuple[torch.Tensor, ...]
+  actor: torch.Tensor
+  critic: torch.Tensor
+  uncertainty: torch.Tensor | None
 
 
 class WorldModelEnv(ABC):
@@ -36,6 +53,8 @@ class WorldModelEnv(ABC):
   and the reset/observation plumbing. ``get_observations`` is the only abstract
   method; subclasses choose how to assemble the actor observation.
   """
+
+  _supports_estimator_inputs = False
 
   def __init__(
     self,
@@ -47,6 +66,8 @@ class WorldModelEnv(ABC):
     history_length: int,
     termination_softness: float,
     device: str = "cpu",
+    estimator_input_config: EITInputConfig | None = None,
+    posterior_provider: PosteriorProvider | None = None,
   ) -> None:
     self.device = device
     self.dynamics = dynamics
@@ -54,6 +75,22 @@ class WorldModelEnv(ABC):
     self.num_envs = batch_size
     self.replay_buffer = replay_buffer
     self.history_length = history_length
+    self.estimator_input_config = estimator_input_config
+    self.posterior_provider = posterior_provider
+    self._posterior: PosteriorInput | None = None
+    self._task_uncertainty: torch.Tensor | None = None
+    if estimator_input_config is not None:
+      if not self._supports_estimator_inputs:
+        raise ValueError("Estimator inputs require the MultiTaskWorldModelEnv adapter")
+      if representation.actor_obs_mode != "proprio" or env.num_actions != 29:
+        raise ValueError(
+          "Estimator inputs require G1 proprio observations (29 actions)"
+        )
+      if history_length != estimator_input_config.history_length:
+        raise ValueError("history_length must match estimator_input_config")
+      self._action_lower, self._action_upper = normalized_action_limits(
+        env, env.num_actions, device=device
+      )
 
     # Analytic per-step reward ceiling: positive tracking-reward weights, dt-scaled.
     self.max_step_reward = env.unwrapped.step_dt * sum(
@@ -97,11 +134,20 @@ class WorldModelEnv(ABC):
     """Dimension of the action space for the high-level policy."""
     return self._num_actions
 
-  def reset(self, batch: TensorDict | None = None) -> TensorDict:
+  def reset(
+    self,
+    batch: TensorDict | None = None,
+    *,
+    posterior: PosteriorInput | None = None,
+  ) -> TensorDict:
     """Reset buffers to ``batch`` (a fresh ``sample_initial_states()`` by
     default) and refresh goals."""
+    if self.estimator_input_config is not None:
+      self._check_posterior_source(posterior)
     if batch is None:
       batch = self.sample_initial_states()
+    if self.estimator_input_config is not None:
+      return self._reset_estimator_inputs(batch, posterior)
     self.aux_state, self.rep_state = self._unpack_initial_states(batch)
     self.joint_state = self.representation.joint_state(self.rep_state)
     # Raw policy outputs (pre-scale/offset). Dynamics handles the transform;
@@ -112,8 +158,10 @@ class WorldModelEnv(ABC):
     return self.get_observations()
 
   def step(
-    self, actions: torch.Tensor
+    self, actions: torch.Tensor, *, posterior: PosteriorInput | None = None
   ) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict[str, object]]:
+    if self.estimator_input_config is not None:
+      return self._step_estimator_inputs(actions, posterior)
     next_aux_state, next_rep_state, next_joint_state, term_prob, rewards = (
       self._wm_step(
         self.rep_state,
@@ -138,16 +186,138 @@ class WorldModelEnv(ABC):
 
     return self.get_observations(), rewards, term_prob, {}
 
+  def _check_posterior_source(self, posterior: PosteriorInput | None) -> None:
+    config = self.estimator_input_config
+    if config.uses_posterior and posterior is None and self.posterior_provider is None:
+      raise ValueError(
+        f"Group {config.group} in {config.mode} mode requires posterior mean"
+      )
+
+  def _reset_estimator_inputs(
+    self, batch: TensorDict, posterior: PosteriorInput | None
+  ) -> TensorDict:
+    """Validate the complete reset input before replacing a live rollout."""
+    aux, rep = self._unpack_initial_states(batch)
+    joints = self.representation.joint_state(rep)
+    actions = batch["prev_action"].detach()
+    required = {"alignment_rotation", "alignment_translation"}
+    if not required.issubset(batch.keys()):
+      raise ValueError("Estimator replay requires the stored episode alignment")
+    alignment = EpisodeAlignment(
+      batch["alignment_rotation"].detach(), batch["alignment_translation"].detach()
+    )
+    if self.history_length > 1:
+      if "sensor_window" not in batch.keys():
+        raise ValueError("Estimator replay requires the stored noisy sensor_window")
+      history = batch["sensor_window"].detach()
+    else:
+      history = batch["actor_obs"].detach().unsqueeze(1)
+    if history.shape != (self.num_envs, self.history_length, 93):
+      raise ValueError("Estimator sensor history must have shape (batch, H_obs, 93)")
+    if not torch.equal(history[:, -1, -29:], actions):
+      raise ValueError("Stored measurement actions must equal replay prev_action")
+    sensor = history[:, -1]
+    posterior = self._resolve_posterior(posterior, sensor, actions, reset=True)
+    goals = self._prepare_estimator_goals(
+      aux, rep, batch["motion_time"], alignment, posterior
+    )
+    # Commit only after posterior and all actor/critic reference inputs are valid.
+    self.aux_state, self.rep_state, self.joint_state = aux, rep, joints
+    self.last_actions, self.sim_ctx = actions, batch["sim_ctx"]
+    self.motion_times, self.reference_alignment = batch["motion_time"], alignment
+    self._past_sensors, self._latest_sensor = history[:, :-1], sensor
+    self._posterior = posterior
+    self._commit_estimator_goals(goals)
+    return self.get_observations()
+
+  def _step_estimator_inputs(
+    self, actions: torch.Tensor, posterior: PosteriorInput | None
+  ) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict[str, object]]:
+    """Stage the next frame; failed posterior validation leaves env state intact."""
+    self._check_posterior_source(posterior)
+    actions = self.limit_actions(actions)
+    aux, rep, joints, term_prob, rewards = self._wm_step(
+      self.rep_state, self.aux_state, actions, self.last_actions, self.sim_ctx
+    )
+    times = self._next_motion_times()
+    sensor = None
+    if posterior is None and self.posterior_provider is not None:
+      sensor = self._sensor_from_state(rep, aux, joints, actions, self.sim_ctx)
+      posterior = self._resolve_posterior(posterior, sensor, actions, reset=False)
+    goals = self._prepare_estimator_goals(
+      aux, rep, times, self.reference_alignment, posterior
+    )
+    # A direct injection can be validated before drawing any new measurement.
+    if sensor is None:
+      sensor = self._sensor_from_state(rep, aux, joints, actions, self.sim_ctx)
+    if self.history_length > 1:
+      past = torch.cat(
+        [self._past_sensors[:, 1:], self._latest_sensor.unsqueeze(1)], dim=1
+      )
+      self._past_sensors = past
+    self.aux_state, self.rep_state, self.joint_state = aux, rep, joints
+    self.last_actions, self.motion_times = actions, times
+    self._latest_sensor, self._posterior = sensor, posterior
+    self._commit_estimator_goals(goals)
+    return self.get_observations(), rewards, term_prob, {}
+
+  def limit_actions(self, actions: torch.Tensor) -> torch.Tensor:
+    """Same post-exploration normalized command limit used by real collection."""
+    if self.estimator_input_config is None:
+      return actions
+    return torch.clamp(
+      actions, min=self._action_lower.to(actions), max=self._action_upper.to(actions)
+    )
+
   def _synth_sensor(self) -> torch.Tensor:
     """Synthesize the actor's sensor from the current WM state."""
-    return self.representation.compute_actor_sensor(
-      self.rep_state,
-      self.sim_ctx,
-      aux_state=self.aux_state,
-      joint_state=self.joint_state,
-      last_action=self.last_actions,
-      noisy=True,
+    return self._sensor_from_state(
+      self.rep_state, self.aux_state, self.joint_state, self.last_actions, self.sim_ctx
     )
+
+  def _sensor_from_state(
+    self,
+    rep: torch.Tensor,
+    aux: torch.Tensor,
+    joints: torch.Tensor,
+    actions: torch.Tensor,
+    sim_ctx: torch.Tensor,
+  ) -> torch.Tensor:
+    sensor = self.representation.compute_actor_sensor(
+      rep,
+      sim_ctx,
+      aux_state=aux,
+      joint_state=joints,
+      last_action=actions,
+      noisy=self.estimator_input_config is None,
+    )
+    if self.estimator_input_config is not None:
+      return sample_proprio(sensor, self.estimator_input_config.measurement_noise)
+    return sensor
+
+  def _resolve_posterior(
+    self,
+    posterior: PosteriorInput | None,
+    sensor: torch.Tensor,
+    actions: torch.Tensor,
+    *,
+    reset: bool,
+  ) -> PosteriorInput | None:
+    """Consume a posterior for this time point, never reuse a stale injection.
+
+    The provider sees exactly the sensor sample consumed by the actor and the
+    previous executed action. It has no privileged-state argument. A reset call
+    restores/initializes its state; history padding is not replayed as updates.
+    """
+    if posterior is None and self.posterior_provider is not None:
+      posterior = self.posterior_provider(
+        measurement=sensor[..., :64],
+        previous_action=actions,
+        reset_mask=torch.full(
+          (self.num_envs,), reset, dtype=torch.bool, device=sensor.device
+        ),
+      )
+    return posterior
 
   def _sensor_history(self) -> torch.Tensor:
     """The ``(B, history_length, sensor_dim)`` window; newest frame last."""
@@ -230,21 +400,79 @@ class WorldModelEnv(ABC):
 
   def _compute_commands(self) -> None:
     """Advance the reference clip one frame (clamped at clip ends) and refresh."""
+    self.motion_times = self._next_motion_times()
+    self._update_goal()
+
+  def _next_motion_times(self) -> torch.Tensor:
     next_motion_times = self.motion_times + 1
     # Membership in the sorted clip ends; torch.isin syncs the host on long lists.
     ends = self.motion.motion_ends
     pos = torch.searchsorted(ends, next_motion_times).clamp(max=ends.numel() - 1)
     at_end = ends[pos] == next_motion_times
-    self.motion_times = torch.where(at_end, self.motion_times, next_motion_times)
-    self._update_goal()
+    return torch.where(at_end, self.motion_times, next_motion_times)
 
   def _update_goal(self) -> None:
     """Compute the reference body state at ``motion_times`` and rebuild goals."""
+    if self.estimator_input_config is not None:
+      goals = self._prepare_estimator_goals(
+        self.aux_state,
+        self.rep_state,
+        self.motion_times,
+        self.reference_alignment,
+        self._posterior,
+      )
+      self._commit_estimator_goals(goals)
+      return
     self._ref_body_state = self.motion.body_state(self.motion_times)
     self._wm_goal_obs, self._actor_goal_obs = self.representation.compute_wm_goal(
       self.motion, self.motion_times, self.aux_state
     )
     self._build_task_goals()
+
+  def _prepare_estimator_goals(
+    self,
+    aux: torch.Tensor,
+    rep: torch.Tensor,
+    times: torch.Tensor,
+    alignment: EpisodeAlignment,
+    posterior: PosteriorInput | None,
+  ) -> _EstimatorGoals:
+    reference = self.representation.reference_window(self.motion, times, alignment)
+    truth = self.representation.true_rpv(aux, rep)
+    actor, uncertainty = build_actor_features(
+      self.estimator_input_config, truth, posterior, reference
+    )
+    # Complete B/C belief critics remain a later integration step.
+    critic, _ = build_actor_features(EITInputConfig(group="A"), truth, None, reference)
+    bodies = self._aligned_reference_bodies(self.motion.body_state(times), alignment)
+    return _EstimatorGoals(bodies, actor, critic, uncertainty)
+
+  def _commit_estimator_goals(self, goals: _EstimatorGoals) -> None:
+    self._ref_body_state = goals.body_state
+    self._actor_goal_obs, self._wm_goal_obs = goals.actor, goals.critic
+    self._task_uncertainty = goals.uncertainty
+    self._build_task_goals()
+
+  def _aligned_reference_bodies(
+    self,
+    body_state: tuple[torch.Tensor, ...],
+    alignment: EpisodeAlignment,
+  ) -> tuple[torch.Tensor, ...]:
+    """Apply the saved episode transform to every privileged reference channel."""
+    position, quaternion, linear_velocity, angular_velocity = body_state
+    rotation = alignment.rotation[:, None]
+    translation = alignment.translation[:, None]
+
+    def rotate(value: torch.Tensor) -> torch.Tensor:
+      return (rotation @ value.unsqueeze(-1)).squeeze(-1)
+
+    alignment_quaternion = matrix_to_quat(rotation).expand_as(quaternion)
+    return (
+      rotate(position) + translation,
+      quat_mul(alignment_quaternion, quaternion),
+      rotate(linear_velocity),
+      rotate(angular_velocity),
+    )
 
   # ------------------------------------------------------------------
   # Shared helpers

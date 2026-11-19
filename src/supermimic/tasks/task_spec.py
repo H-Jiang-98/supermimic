@@ -71,14 +71,28 @@ def build_actor_obs_td(
   goals_by_name: dict[str, torch.Tensor],
   history: torch.Tensor,
   critic: torch.Tensor | None = None,
+  task_uncertainty: torch.Tensor | None = None,
 ) -> TensorDict:
   """``history`` (B, H, obs_dim) (+ optional ``critic``) plus one ``goal_<name>``
   key per task. The newest frame ``history[:, -1]`` is the current obs."""
   obs: dict[str, torch.Tensor] = {"history": history}
   if critic is not None:
     obs["critic"] = critic
+  if task_uncertainty is not None:
+    obs["task_uncertainty"] = task_uncertainty
   obs.update({f"goal_{name}": goal for name, goal in goals_by_name.items()})
   return TensorDict(obs, batch_size=[history.shape[0]], device=history.device)
+
+
+def make_estimator_motion_task() -> TaskSpec:
+  """The v1 motion task requires explicitly selected R/p/v, never pose alone."""
+
+  def extract(*args, **kwargs):
+    raise RuntimeError(
+      "eit_rpv_v1 requires build_actor_features with explicit R/p/v and reference"
+    )
+
+  return TaskSpec(name="motion", goal_dim=700, extract_training_goal=extract)
 
 
 def make_motion_task(representation: "StateRepresentation", num_goals: int) -> TaskSpec:

@@ -6,10 +6,12 @@ from tensordict import TensorDict
 
 @dataclass(frozen=True)
 class FieldSpec:
-  dim: int = 0  # 0 = scalar (no trailing axis); >0 = vector with trailing dim
+  dim: int | tuple[int, ...] = 0  # 0 = scalar; tuple preserves structured fields
   dtype: torch.dtype = torch.float32
 
   def shape(self, num_envs: int, buffer_size: int) -> tuple[int, ...]:
+    if isinstance(self.dim, tuple):
+      return (num_envs, buffer_size, *self.dim)
     return (num_envs, buffer_size, self.dim) if self.dim else (num_envs, buffer_size)
 
 
@@ -50,6 +52,20 @@ class ReplayBuffer:
     self._storage[:, self._step] = td
     self._step = (self._step + 1) % self.buffer_size
     self.num_transitions = min(self.buffer_size, self.num_transitions + 1)
+
+  def truncate_open_episodes(self) -> None:
+    """End unfinished episodes before an explicit all-environment reset.
+
+    The last inserted transition precedes the reset. Mark only unfinished rows
+    as truncated, preserving real terminations/timeouts and the rest of replay.
+    Both forward sequence sampling and causal history then respect the boundary.
+    """
+    if self.num_transitions == 0:
+      return
+    last = (self._step - 1) % self.buffer_size
+    terminated = self._storage["terminated"][:, last]
+    truncated = self._storage["truncated"][:, last]
+    truncated.logical_or_(~(terminated | truncated))
 
   def sample_causal(
     self, sequence_length: int, batch_size: int

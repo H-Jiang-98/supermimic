@@ -7,7 +7,10 @@ Representation-specific helpers live in dedicated modules:
 
 from __future__ import annotations
 
+import math
+
 import torch
+from mjlab.envs.mdp.actions import JointPositionAction
 from mjlab.utils.lab_api.math import matrix_from_quat, quat_mul
 
 
@@ -26,6 +29,71 @@ def extract_action_scale_offset(env: object) -> tuple[torch.Tensor, torch.Tensor
   if offset.dim() > 1:
     offset = offset[0:1]
   return scale, offset
+
+
+def normalized_action_limits(
+  env: object, num_actions: int, *, device: torch.device | str = "cpu"
+) -> tuple[torch.Tensor, torch.Tensor]:
+  """Intersect wrapper and affine joint-target limits in policy coordinates.
+
+  EIT records this limited command as both the executed action and next-frame
+  last_action. Limiting *before* the action manager keeps its raw action buffer,
+  physical target, replay, and imagined dynamics consistent. Only a single
+  absolute JointPositionAction with environment-independent affine parameters
+  is supported: sampled replay rows do not retain an original simulator index.
+  An adapter without an action manager may supply only wrapper limits.
+  """
+  if num_actions != 29:
+    raise ValueError("Estimator action limits support only the 29-action G1")
+  lower = torch.full((num_actions,), -torch.inf, device=device)
+  upper = torch.full((num_actions,), torch.inf, device=device)
+  wrapper_limit = getattr(env, "clip_actions", None)
+  if wrapper_limit is not None:
+    if not isinstance(wrapper_limit, (int, float)) or (
+      not math.isfinite(wrapper_limit) or wrapper_limit < 0
+    ):
+      raise ValueError("clip_actions must be a finite nonnegative scalar or None")
+    lower.fill_(-wrapper_limit)
+    upper.fill_(wrapper_limit)
+
+  unwrapped = getattr(env, "unwrapped", env)
+  manager = getattr(unwrapped, "action_manager", None)
+  if manager is None:
+    return lower, upper
+  names = manager.active_terms
+  if not isinstance(names, (list, tuple)) or len(names) != 1:
+    raise ValueError("Estimator inputs require one affine JointPositionAction term")
+  term = manager.get_term(names[0])
+  if not isinstance(term, JointPositionAction) or term.action_dim != num_actions:
+    raise ValueError("Estimator inputs require an absolute 29-joint position action")
+
+  def uniform(value, tail_shape: tuple[int, ...], name: str) -> torch.Tensor:
+    tensor = torch.as_tensor(value, dtype=torch.float32, device=device)
+    if tensor.ndim == 0:
+      return tensor.expand(tail_shape)
+    if tuple(tensor.shape) == tail_shape:
+      return tensor
+    if tensor.ndim == len(tail_shape) + 1 and tuple(tensor.shape[1:]) == tail_shape:
+      if tensor.shape[0] > 0 and torch.equal(tensor, tensor[:1].expand_as(tensor)):
+        return tensor[0]
+    raise ValueError(f"Estimator action {name} must be identical across environments")
+
+  scale = uniform(term.scale, (num_actions,), "scale")
+  offset = uniform(term.offset, (num_actions,), "offset")
+  if not torch.isfinite(scale).all() or not torch.isfinite(offset).all():
+    raise ValueError("Estimator action scale/offset must be finite")
+  if (scale == 0).any():
+    raise ValueError("Estimator action scale must be nonzero")
+  if term.cfg.clip is not None:
+    physical = uniform(term._clip, (num_actions, 2), "clip")
+    if torch.isnan(physical).any() or (physical[:, 0] > physical[:, 1]).any():
+      raise ValueError("Invalid physical joint target limits")
+    endpoints = (physical - offset[:, None]) / scale[:, None]
+    lower = torch.maximum(lower, endpoints.amin(-1))
+    upper = torch.minimum(upper, endpoints.amax(-1))
+  if (lower > upper).any():
+    raise ValueError("Wrapper and physical action limits have an empty intersection")
+  return lower, upper
 
 
 def matrix_to_quat(rot_mat: torch.Tensor) -> torch.Tensor:

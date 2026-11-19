@@ -96,6 +96,11 @@ def parse_train_args(argv: list[str] | None = None) -> tuple[str, TrainConfig]:
 
 def main() -> None:
   chosen_task, args = parse_train_args()
+  if args.runner.estimator_inputs is not None:
+    raise NotImplementedError(
+      "Estimator input v1 currently supports injected-posterior interface checks; "
+      "complete estimator/belief critic training is not enabled"
+    )
   if args.config is not None:
     print(f"[INFO] Loaded training config: {args.config}")
 

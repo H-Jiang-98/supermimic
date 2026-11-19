@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Literal
@@ -16,6 +16,12 @@ from tensordict import TensorDict
 
 from supermimic.envs.motion_tracking_env import MotionTrackingEnv
 from supermimic.envs.multi_task_world_model_env import MultiTaskWorldModelEnv
+from supermimic.estimator_inputs import (
+  EITInputConfig,
+  PosteriorInput,
+  PosteriorProvider,
+  build_actor_features,
+)
 from supermimic.learners.policy_learner import (
   ActorCriticPolicyLearner,
   ActorCriticPolicyLearnerCfg,
@@ -32,6 +38,7 @@ from supermimic.sim_context import SimContext
 from supermimic.tasks.task_spec import (
   TasksCfg,
   build_actor_obs_td,
+  make_estimator_motion_task,
   resolve_task_specs,
 )
 from supermimic.utils.helpers import (
@@ -73,6 +80,8 @@ ActorCriticCfg = Annotated[
 
 @dataclass
 class SuperMimicRunnerCfg(BaseRunnerCfg):
+  estimator_inputs: EITInputConfig | None = None
+  """Opt-in input/FiLM scaffold; complete estimator training is a later stage."""
   max_iterations: int = 1000000
   replay_ratio: int = 16
   latent_dim: int = 32
@@ -95,6 +104,34 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   train.py resolves this into the motion command's cfg before the env is built
   ('return' drives mjlab's 'external' mode)."""
   return_sampler: ReturnSamplerCfg = field(default_factory=ReturnSamplerCfg)
+
+  @classmethod
+  def for_estimator_inputs(cls, group: Literal["A", "B", "C"] = "A", **kwargs):
+    inputs = kwargs.pop("estimator_inputs", EITInputConfig(group=group))
+    return cls(
+      estimator_inputs=inputs,
+      actor_obs="proprio",
+      history_length=inputs.history_length,
+      cuda_graphs=False,
+      **kwargs,
+    )
+
+  def validate_estimator_inputs(self) -> None:
+    inputs = self.estimator_inputs
+    if inputs is None:
+      return
+    if self.representation != "gencoord" or self.actor_obs != "proprio":
+      raise ValueError(
+        "Estimator input v1 requires G1 GenCoord and actor_obs='proprio'"
+      )
+    if self.history_length != inputs.history_length:
+      raise ValueError("runner and estimator_inputs history_length must agree")
+    if self.slot_mix.get("motion") != 1.0 or any(
+      value != 0.0 for name, value in self.slot_mix.items() if name != "motion"
+    ):
+      raise ValueError("Estimator input v1 supports only the motion task")
+    if self.cuda_graphs:
+      raise ValueError("Estimator input v1 must be validated in eager mode")
 
 
 @dataclass
@@ -125,6 +162,20 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
 
   Resets ``env`` to read its observation dimensions.
   """
+  inputs = getattr(cfg, "estimator_inputs", None)
+  if inputs is not None:
+    cfg.validate_estimator_inputs()
+    actor_cfg = env.unwrapped.cfg.observations["actor"]
+    motion_cfg = env.unwrapped.cfg.commands["motion"]
+    if (
+      actor_cfg.enable_corruption
+      or actor_cfg.terms["joint_pos"].params.get("biased", False)
+      or not getattr(motion_cfg, "fixed_reference_alignment", False)
+    ):
+      raise ValueError(
+        "Call configure_estimator_env_cfg before creating the simulation: "
+        "EIT requires single corruption, calibrated proprio and fixed references"
+      )
   if cfg.history_length > 1 and cfg.actor_obs != "proprio":
     raise RuntimeError(
       "history_length > 1 requires actor_obs='proprio' (--runner.actor-obs proprio)"
@@ -154,6 +205,11 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
   ).to(device)
 
   representation.bind(env.unwrapped, sim_context)
+  if inputs is not None:
+    if num_actions != 29 or abs(env.unwrapped.step_dt - 0.02) > 1e-8:
+      raise ValueError("Estimator input v1 requires 29 actions at 50 Hz")
+    representation.configure_estimator_measurement(inputs.measurement_noise)
+    num_goals = 700
 
   print(
     f"[INFO] Representation: {cfg.representation} "
@@ -185,6 +241,12 @@ def build_actor(
 ) -> MultiEncoderAE:
   """Actor sized by ``cfg``; the resolved task specs live on ``actor.task_specs``."""
   representation = wm.representation
+  inputs = cfg.estimator_inputs
+  cfg.validate_estimator_inputs()
+  if inputs is not None and (
+    wm.num_actions != 29 or representation.proprio_obs_dim(wm.num_actions) != 93
+  ):
+    raise ValueError("Estimator input v1 requires the G1 93-dimensional sensor layout")
   obs_dim = (
     representation.rep_state_dim
     if cfg.actor_obs == "rep_state"
@@ -193,13 +255,97 @@ def build_actor(
   return MultiEncoderAE(
     obs_dim=obs_dim,
     action_dim=wm.num_actions,
-    task_specs=resolve_task_specs(cfg.tasks, representation, wm.num_goals, device),
-    slot_mix=cfg.slot_mix,
+    task_specs=(
+      [make_estimator_motion_task()]
+      if inputs is not None
+      else resolve_task_specs(cfg.tasks, representation, wm.num_goals, device)
+    ),
+    slot_mix={"motion": 1.0} if inputs is not None else cfg.slot_mix,
     latent_dim=cfg.latent_dim,
     hidden_dims=cfg.actor_hidden_dims,
     latent_bc_weight=cfg.latent_bc_weight,
     history_length=cfg.history_length,
+    uncertainty_dim=450 if inputs is not None and inputs.uses_uncertainty else 0,
+    input_version=inputs.version if inputs is not None else "legacy",
   ).to(device)
+
+
+def actor_checkpoint(actor: MultiEncoderAE, cfg: SuperMimicRunnerCfg) -> dict:
+  """Store feature semantics as well as weights; legacy checkpoints stay unchanged."""
+  if cfg.estimator_inputs is None:
+    return actor.state_dict()
+  return {
+    "input_config": cfg.estimator_inputs.to_dict(),
+    "actor": actor.state_dict(),
+    "architecture": {
+      "hidden_dims": list(cfg.actor_hidden_dims),
+      "latent_dim": cfg.latent_dim,
+      "film_hidden_dims": [128, 64],
+    },
+  }
+
+
+def load_actor_checkpoint(
+  actor: MultiEncoderAE,
+  cfg: SuperMimicRunnerCfg,
+  checkpoint: dict,
+  *,
+  for_evaluation: bool = False,
+) -> None:
+  """Reject cross-version or cross-group loads before touching actor parameters."""
+  inputs = cfg.estimator_inputs
+  if inputs is None:
+    if "input_config" in checkpoint:
+      raise ValueError("Estimator input checkpoint cannot be loaded as a legacy actor")
+    actor.load_state_dict(checkpoint)
+    return
+  if "input_config" not in checkpoint:
+    raise ValueError("Estimator input actor requires a versioned checkpoint")
+  saved = EITInputConfig.from_dict(checkpoint["input_config"])
+  if for_evaluation:
+    if inputs.mode != "eval":
+      raise ValueError("for_evaluation requires mode='eval'")
+    saved = replace(saved, mode="eval")
+  if saved != inputs:
+    raise ValueError("Actor input configuration mismatch (including group/mode/noise)")
+  expected = {
+    "hidden_dims": list(cfg.actor_hidden_dims),
+    "latent_dim": cfg.latent_dim,
+    "film_hidden_dims": [128, 64],
+  }
+  if checkpoint.get("architecture") != expected:
+    raise ValueError("Actor architecture mismatch")
+  actor.load_state_dict(checkpoint["actor"])
+
+
+def build_ablation_actors(
+  cfg: SuperMimicRunnerCfg, wm: WorldModel, device: str
+) -> dict[str, MultiEncoderAE]:
+  """Independent A/B/C actors with copied common weights and normalization."""
+  if cfg.estimator_inputs is None:
+    raise ValueError("build_ablation_actors requires estimator_inputs")
+  actors = {}
+  for group in ("A", "B", "C"):
+    group_cfg = replace(
+      cfg, estimator_inputs=replace(cfg.estimator_inputs, group=group)
+    )
+    actors[group] = build_actor(group_cfg, wm, device)
+    if group != "A":
+      actors[group].copy_common_initialization_from(actors["A"])
+  return actors
+
+
+@dataclass
+class InputStagePolicy:
+  """Collection-only actor holder, deliberately not a partial training baseline."""
+
+  actor: MultiEncoderAE
+  cfg: BpttPolicyLearnerCfg | ActorCriticPolicyLearnerCfg
+
+  def update(self):
+    raise NotImplementedError(
+      "Complete estimator and belief critic training is a later stage"
+    )
 
 
 def load_wandb_checkpoint(wandb_run_path: str, wm: WorldModel, device: str) -> None:
@@ -299,12 +445,20 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
 
   def _seed_sim_history(self) -> None:
     """Seed the real-sim obs-history ring with the noised current sensor."""
-    if self.cfg.history_length == 1:
+    if (
+      self.cfg.history_length == 1
+      and getattr(self.cfg, "estimator_inputs", None) is None
+    ):
       return
     seed = self._representation.add_proprio_noise(
       self.env.get_observations()["actor"].to(self.device)
     )
     self._sim_history = seed.unsqueeze(1).repeat(1, self.cfg.history_length, 1)
+    if getattr(self.cfg, "estimator_inputs", None) is not None:
+      self._measurement_reset = torch.ones(
+        seed.shape[0], dtype=torch.bool, device=seed.device
+      )
+      self._posterior_ready = False
 
   def _collection_history(self, sensor: torch.Tensor) -> torch.Tensor:
     """The ``(B, history_length, sensor_dim)`` window for a real-sim actor step.
@@ -317,13 +471,19 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
   def _advance_sim_history(self, next_actor: torch.Tensor, dones: torch.Tensor) -> None:
     """Append the noised next sensor; rows whose episode just reset repeat that
     single realization, matching the warm-start padding."""
-    if self.cfg.history_length == 1:
+    if (
+      self.cfg.history_length == 1
+      and getattr(self.cfg, "estimator_inputs", None) is None
+    ):
       return
     assert self._sim_history is not None
     next_sensor = self._representation.add_proprio_noise(next_actor)
     shifted = torch.cat([self._sim_history[:, 1:], next_sensor.unsqueeze(1)], dim=1)
     reset = dones.bool().view(-1, 1, 1)
     self._sim_history = torch.where(reset, next_sensor.unsqueeze(1), shifted)
+    if getattr(self.cfg, "estimator_inputs", None) is not None:
+      self._measurement_reset = dones.bool().reshape(-1).clone()
+      self._posterior_ready = False
 
   def _policy_input_dims(self) -> tuple[int, int]:
     """Compute actor and critic input dimensions from the representation."""
@@ -378,8 +538,9 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
   def _stores_actor_obs(self) -> bool:
     """The buffer carries the real sensor only for its sole reader, the
     history warm-start (``WorldModelEnv.sample_initial_states``)."""
-    return (
-      self._representation.actor_obs_mode == "proprio" and self.cfg.history_length > 1
+    return self._representation.actor_obs_mode == "proprio" and (
+      self.cfg.history_length > 1
+      or getattr(self.cfg, "estimator_inputs", None) is not None
     )
 
   def _buffer_schema(self) -> dict[str, FieldSpec]:
@@ -397,6 +558,9 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
         self._representation.proprio_obs_dim(self._num_actions)
       )
     schema["sim_ctx"] = FieldSpec(self._sim_context.output_dim)
+    if getattr(self.cfg, "estimator_inputs", None) is not None:
+      schema["alignment_rotation"] = FieldSpec((3, 3))
+      schema["alignment_translation"] = FieldSpec(3)
     return schema
 
   def _init_policy(self) -> None:
@@ -522,6 +686,19 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
   only in what goal modality their encoder consumes.
   """
 
+  def __init__(
+    self,
+    *args,
+    posterior_provider: PosteriorProvider | None = None,
+    imagined_posterior_provider: PosteriorProvider | None = None,
+    **kwargs,
+  ):
+    self.posterior_provider = posterior_provider
+    self.imagined_posterior_provider = imagined_posterior_provider
+    self._current_posterior: PosteriorInput | None = None
+    self._posterior_ready = False
+    super().__init__(*args, **kwargs)
+
   def _init_policy(self) -> None:
     actor = build_actor(self.cfg, self._wm, self.device)
     self._active_task_specs = [
@@ -533,13 +710,6 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       actor.task_specs, actor.slot_ranges(self.env.num_envs), strict=True
     ):
       print(f"  {ts.name}: [{lo}, {hi}) — goal_dim={ts.goal_dim}")
-    _, critic_input_dim = self._policy_input_dims()
-    critic = build_mlp(
-      critic_input_dim,
-      self.cfg.critic_hidden_dims,
-      output_dim=1,
-    ).to(self.device)
-
     policy_cfg = self.cfg.policy
 
     self.wm_env = MultiTaskWorldModelEnv(
@@ -552,12 +722,27 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       history_length=self.cfg.history_length,
       termination_softness=self.cfg.termination_softness,
       device=self.device,
+      estimator_input_config=self.cfg.estimator_inputs,
+      posterior_provider=self.imagined_posterior_provider,
     )
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and self.cfg.estimator_inputs is None:
       self.wm_env.step = torch.compile(self.wm_env.step)
       self.wm_env.reset = torch.compile(self.wm_env.reset)
 
     self._configure_reset_sampling()
+
+    if self.cfg.estimator_inputs is not None:
+      # No placeholder belief critic is allowed to become a training baseline.
+      # Collection and explicit short-sequence autograd checks remain available.
+      self.policy_learner = InputStagePolicy(actor=actor, cfg=policy_cfg)
+      return
+
+    _, critic_input_dim = self._policy_input_dims()
+    critic = build_mlp(
+      critic_input_dim,
+      self.cfg.critic_hidden_dims,
+      output_dim=1,
+    ).to(self.device)
 
     if isinstance(policy_cfg, ActorCriticPolicyLearnerCfg):
       self.policy_learner = ActorCriticPolicyLearner(
@@ -577,6 +762,22 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         cuda_graphs=self.cfg.cuda_graphs,
       )
 
+  @torch.inference_mode()
+  def reset_collection(self) -> None:
+    """Start real collection with one shared initial measurement per environment.
+
+    Input-stage users call this once, then step(posterior=...) or use the
+    constructor's collection posterior provider. Padding is not a filter update.
+    Match step()'s inference context for simulator caches created during rollout.
+    """
+    self.env.reset()
+    self.replay_buffer.truncate_open_episodes()
+    if self._sampler is not None:
+      self._sampler.truncate_open_episodes()
+    self._seed_sim_history()
+    self._current_posterior = None
+    self._posterior_ready = False
+
   def _build_sim_obs_td(
     self,
     rep_state: torch.Tensor,
@@ -584,7 +785,38 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     sim_actor_obs: torch.Tensor,
     motion_times: torch.Tensor,
     sim_ctx: torch.Tensor,
+    *,
+    posterior: PosteriorInput | None = None,
   ) -> TensorDict:
+    inputs = self.cfg.estimator_inputs
+    if inputs is not None:
+      if self._sim_history is None:
+        raise RuntimeError("Seed the measurement history after reset before collection")
+      sensor = self._sim_history[:, -1]
+      if not self._posterior_ready:
+        if posterior is None and self.posterior_provider is not None:
+          posterior = self.posterior_provider(
+            measurement=sensor[..., :64],
+            previous_action=sensor[..., 64:],
+            reset_mask=self._measurement_reset,
+          )
+        self._current_posterior = posterior
+      elif posterior is not None:
+        raise ValueError("A posterior was already supplied for this measurement")
+      alignment = self.motion_cmd.reference_alignment
+      reference = self._representation.reference_window(
+        self.motion, motion_times, alignment
+      )
+      goal, uncertainty = build_actor_features(
+        inputs,
+        self._representation.true_rpv(aux_state, rep_state),
+        self._current_posterior,
+        reference,
+      )
+      self._posterior_ready = True
+      return build_actor_obs_td(
+        {"motion": goal}, self._sim_history, task_uncertainty=uncertainty
+      )
     proprio = self.cfg.actor_obs == "proprio"
     sensor = self._representation.compute_actor_sensor(
       rep_state,
@@ -623,7 +855,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       device=self.device,
     )
 
-  def step(self) -> int:
+  def step(self, *, posterior: PosteriorInput | None = None) -> int:
     with torch.inference_mode():
       obs = self.env.get_observations()
       curr_states = obs["full_state"].to(self.device)
@@ -636,15 +868,33 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       aux_state = self._representation.extract_aux_state(curr_states)
       sim_ctx = self._sim_context.read(self.env.unwrapped)
       actor_td = self._build_sim_obs_td(
-        rep_state, aux_state, sim_actor_obs, motion_times, sim_ctx
+        rep_state,
+        aux_state,
+        sim_actor_obs,
+        motion_times,
+        sim_ctx,
+        posterior=posterior,
       )
 
       actions = self.policy_learner.actor(actor_td)
       actions = actions + torch.randn_like(actions) * self.policy_learner.cfg.noise
+      if self.cfg.estimator_inputs is not None:
+        actions = self.wm_env.limit_actions(actions)
 
       extra_fields = {"sim_ctx": sim_ctx}
       if self._stores_actor_obs:
-        extra_fields["actor_obs"] = sim_actor_obs
+        extra_fields["actor_obs"] = (
+          actor_td["history"][:, -1]
+          if self.cfg.estimator_inputs is not None
+          else sim_actor_obs
+        )
+      if self.cfg.estimator_inputs is not None:
+        if not torch.equal(actor_td["history"][:, -1, 64:], self.action_manager.action):
+          raise RuntimeError("Measured previous action differs from executed action")
+        alignment = self.motion_cmd.reference_alignment
+        # env.step can reset and replace per-environment alignment buffers.
+        extra_fields["alignment_rotation"] = alignment.rotation.clone()
+        extra_fields["alignment_translation"] = alignment.translation.clone()
 
       next_obs, rewards, dones, extras = self._step_and_store(
         actions,
@@ -680,6 +930,11 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       self.policy_learner.actor.update_normalization(actor_td)
 
   def run(self) -> None:
+    if self.cfg.estimator_inputs is not None:
+      raise NotImplementedError(
+        "Estimator input v1 is the step-1 interface scaffold. Use collection and "
+        "injected-posterior short sequences; full estimator/critic training comes later."
+      )
     log_dir = self._create_log_dir()
     self._init_wandb(log_dir)
 
@@ -772,7 +1027,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         world_model_path = str(log_dir / "world_model.pt")
         actor_path = str(log_dir / "actor.pt")
         torch.save(self._wm.bundle(), world_model_path)
-        torch.save(self.policy_learner.actor.state_dict(), actor_path)
+        torch.save(actor_checkpoint(self.policy_learner.actor, self.cfg), actor_path)
         checkpoint_files = [world_model_path, actor_path]
         critic = getattr(self.policy_learner, "critic", None)
         if critic is not None:
