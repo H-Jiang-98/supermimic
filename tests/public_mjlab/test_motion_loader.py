@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-from supermimic.motion_loader import MotionLoader
+from supermimic.motion_loader import MotionLoader, motion_content_digest
 
 
 def test_public_and_root_formats_have_same_targets(fk, motion_file):
@@ -16,6 +16,20 @@ def test_public_and_root_formats_have_same_targets(fk, motion_file):
     torch.testing.assert_close(a, b)
   # Stored public non-root bodies are intentionally bogus: FK defines targets.
   assert not torch.equal(public.body_pos_w[:, 0], public.body_pos_w[:, -1])
+  # File location/format do not affect the loaded reference's identity.
+  assert motion_content_digest(public) == motion_content_digest(root)
+
+
+def test_content_digest_distinguishes_equal_length_clips_and_their_order(
+  fk, motion_file
+):
+  paths = [motion_file("a.npz", frames=3), motion_file("b.npz", frames=3, root_x=10)]
+  first, second = (MotionLoader(path, fk, 29) for path in paths)
+  assert torch.equal(first.motion_ends, second.motion_ends)
+  assert motion_content_digest(first) != motion_content_digest(second)
+  forward, reverse = MotionLoader(paths, fk, 29), MotionLoader(paths[::-1], fk, 29)
+  assert torch.equal(forward.motion_ends, reverse.motion_ends)
+  assert motion_content_digest(forward) != motion_content_digest(reverse)
 
 
 def test_multiple_files_preserve_clip_boundaries(fk, motion_file):

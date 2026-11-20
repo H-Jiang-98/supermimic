@@ -3,12 +3,42 @@
 from __future__ import annotations
 
 import glob
+import hashlib
 from pathlib import Path
 
 import numpy as np
 import torch
 
 from supermimic.utils.forward_kinematics import ForwardKinematics
+
+
+def motion_content_digest(motion: MotionLoader) -> str:
+  """Fingerprint loaded references, including FK targets, at snapshot boundaries.
+
+  Paths and devices do not define a motion; tensor layouts, values and clip
+  order do. Recompute rather than cache so in-place edits cannot reuse a stale
+  identity. Chunk CPU transfers to bound temporary memory for large datasets.
+  """
+  digest = hashlib.sha256(b"supermimic_motion_reference_v1")
+  for name in (
+    "motion_ends",
+    "joint_pos",
+    "joint_vel",
+    "root_pos_w",
+    "root_quat_w",
+    "root_lin_vel_w",
+    "root_ang_vel_w",
+    "body_pos_w",
+    "body_quat_w",
+    "body_lin_vel_w",
+    "body_ang_vel_w",
+  ):
+    value = getattr(motion, name).detach()
+    digest.update(f"{name}:{value.dtype}:{tuple(value.shape)}".encode())
+    for chunk in value.split(4096):
+      raw = chunk.cpu().contiguous().reshape(-1).view(torch.uint8)
+      digest.update(raw.numpy())
+  return digest.hexdigest()
 
 
 def resolve_motion_files(motion_file: str | list[str]) -> list[str]:

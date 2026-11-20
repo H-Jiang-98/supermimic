@@ -98,7 +98,7 @@ def main() -> None:
   chosen_task, args = parse_train_args()
   if args.runner.estimator_inputs is not None:
     raise NotImplementedError(
-      "Estimator input v1 currently supports injected-posterior interface checks; "
+      "Estimator inputs support collection, keyed replay and short belief rollouts; "
       "complete estimator/belief critic training is not enabled"
     )
   if args.config is not None:

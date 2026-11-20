@@ -23,6 +23,8 @@ import torch
 from mjlab.utils.lab_api.math import quat_mul
 from tensordict import TensorDict
 
+from supermimic.belief import BeliefState
+from supermimic.belief_provider import BeliefProvider, PreparedBelief
 from supermimic.estimator_inputs import (
   EITInputConfig,
   EpisodeAlignment,
@@ -31,8 +33,11 @@ from supermimic.estimator_inputs import (
   build_actor_features,
   sample_proprio,
 )
+from supermimic.motion_loader import motion_content_digest
 from supermimic.replay_buffer import ReplayBuffer
 from supermimic.utils.helpers import matrix_to_quat, normalized_action_limits
+from supermimic.utils.lie_state import LieState
+from supermimic.utils.validation import validate_rotation
 
 if TYPE_CHECKING:
   from supermimic.models import Dynamics
@@ -44,6 +49,15 @@ class _EstimatorGoals(NamedTuple):
   actor: torch.Tensor
   critic: torch.Tensor
   uncertainty: torch.Tensor | None
+
+
+class _BeliefFrame(NamedTuple):
+  """Provider revision used to build this latent frame's policy observation."""
+
+  provider: BeliefProvider
+  generation: int
+  episode_id: torch.Tensor
+  time_index: torch.Tensor
 
 
 class WorldModelEnv(ABC):
@@ -78,7 +92,9 @@ class WorldModelEnv(ABC):
     self.estimator_input_config = estimator_input_config
     self.posterior_provider = posterior_provider
     self._posterior: PosteriorInput | None = None
+    self._belief_frame: _BeliefFrame | None = None
     self._task_uncertainty: torch.Tensor | None = None
+    self._pending_belief_step = None
     if estimator_input_config is not None:
       if not self._supports_estimator_inputs:
         raise ValueError("Estimator inputs require the MultiTaskWorldModelEnv adapter")
@@ -139,15 +155,35 @@ class WorldModelEnv(ABC):
     batch: TensorDict | None = None,
     *,
     posterior: PosteriorInput | None = None,
+    episode_id: int | torch.Tensor | None = None,
+    time_index: int | torch.Tensor | None = None,
+    segment_time: int | torch.Tensor | None = None,
   ) -> TensorDict:
-    """Reset buffers to ``batch`` (a fresh ``sample_initial_states()`` by
-    default) and refresh goals."""
+    """Rebuild through a physical time_index or a zero-based retained segment_time."""
+    candidate = None
     if self.estimator_input_config is not None:
       self._check_posterior_source(posterior)
+    if isinstance(self.posterior_provider, BeliefProvider):
+      if (
+        batch is not None
+        or posterior is not None
+        or episode_id is None
+        or (time_index is None) == (segment_time is None)
+      ):
+        raise ValueError(
+          "Belief reset requires episode_id and one of time_index or segment_time from replay"
+        )
+      batch, candidate = self._rebuild_from_replay(
+        episode_id,
+        time_index if segment_time is None else segment_time,
+        relative=segment_time is not None,
+      )
+    elif episode_id is not None or time_index is not None or segment_time is not None:
+      raise ValueError("Keyed replay reset requires a full belief provider")
     if batch is None:
       batch = self.sample_initial_states()
     if self.estimator_input_config is not None:
-      return self._reset_estimator_inputs(batch, posterior)
+      return self._reset_estimator_inputs(batch, posterior, candidate=candidate)
     self.aux_state, self.rep_state = self._unpack_initial_states(batch)
     self.joint_state = self.representation.joint_state(self.rep_state)
     # Raw policy outputs (pre-scale/offset). Dynamics handles the transform;
@@ -158,8 +194,22 @@ class WorldModelEnv(ABC):
     return self.get_observations()
 
   def step(
-    self, actions: torch.Tensor, *, posterior: PosteriorInput | None = None
+    self,
+    actions: torch.Tensor,
+    *,
+    posterior: PosteriorInput | None = None,
+    process_noise: torch.Tensor | None = None,
+    measurement_noise: torch.Tensor | None = None,
   ) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict[str, object]]:
+    self._check_belief_frame()
+    if isinstance(self.posterior_provider, BeliefProvider):
+      if posterior is not None:
+        raise ValueError(
+          "A live belief provider requires full restore, not RPV injection"
+        )
+      return self._step_belief_inputs(actions, process_noise, measurement_noise)
+    if process_noise is not None or measurement_noise is not None:
+      raise ValueError("Explicit rollout noises require a full belief provider")
     if self.estimator_input_config is not None:
       return self._step_estimator_inputs(actions, posterior)
     next_aux_state, next_rep_state, next_joint_state, term_prob, rewards = (
@@ -188,16 +238,211 @@ class WorldModelEnv(ABC):
 
   def _check_posterior_source(self, posterior: PosteriorInput | None) -> None:
     config = self.estimator_input_config
+    if isinstance(self.posterior_provider, BeliefProvider):
+      estimator = self.posterior_provider.estimator
+      if (
+        config is None
+        or estimator.dynamics is not self.dynamics
+        or estimator.measurement_config != config.measurement_noise
+        or not torch.equal(
+          estimator.default_joint_pos, self.representation._default_joint_pos
+        )
+      ):
+        raise ValueError(
+          "Belief provider must use the environment dynamics and measurement definition"
+        )
+      if not self.posterior_provider.differentiable:
+        raise ValueError("Imagined belief provider must retain differentiable state")
     if config.uses_posterior and posterior is None and self.posterior_provider is None:
       raise ValueError(
         f"Group {config.group} in {config.mode} mode requires posterior mean"
       )
 
+  def _check_belief_frame(self) -> None:
+    """Cached goals and policy actions must still refer to the committed posterior."""
+    provider, frame = self.posterior_provider, self._belief_frame
+    if frame is None and not isinstance(provider, BeliefProvider):
+      return
+    if (
+      frame is None
+      or provider is not frame.provider
+      or provider.generation != frame.generation
+      or provider.lookup(frame.episode_id, frame.time_index, self.sim_ctx) is None
+    ):
+      raise ValueError("Imagined posterior changed; reset from keyed replay")
+
+  def _commit_belief_frame(self, candidate: PreparedBelief) -> None:
+    provider = self.posterior_provider
+    provider.commit(candidate)
+    self._belief_frame = _BeliefFrame(
+      provider,
+      provider.generation,
+      candidate.state.episode_id.clone(),
+      candidate.state.time_index.clone(),
+    )
+
+  def _rebuild_from_replay(self, episode_id, time_index, *, relative=False):
+    """Use the recorded prior, actions and measurements, at one model version."""
+
+    def indices(value):
+      value = torch.as_tensor(value, device=self.device)
+      if value.ndim == 0:
+        value = value.expand(self.num_envs)
+      if (
+        value.shape != (self.num_envs,)
+        or value.dtype != torch.long
+        or (value < 0).any()
+      ):
+        raise ValueError(
+          "Replay keys must be nonnegative int64 indices per rollout slot"
+        )
+      return value
+
+    episodes, times = indices(episode_id), indices(time_index)
+    provider = self.posterior_provider
+    version = provider.model_version
+    targets, histories, means, covariances = [], [], [], []
+    # The rollout treats Q[t|t] as its initial condition. Relinearize every
+    # recorded transition but do not retain its model-training graph.
+    with torch.inference_mode(False), torch.no_grad():
+      for episode, t in zip(episodes.tolist(), times.tolist(), strict=True):
+        prior, frames = self.replay_buffer.training_prefix(
+          episode, t, relative=relative
+        )
+        measurements = frames["actor_obs"][..., :64]
+        current = provider.estimator.correct(
+          prior.index(None).clone(), measurements[:1]
+        )
+        for k in range(1, len(frames)):
+          predicted = provider.estimator.predict(
+            current, frames["action"][k - 1 : k], frames["sim_ctx"][k - 1 : k]
+          )
+          current = provider.estimator.correct(predicted, measurements[k : k + 1])
+        means.append(current.mean.to_full())
+        covariances.append(current.covariance)
+        targets.append(frames[-1])
+        history_indices = (
+          len(frames) - 1 + torch.arange(1 - self.history_length, 1, device=self.device)
+        ).clamp_min(0)
+        histories.append(frames["actor_obs"][history_indices])
+      batch = torch.stack(targets)
+      batch["sensor_window"] = torch.stack(histories)
+      belief = BeliefState(LieState.from_full(torch.cat(means)), torch.cat(covariances))
+      candidate = provider.prepare_restore(
+        belief,
+        batch["sim_ctx"],
+        model_version=version,
+        episode_id=episodes,
+        time_index=batch["segment_time"],
+      )
+    return batch, candidate
+
+  def snapshot(self) -> dict:
+    """Save the last committed imagined frame as a detached rollout starting point."""
+    if not isinstance(self.posterior_provider, BeliefProvider):
+      raise ValueError("An imagined snapshot requires a full belief provider")
+    self._check_belief_frame()
+    frame = {
+      "aux_state": self.aux_state,
+      "rep_state": self.rep_state,
+      "sensor_window": self._sensor_history(),
+      "prev_action": self.last_actions,
+      "sim_ctx": self.sim_ctx,
+      "motion_time": self.motion_times,
+      "alignment_rotation": self.reference_alignment.rotation,
+      "alignment_translation": self.reference_alignment.translation,
+      "episode_id": self._belief_frame.episode_id,
+      "segment_time": self._belief_frame.time_index,
+      "segment_start_time": self._segment_start_time,
+    }
+    return {
+      "version": 2,
+      "estimator_inputs": self.estimator_input_config.to_dict(),
+      "motion_ends": self.motion.motion_ends.detach().clone(),
+      "motion_digest": motion_content_digest(self.motion),
+      "provider": self.posterior_provider.state_dict(),
+      "frame": {key: value.detach().clone() for key, value in frame.items()},
+    }
+
+  def restore(self, snapshot: dict) -> TensorDict:
+    """Resume an imagined frame on the same model and motion without replay or fusion."""
+    if not isinstance(self.posterior_provider, BeliefProvider):
+      raise ValueError("An imagined restore requires a full belief provider")
+    self._check_posterior_source(None)
+    if snapshot.get("version") != 2:
+      raise ValueError(
+        "Imagined snapshot version 2 with a motion content fingerprint is required"
+      )
+    if snapshot.get(
+      "estimator_inputs"
+    ) != self.estimator_input_config.to_dict() or not torch.equal(
+      snapshot["motion_ends"], self.motion.motion_ends
+    ):
+      raise ValueError("Imagined snapshot configuration mismatch")
+    if snapshot.get("motion_digest") != motion_content_digest(self.motion):
+      raise ValueError("Imagined snapshot reference motion content mismatch")
+    candidate = self.posterior_provider.prepare_load_state_dict(snapshot["provider"])
+    state = candidate.state
+    frame = snapshot["frame"]
+    shapes = {
+      "aux_state": (7,),
+      "rep_state": (68,),
+      "sensor_window": (self.history_length, 93),
+      "prev_action": (29,),
+      "sim_ctx": (self.dynamics.sim_ctx_dim,),
+      "alignment_rotation": (3, 3),
+      "alignment_translation": (3,),
+    }
+    batch = {}
+    for key, shape in shapes.items():
+      value = frame[key]
+      if (
+        value.shape != (self.num_envs, *shape)
+        or value.device != state.context.device
+        or value.dtype != state.context.dtype
+        or not torch.isfinite(value).all()
+      ):
+        raise ValueError(f"Invalid imagined snapshot field {key}")
+      batch[key] = value.detach().clone()
+    for key in ("segment_start_time", "motion_time", "episode_id", "segment_time"):
+      value = frame[key]
+      if (
+        value.shape != (self.num_envs,)
+        or value.dtype != torch.long
+        or value.device != state.context.device
+        or (value < 0).any()
+      ):
+        raise ValueError(f"Invalid imagined snapshot index {key}")
+      batch[key] = value.detach().clone()
+    if (
+      not torch.equal(batch["episode_id"], state.episode_id)
+      or not torch.equal(batch["segment_time"], state.time_index)
+      or not torch.equal(batch["sim_ctx"], state.context)
+      or (batch["motion_time"] >= self.motion.motion_ends[-1]).any()
+    ):
+      raise ValueError("Imagined snapshot frame and posterior disagree")
+    validate_rotation(batch["alignment_rotation"])
+    aux, rep = batch.pop("aux_state"), batch.pop("rep_state")
+    LieState.from_rep(aux, rep).validate()
+    batch["time_index"] = batch["segment_start_time"] + batch["segment_time"]
+    batch["actor_obs"] = batch["sensor_window"][:, -1]
+    return self._reset_estimator_inputs(
+      TensorDict(batch, batch_size=[self.num_envs]),
+      None,
+      candidate=candidate,
+      latent=(aux, rep),
+    )
+
   def _reset_estimator_inputs(
-    self, batch: TensorDict, posterior: PosteriorInput | None
+    self,
+    batch: TensorDict,
+    posterior: PosteriorInput | None,
+    *,
+    candidate: PreparedBelief | None = None,
+    latent: tuple[torch.Tensor, torch.Tensor] | None = None,
   ) -> TensorDict:
     """Validate the complete reset input before replacing a live rollout."""
-    aux, rep = self._unpack_initial_states(batch)
+    aux, rep = self._unpack_initial_states(batch) if latent is None else latent
     joints = self.representation.joint_state(rep)
     actions = batch["prev_action"].detach()
     required = {"alignment_rotation", "alignment_translation"}
@@ -217,18 +462,144 @@ class WorldModelEnv(ABC):
     if not torch.equal(history[:, -1, -29:], actions):
       raise ValueError("Stored measurement actions must equal replay prev_action")
     sensor = history[:, -1]
-    posterior = self._resolve_posterior(posterior, sensor, actions, reset=True)
+    if candidate is not None:
+      posterior = candidate.to_actor_input()
+    else:
+      posterior = self._resolve_posterior(posterior, sensor, actions, reset=True)
     goals = self._prepare_estimator_goals(
       aux, rep, batch["motion_time"], alignment, posterior
     )
     # Commit only after posterior and all actor/critic reference inputs are valid.
+    if candidate is not None:
+      self._commit_belief_frame(candidate)
+      self._segment_start_time = batch["time_index"] - batch["segment_time"]
+    else:
+      self._belief_frame = None
     self.aux_state, self.rep_state, self.joint_state = aux, rep, joints
     self.last_actions, self.sim_ctx = actions, batch["sim_ctx"]
     self.motion_times, self.reference_alignment = batch["motion_time"], alignment
     self._past_sensors, self._latest_sensor = history[:, :-1], sensor
-    self._posterior = posterior
+    self._posterior = posterior if candidate is None else None
     self._commit_estimator_goals(goals)
+    self._pending_belief_step = None
     return self.get_observations()
+
+  def _step_belief_inputs(self, actions, process_noise, measurement_noise):
+    """Stage latent state, one measurement and belief as one transaction.
+
+    Input validation precedes any random draw. After sampling, retries reuse
+    that transition with the same action. Noise arguments are standard normal
+    samples. Omit them on retry to reuse the original samples and graphs.
+    A keyed reset abandons the pending transition.
+    """
+    self._check_posterior_source(None)
+    frame = self._belief_frame
+    assert frame is not None
+    inputs = (
+      ("actions", actions, self.num_actions),
+      ("process_noise", process_noise, 70),
+      ("measurement_noise", measurement_noise, 64),
+    )
+    for name, value, width in inputs:
+      if value is not None and (
+        value.shape != (self.num_envs, width)
+        or value.dtype != self.rep_state.dtype
+        or value.device != self.rep_state.device
+        or not torch.isfinite(value).all()
+      ):
+        raise ValueError(
+          f"{name} must be finite with shape ({self.num_envs},{width}) "
+          "and match the rollout dtype and device"
+        )
+    actions = self.limit_actions(actions.clone())
+    pending = self._pending_belief_step
+    if pending is None:
+      # Autograd and retries must both see the realized samples, even when the
+      # caller reuses a noise tensor as mutable storage for another transition.
+      def sample(value, width):
+        if value is None:
+          return torch.randn(
+            self.num_envs, width, device=actions.device, dtype=actions.dtype
+          )
+        return value.clone()
+
+      process_noise = sample(process_noise, 70)
+      measurement_noise = sample(measurement_noise, 64)
+      aux, rep, joints, term_prob, rewards = self._wm_step(
+        self.rep_state,
+        self.aux_state,
+        actions,
+        self.last_actions,
+        self.sim_ctx,
+        process_noise=process_noise,
+      )
+      sensor = self._sensor_from_state(
+        rep, aux, joints, actions, self.sim_ctx, measurement_noise=measurement_noise
+      )
+      outputs = (aux, rep, joints, term_prob, rewards, sensor)
+      if not torch.stack([torch.isfinite(value).all() for value in outputs]).all():
+        raise ValueError("World model produced a non-finite imagined transition")
+      pending = dict(
+        gradient_sources={
+          name: value
+          for name, value, _ in inputs
+          if value is not None and value.requires_grad
+        },
+        actions=actions,
+        process_noise=process_noise,
+        measurement_noise=measurement_noise,
+        aux=aux,
+        rep=rep,
+        joints=joints,
+        term_prob=term_prob,
+        rewards=rewards,
+        sensor=sensor,
+        times=self._next_motion_times(),
+      )
+      self._pending_belief_step = pending
+    else:
+      for name, value, _ in inputs:
+        if value is None:
+          continue  # Omitted explicit noise reuses the original sample and graph.
+        realized = actions if name == "actions" else value
+        if not torch.equal(realized, pending[name]):
+          raise ValueError(
+            "Pending transition retry must use the same action/noises or reset"
+          )
+        source = pending["gradient_sources"].get(name)
+        if (source is not None or value.requires_grad) and value is not source:
+          raise ValueError(
+            f"Retry must reuse the same differentiable {name} tensor or reset"
+          )
+    candidate = frame.provider.prepare(
+      measurement=pending["sensor"][..., :64],
+      previous_action=pending["actions"],
+      reset_mask=torch.zeros(self.num_envs, dtype=torch.bool, device=actions.device),
+      context=self.sim_ctx,
+      episode_id=frame.episode_id,
+      time_index=frame.time_index + 1,
+    )
+    if candidate.generation != frame.generation:
+      raise ValueError("Imagined posterior changed; reset from keyed replay")
+    posterior = candidate.to_actor_input()
+    goals = self._prepare_estimator_goals(
+      pending["aux"],
+      pending["rep"],
+      pending["times"],
+      self.reference_alignment,
+      posterior,
+    )
+    self._commit_belief_frame(candidate)
+    if self.history_length > 1:
+      self._past_sensors = torch.cat(
+        [self._past_sensors[:, 1:], self._latest_sensor.unsqueeze(1)], dim=1
+      )
+    self.aux_state, self.rep_state = pending["aux"], pending["rep"]
+    self.joint_state, self.last_actions = pending["joints"], pending["actions"]
+    self.motion_times, self._latest_sensor = pending["times"], pending["sensor"]
+    self._commit_estimator_goals(goals)
+    self._pending_belief_step = None
+    return self.get_observations(), pending["rewards"], pending["term_prob"], {}
 
   def _step_estimator_inputs(
     self, actions: torch.Tensor, posterior: PosteriorInput | None
@@ -282,6 +653,8 @@ class WorldModelEnv(ABC):
     joints: torch.Tensor,
     actions: torch.Tensor,
     sim_ctx: torch.Tensor,
+    *,
+    measurement_noise: torch.Tensor | None = None,
   ) -> torch.Tensor:
     sensor = self.representation.compute_actor_sensor(
       rep,
@@ -292,6 +665,18 @@ class WorldModelEnv(ABC):
       noisy=self.estimator_input_config is None,
     )
     if self.estimator_input_config is not None:
+      if measurement_noise is not None:
+        if (
+          measurement_noise.shape != sensor[..., :64].shape
+          or not torch.isfinite(measurement_noise).all()
+        ):
+          raise ValueError("measurement_noise must be finite with shape (B,64)")
+        std = self.estimator_input_config.measurement_noise.standard_deviations(
+          29, device=sensor.device, dtype=sensor.dtype
+        )
+        return torch.cat(
+          [sensor[..., :64] + measurement_noise * std, sensor[..., 64:]], -1
+        )
       return sample_proprio(sensor, self.estimator_input_config.measurement_noise)
     return sensor
 
@@ -337,6 +722,8 @@ class WorldModelEnv(ABC):
     action: torch.Tensor,
     last_action: torch.Tensor,
     sim_ctx: torch.Tensor,
+    *,
+    process_noise: torch.Tensor | None = None,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Bundled dynamics + termination + reward for one env step.
 
@@ -346,9 +733,14 @@ class WorldModelEnv(ABC):
     score the post-step state against the cached reference body state, the way
     the simulator scores it before advancing the clip.
     """
-    next_aux_state, next_rep_state = self.dynamics(
-      rep_state, action, aux_state, sim_ctx
-    )
+    if process_noise is None:
+      next_aux_state, next_rep_state = self.dynamics(
+        rep_state, action, aux_state, sim_ctx
+      )
+    else:
+      next_aux_state, next_rep_state = self.dynamics.sample(
+        rep_state, action, aux_state, sim_ctx, process_noise
+      )
     next_joint_state = self.representation.joint_state(next_rep_state)
     ref_body_pos_w, ref_body_quat_w, ref_body_lin_vel_w, ref_body_ang_vel_w = (
       self._ref_body_state

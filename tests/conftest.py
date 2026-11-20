@@ -186,14 +186,23 @@ def make_mock_motion(num_frames: int = 10, num_bodies: int = 14) -> MagicMock:
   tracked body (``body_state``) at rest at the origin."""
 
   def body_state(frames: torch.Tensor) -> tuple[torch.Tensor, ...]:
-    zeros = torch.zeros(*frames.shape, num_bodies, 3)
-    quat = torch.tensor([1.0, 0.0, 0.0, 0.0]).repeat(*frames.shape, num_bodies, 1)
-    return zeros, quat, zeros, zeros
+    return tuple(
+      getattr(motion, name)[frames]
+      for name in ("body_pos_w", "body_quat_w", "body_lin_vel_w", "body_ang_vel_w")
+    )
 
   motion = MagicMock()
   motion.body_state.side_effect = body_state
   motion.root_pos_w = torch.zeros(num_frames, 3)
   motion.root_quat_w = torch.tensor([1.0, 0.0, 0.0, 0.0]).repeat(num_frames, 1)
+  motion.root_lin_vel_w = torch.zeros(num_frames, 3)
+  motion.root_ang_vel_w = torch.zeros(num_frames, 3)
+  motion.body_pos_w = torch.zeros(num_frames, num_bodies, 3)
+  motion.body_quat_w = torch.tensor([1.0, 0.0, 0.0, 0.0]).repeat(
+    num_frames, num_bodies, 1
+  )
+  motion.body_lin_vel_w = torch.zeros(num_frames, num_bodies, 3)
+  motion.body_ang_vel_w = torch.zeros(num_frames, num_bodies, 3)
   motion.joint_pos = torch.randn(num_frames, 29)
   motion.joint_vel = torch.randn(num_frames, 29)
   motion.motion_ends = torch.tensor([num_frames], dtype=torch.long)

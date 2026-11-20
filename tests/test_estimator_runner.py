@@ -200,6 +200,64 @@ class _PhysicalEnv:
     return self.get_observations(), torch.ones(BATCH), dones, {}
 
 
+@pytest.mark.parametrize("failure", ["sensor", "before_insert", "after_insert"])
+def test_post_physics_retry_commits_the_executed_transition_once(failure, monkeypatch):
+  provider = _MeasurementPosterior()
+  runner = _runner("B", provider=provider)
+  runner.env = _PhysicalEnv(runner)
+  runner.action_manager = runner.env.action_manager
+  runner.replay_buffer = ReplayBuffer(runner._buffer_schema(), 2, BATCH)
+  runner._pending_norm_updates = []
+  runner.world_model_learner = MagicMock()
+  runner.logger = MagicMock()
+  runner._sampler = None
+  actor = build_actor(runner.cfg, runner._wm, "cpu")
+  runner.policy_learner = InputStagePolicy(actor, runner.cfg.policy)
+  runner.reset_collection()
+  history = runner._sim_history.clone()
+  initial_ids = runner._episode_id.clone()
+  sample = MagicMock(wraps=runner._representation.add_proprio_noise)
+  monkeypatch.setattr(runner._representation, "add_proprio_noise", sample)
+  insert = runner.replay_buffer.insert
+  if failure == "sensor":
+    sample.side_effect = ValueError("sensor")
+  else:
+
+    def fail(*args, **kwargs):
+      if failure == "after_insert":
+        insert(*args, **kwargs)
+      raise ValueError(failure)
+
+    monkeypatch.setattr(runner.replay_buffer, "insert", fail)
+  with pytest.raises(ValueError, match=failure):
+    runner.step()
+  assert len(runner.env.actions) == 1
+  assert len(provider.calls) == 1
+  assert torch.equal(history, runner._sim_history)
+  assert runner.replay_buffer.insert_count == int(failure == "after_insert")
+  sample.side_effect = None
+  monkeypatch.setattr(runner.replay_buffer, "insert", insert)
+  rng = torch.random.get_rng_state()
+  assert runner.step() == BATCH
+  assert sample.call_count == 1 + int(failure == "sensor")
+  if failure != "sensor":
+    assert torch.equal(rng, torch.random.get_rng_state())
+  assert (
+    len(runner.env.actions)
+    == len(provider.calls)
+    == runner.replay_buffer.insert_count
+    == 1
+  )
+  assert runner.logger.process_env_step.call_count == 1
+  stored = runner.replay_buffer._storage[:, 0]
+  assert torch.equal(stored["action"], runner.env.actions[0])
+  assert torch.equal(stored["actor_obs"], history[:, -1])
+  assert torch.equal(stored["episode_id"], initial_ids)
+  assert runner._time_index.tolist() == [0, 1, 1]
+  runner.step()
+  assert runner.replay_buffer._storage["time_index"][:, 1].tolist() == [0, 1, 1]
+
+
 def test_two_real_collection_steps_share_measurements_actions_and_reset_history():
   torch.manual_seed(91)
   provider = _MeasurementPosterior()

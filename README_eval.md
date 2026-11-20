@@ -3,6 +3,11 @@
 先完成 [环境安装](README.md#setup)，以下命令均在仓库根目录执行。
 `play.py` 加载已有模型，在单个仿真环境中观察策略跟踪效果和世界模型预测，不更新权重。
 
+本页适用于旧输入布局的 checkpoint。`eit_rpv_v1` 的 A/B/C estimator 配置目前由
+play、viewer、benchmark 和 ONNX exporter 明确拒绝；第二步的真实采集与随机想象
+验收请使用 [README 中的 check_estimator 命令](README.md#estimator-第二步完整-belief-与随机动力学)。
+短序列梯度验证不等同于独立闭环控制性能评估。
+
 ## 启动播放
 
 编辑 [play_config.toml](play_config.toml)，填写自己的 W&B 用户名或团队名。例如固定使用 `v32`：

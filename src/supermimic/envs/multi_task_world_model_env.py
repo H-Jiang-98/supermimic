@@ -74,6 +74,7 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
       ).clone()
 
   def get_observations(self) -> TensorDict:
+    self._check_belief_frame()
     obs = build_actor_obs_td(
       self._task_goal_obs, self._sensor_history(), critic=self._critic_obs()
     )
