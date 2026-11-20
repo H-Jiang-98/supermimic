@@ -11,6 +11,7 @@ from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 from mjlab.managers import ObservationGroupCfg, ObservationTermCfg, TerminationTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.tasks.tracking.config.g1.env_cfgs import unitree_g1_flat_tracking_env_cfg
+from mjlab.utils.lab_api.math import matrix_from_quat
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 
 from supermimic.motion_command import MotionCommand, MotionCommandCfg, motion_end
@@ -20,6 +21,8 @@ from supermimic.representations import (
   motion_anchor_window,
   motion_goal_window,
 )
+from supermimic.utils.helpers import rotation_error_magnitude
+from supermimic.utils.tracking_reward import _reanchor_targets
 
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 
@@ -162,6 +165,32 @@ def _goal_obs_group() -> ObservationGroupCfg:
   )
 
 
+def current_body_pose_reward(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  std: float,
+  orientation: bool,
+  body_names: tuple[str, ...] | None = None,
+) -> torch.Tensor:
+  """Re-anchor at reward evaluation, after physics and before command advancement."""
+  cmd = cast(MotionCommand, env.command_manager.get_term(command_name))
+  pos, rot = _reanchor_targets(
+    cmd.body_pos_w, cmd.body_quat_w, cmd.robot_anchor_pos_w, cmd.robot_anchor_quat_w
+  )
+  bodies = [
+    i
+    for i, name in enumerate(cmd.cfg.body_names)
+    if body_names is None or name in body_names
+  ]
+  if orientation:
+    error = rotation_error_magnitude(
+      matrix_from_quat(cmd.robot_body_quat_w[:, bodies]), rot[:, bodies]
+    ).square()
+  else:
+    error = (cmd.robot_body_pos_w[:, bodies] - pos[:, bodies]).square().sum(-1)
+  return torch.exp(-error.mean(-1) / std**2)
+
+
 def configure_estimator_env_cfg(cfg: ManagerBasedRlEnvCfg) -> ManagerBasedRlEnvCfg:
   """Prepare the G1 GenCoord environment for the versioned estimator actor.
 
@@ -177,6 +206,10 @@ def configure_estimator_env_cfg(cfg: ManagerBasedRlEnvCfg) -> ManagerBasedRlEnvC
   if full_state is None or "root_pos" not in full_state.terms:
     raise ValueError("Estimator inputs require the GenCoord full-state layout")
   motion.fixed_reference_alignment = True
+  for name, orientation in (("motion_body_pos", False), ("motion_body_ori", True)):
+    term = cfg.rewards[name]
+    term.func = current_body_pose_reward
+    term.params = dict(term.params, orientation=orientation)
   actor = cfg.observations["actor"]
   actor.enable_corruption = False
   for term in actor.terms.values():

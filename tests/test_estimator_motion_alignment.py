@@ -136,6 +136,9 @@ def test_hybrid_reward_matches_simulation_with_fixed_reference(offset, yaw):
   command._resample_command(torch.tensor([0, 1]))
   target_pos = command.body_pos_w
   target_quat = command.body_quat_w
+  # The real reward manager runs before the command refresh for this step.
+  command.update_relative_body_poses()
+  cached_pos = command.body_pos_relative_w.clone()
   delta = torch.tensor(
     [torch.cos(torch.tensor(yaw / 2)), 0.0, 0.0, torch.sin(torch.tensor(yaw / 2))]
   )
@@ -154,13 +157,14 @@ def test_hybrid_reward_matches_simulation_with_fixed_reference(offset, yaw):
   command.robot.data.joint_pos[:, 0] = 10.2  # Exercise the joint-limit penalty.
   action = torch.full((2, 29), 0.2)
   last_action = torch.full((2, 29), 0.1)
-  command.update_relative_body_poses()
   reward_env = SimpleNamespace(
     command_manager=SimpleNamespace(get_term=lambda _: command),
     action_manager=SimpleNamespace(action=action, prev_action=last_action),
     scene={"robot": command.robot},
   )
-  cfg = gencoord_env_cfg()
+  cfg = configure_estimator_env_cfg(gencoord_env_cfg())
+  if offset:
+    assert not torch.allclose(cached_pos[:, 0], command.robot_anchor_pos_w)
   terms = {
     name: term.func(reward_env, **term.params) for name, term in cfg.rewards.items()
   }
