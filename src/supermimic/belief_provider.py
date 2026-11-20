@@ -88,6 +88,13 @@ class BeliefProvider:
   def model_version(self) -> str:
     return self.estimator.dynamics.model_version
 
+  def clear(self) -> None:
+    """Release an active graph and invalidate outstanding transactions."""
+    self.state = None
+    self.diagnostics = None
+    self._pending_prior = None
+    self._generation += 1
+
   @property
   def generation(self) -> int:
     """Changes on every committed filter update or restore."""

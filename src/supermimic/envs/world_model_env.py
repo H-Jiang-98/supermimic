@@ -17,6 +17,7 @@ single-actor policy and the multi-encoder actor, and may override
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
@@ -60,6 +61,45 @@ class _BeliefFrame(NamedTuple):
   time_index: torch.Tensor
 
 
+@dataclass(frozen=True)
+class BeliefRolloutStart:
+  """Detached physical frames and posteriors at one sealed replay/model version."""
+
+  batch: TensorDict
+  belief: BeliefState
+  model_version: str
+  replay_buffer: ReplayBuffer
+  insert_count: int
+  motion_digest: str
+  remaining_steps: torch.Tensor
+
+  def __len__(self):
+    return len(self.batch)
+
+  @property
+  def motion_times(self):
+    return self.batch["motion_time"]
+
+  def index(self, selection):
+    if isinstance(selection, int):
+      selection = [selection]
+    return replace(
+      self,
+      batch=self.batch[selection].clone(),
+      belief=self.belief.index(selection).clone(),
+      remaining_steps=self.remaining_steps[selection].clone(),
+    )
+
+  def repeat_interleave(self, repeats: int):
+    if type(repeats) is not int or repeats < 1:
+      raise ValueError("Rollout repeats must be positive")
+    return self.index(
+      torch.arange(len(self), device=self.motion_times.device).repeat_interleave(
+        repeats
+      )
+    )
+
+
 class WorldModelEnv(ABC):
   """Differentiable world model env for motion tracking.
 
@@ -95,6 +135,9 @@ class WorldModelEnv(ABC):
     self._belief_frame: _BeliefFrame | None = None
     self._task_uncertainty: torch.Tensor | None = None
     self._pending_belief_step = None
+    self.eit_critic = False
+    self.critic_input_config = None
+    self._reference_finished = None
     if estimator_input_config is not None:
       if not self._supports_estimator_inputs:
         raise ValueError("Estimator inputs require the MultiTaskWorldModelEnv adapter")
@@ -337,6 +380,163 @@ class WorldModelEnv(ABC):
       )
     return batch, candidate
 
+  def _last_reference_frame(self, frames):
+    if (
+      frames.dtype != torch.long
+      or (frames < 0).any()
+      or (frames >= self.motion.motion_ends[-1]).any()
+    ):
+      raise ValueError("Reference frame indices must be valid nonnegative int64 values")
+    clips = torch.searchsorted(self.motion.motion_ends, frames, right=True)
+    return self.motion.motion_ends[clips] - 1
+
+  def prepare_policy_starts(self, episode_id, time_index) -> BeliefRolloutStart:
+    """Reconstruct each unique physical frame once, without changing live state."""
+    self._check_posterior_source(None)
+    if not isinstance(self.posterior_provider, BeliefProvider):
+      raise ValueError("Policy starts require a full belief provider")
+    episodes = torch.as_tensor(episode_id, device=self.device)
+    times = torch.as_tensor(time_index, device=self.device)
+    if (
+      episodes.ndim != 1
+      or not len(episodes)
+      or times.shape != episodes.shape
+      or episodes.dtype != torch.long
+      or times.dtype != torch.long
+    ):
+      raise ValueError("Policy start keys require equal nonempty int64 vectors")
+    keys, inverse = torch.unique(
+      torch.stack((episodes, times), -1), dim=0, return_inverse=True
+    )
+    previous_size = self.num_envs
+    try:
+      self.num_envs = len(keys)
+      batch, candidate = self._rebuild_from_replay(keys[:, 0], keys[:, 1])
+    finally:
+      self.num_envs = previous_size
+    with torch.inference_mode(False), torch.no_grad():
+      batch = batch.detach().clone()
+      start = BeliefRolloutStart(
+        batch,
+        candidate.state.belief.detach().clone(),
+        candidate.state.model_version,
+        self.replay_buffer,
+        self.replay_buffer.insert_count,
+        motion_content_digest(self.motion),
+        self._last_reference_frame(batch["motion_time"]) - batch["motion_time"] + 1,
+      )
+      return start.index(inverse)
+
+  def sample_policy_starts(self, batch_size: int, episode_ids, generator=None):
+    if type(batch_size) is not int or batch_size < 1:
+      raise ValueError("Policy start batch size must be positive")
+    frames = self.replay_buffer.retained_frames(episode_ids=episode_ids)
+    if not len(frames):
+      raise ValueError("No training frames available for policy starts")
+    selected = torch.randint(
+      len(frames), (batch_size,), device=self.device, generator=generator
+    )
+    return self.prepare_policy_starts(
+      frames["episode_id"][selected], frames["time_index"][selected]
+    )
+
+  def reset_prepared(self, start: BeliefRolloutStart) -> TensorDict:
+    """Restore a copied Q0 without sampling or fusing the first measurement again."""
+    self._check_posterior_source(None)
+    if not isinstance(start, BeliefRolloutStart) or not len(start):
+      raise ValueError("A nonempty BeliefRolloutStart is required")
+    if (
+      start.replay_buffer is not self.replay_buffer
+      or start.insert_count != self.replay_buffer.insert_count
+      or start.motion_digest != motion_content_digest(self.motion)
+      or start.model_version != self.dynamics.model_version
+    ):
+      raise ValueError("Stale rollout start: model, replay or motion changed")
+    batch = start.batch.detach().clone()
+    shape = (len(start),)
+    reference = next(self.dynamics.parameters())
+    for key, tail in (
+      ("state", (71,)),
+      ("sensor_window", (self.history_length, 93)),
+      ("prev_action", (29,)),
+      ("sim_ctx", (self.dynamics.sim_ctx_dim,)),
+      ("alignment_rotation", (3, 3)),
+      ("alignment_translation", (3,)),
+    ):
+      value = batch.get(key)
+      if (
+        not isinstance(value, torch.Tensor)
+        or value.shape != (*shape, *tail)
+        or value.dtype != reference.dtype
+        or value.device != reference.device
+        or not torch.isfinite(value).all()
+      ):
+        raise ValueError(f"Invalid prepared rollout field {key}")
+    for key in ("motion_time", "episode_id", "time_index", "segment_time"):
+      value = batch.get(key)
+      if (
+        not isinstance(value, torch.Tensor)
+        or value.shape != shape
+        or value.dtype != torch.long
+        or value.device != reference.device
+        or (value < 0).any()
+      ):
+        raise ValueError(f"Invalid prepared rollout index {key}")
+    if (batch["time_index"] < batch["segment_time"]).any():
+      raise ValueError("Prepared rollout segment starts after its physical frame")
+    if (
+      start.remaining_steps.shape != shape
+      or start.remaining_steps.dtype != torch.long
+      or start.remaining_steps.device != reference.device
+    ):
+      raise ValueError("Invalid prepared rollout remaining steps")
+    validate_rotation(batch["alignment_rotation"])
+    expected = (
+      self._last_reference_frame(batch["motion_time"]) - batch["motion_time"] + 1
+    )
+    if not torch.equal(start.remaining_steps, expected):
+      raise ValueError("Rollout reference length mismatch")
+    candidate = self.posterior_provider.prepare_restore(
+      start.belief.detach(),
+      batch["sim_ctx"],
+      model_version=start.model_version,
+      episode_id=batch["episode_id"],
+      time_index=batch["segment_time"],
+    )
+    previous_size = self.num_envs
+    try:
+      self.num_envs = len(start)
+      return self._reset_estimator_inputs(batch, None, candidate=candidate)
+    except Exception:
+      self.num_envs = previous_size
+      raise
+
+  def clear_rollout(self):
+    """Drop all references to a completed imagined graph."""
+    if isinstance(self.posterior_provider, BeliefProvider):
+      self.posterior_provider.clear()
+    for name in (
+      "_belief_frame",
+      "_pending_belief_step",
+      "_posterior",
+      "_task_uncertainty",
+      "aux_state",
+      "rep_state",
+      "joint_state",
+      "last_actions",
+      "sim_ctx",
+      "motion_times",
+      "reference_alignment",
+      "_past_sensors",
+      "_latest_sensor",
+      "_ref_body_state",
+      "_actor_goal_obs",
+      "_wm_goal_obs",
+      "_reference_finished",
+    ):
+      setattr(self, name, None)
+    self._task_goal_obs = {}
+
   def snapshot(self) -> dict:
     """Save the last committed imagined frame as a detached rollout starting point."""
     if not isinstance(self.posterior_provider, BeliefProvider):
@@ -355,7 +555,7 @@ class WorldModelEnv(ABC):
       "segment_time": self._belief_frame.time_index,
       "segment_start_time": self._segment_start_time,
     }
-    return {
+    snapshot = {
       "version": 2,
       "estimator_inputs": self.estimator_input_config.to_dict(),
       "motion_ends": self.motion.motion_ends.detach().clone(),
@@ -363,6 +563,13 @@ class WorldModelEnv(ABC):
       "provider": self.posterior_provider.state_dict(),
       "frame": {key: value.detach().clone() for key, value in frame.items()},
     }
+    if self.eit_critic:
+      snapshot["eit_critic"] = True
+      snapshot["critic_config"] = asdict(self._full_critic_config())
+      snapshot["frame"]["reference_finished"] = (
+        self._reference_finished.detach().clone()
+      )
+    return snapshot
 
   def restore(self, snapshot: dict) -> TensorDict:
     """Resume an imagined frame on the same model and motion without replay or fusion."""
@@ -381,6 +588,11 @@ class WorldModelEnv(ABC):
       raise ValueError("Imagined snapshot configuration mismatch")
     if snapshot.get("motion_digest") != motion_content_digest(self.motion):
       raise ValueError("Imagined snapshot reference motion content mismatch")
+    if snapshot.get("eit_critic", False) != self.eit_critic or (
+      self.eit_critic
+      and snapshot.get("critic_config") != asdict(self._full_critic_config())
+    ):
+      raise ValueError("Imagined snapshot critic configuration mismatch")
     candidate = self.posterior_provider.prepare_load_state_dict(snapshot["provider"])
     state = candidate.state
     frame = snapshot["frame"]
@@ -422,6 +634,21 @@ class WorldModelEnv(ABC):
     ):
       raise ValueError("Imagined snapshot frame and posterior disagree")
     validate_rotation(batch["alignment_rotation"])
+    finished = None
+    if self.eit_critic:
+      finished = frame.get("reference_finished")
+      if (
+        not isinstance(finished, torch.Tensor)
+        or finished.shape != (self.num_envs,)
+        or finished.dtype != torch.bool
+        or finished.device != state.context.device
+        or (
+          finished
+          & (batch["motion_time"] != self._last_reference_frame(batch["motion_time"]))
+        ).any()
+      ):
+        raise ValueError("Invalid imagined snapshot reference completion")
+      finished = finished.detach().clone()
     aux, rep = batch.pop("aux_state"), batch.pop("rep_state")
     LieState.from_rep(aux, rep).validate()
     batch["time_index"] = batch["segment_start_time"] + batch["segment_time"]
@@ -431,6 +658,7 @@ class WorldModelEnv(ABC):
       None,
       candidate=candidate,
       latent=(aux, rep),
+      reference_finished=finished,
     )
 
   def _reset_estimator_inputs(
@@ -440,6 +668,7 @@ class WorldModelEnv(ABC):
     *,
     candidate: PreparedBelief | None = None,
     latent: tuple[torch.Tensor, torch.Tensor] | None = None,
+    reference_finished: torch.Tensor | None = None,
   ) -> TensorDict:
     """Validate the complete reset input before replacing a live rollout."""
     aux, rep = self._unpack_initial_states(batch) if latent is None else latent
@@ -469,6 +698,22 @@ class WorldModelEnv(ABC):
     goals = self._prepare_estimator_goals(
       aux, rep, batch["motion_time"], alignment, posterior
     )
+    finished = reference_finished
+    if finished is None:
+      finished = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+    if self.eit_critic:
+      if candidate is None:
+        raise ValueError("Full critic reset requires a complete keyed belief")
+      self._build_full_critic(
+        aux,
+        rep,
+        goals.critic,
+        history,
+        batch["sim_ctx"],
+        batch["motion_time"],
+        candidate.state.belief,
+        finished,
+      )
     # Commit only after posterior and all actor/critic reference inputs are valid.
     if candidate is not None:
       self._commit_belief_frame(candidate)
@@ -482,6 +727,7 @@ class WorldModelEnv(ABC):
     self._posterior = posterior if candidate is None else None
     self._commit_estimator_goals(goals)
     self._pending_belief_step = None
+    self._reference_finished = finished
     return self.get_observations()
 
   def _step_belief_inputs(self, actions, process_noise, measurement_noise):
@@ -493,6 +739,12 @@ class WorldModelEnv(ABC):
     A keyed reset abandons the pending transition.
     """
     self._check_posterior_source(None)
+    if (
+      self.eit_critic
+      and self._reference_finished is not None
+      and self._reference_finished.any()
+    ):
+      raise ValueError("Reference clip ended; reset before advancing this rollout")
     frame = self._belief_frame
     assert frame is not None
     inputs = (
@@ -589,6 +841,21 @@ class WorldModelEnv(ABC):
       self.reference_alignment,
       posterior,
     )
+    finished = self.motion_times >= self._last_reference_frame(self.motion_times)
+    if self.eit_critic:
+      history = torch.cat(
+        (self._sensor_history()[:, 1:], pending["sensor"].unsqueeze(1)), dim=1
+      )
+      self._build_full_critic(
+        pending["aux"],
+        pending["rep"],
+        goals.critic,
+        history,
+        self.sim_ctx,
+        pending["times"],
+        candidate.state.belief,
+        finished,
+      )
     self._commit_belief_frame(candidate)
     if self.history_length > 1:
       self._past_sensors = torch.cat(
@@ -596,6 +863,8 @@ class WorldModelEnv(ABC):
       )
     self.aux_state, self.rep_state = pending["aux"], pending["rep"]
     self.joint_state, self.last_actions = pending["joints"], pending["actions"]
+    if self.eit_critic:
+      self._reference_finished = finished
     self.motion_times, self._latest_sensor = pending["times"], pending["sensor"]
     self._commit_estimator_goals(goals)
     self._pending_belief_step = None
@@ -713,7 +982,47 @@ class WorldModelEnv(ABC):
 
   def _critic_obs(self) -> torch.Tensor:
     """The privileged critic input — full WM state, not the actor's sensor obs."""
+    if self.eit_critic:
+      return self._build_full_critic(
+        self.aux_state,
+        self.rep_state,
+        self._wm_goal_obs,
+        self._sensor_history(),
+        self.sim_ctx,
+        self.motion_times,
+        self.posterior_provider.state.belief,
+        self._reference_finished,
+      )
     return torch.cat([self.rep_state, self._wm_goal_obs, self.sim_ctx], dim=-1)
+
+  def _full_critic_config(self):
+    from supermimic.critic_inputs import CriticInputConfig
+
+    return self.critic_input_config or CriticInputConfig(
+      group=self.estimator_input_config.group
+    )
+
+  def _build_full_critic(
+    self, aux, rep, goal, history, context, times, belief, finished
+  ):
+    """Preflight staged frames before committing provider or environment state."""
+    from supermimic.critic_inputs import build_critic_features
+
+    remaining = (self._last_reference_frame(times) - times + 1).to(
+      rep
+    ) * self.representation.dt
+    if finished is not None:
+      remaining = torch.where(finished, 0, remaining)
+    return build_critic_features(
+      LieState.from_rep(aux, rep),
+      goal,
+      history,
+      context,
+      remaining,
+      belief,
+      config=self._full_critic_config(),
+      group=self.estimator_input_config.group,
+    )
 
   def _wm_step(
     self,
