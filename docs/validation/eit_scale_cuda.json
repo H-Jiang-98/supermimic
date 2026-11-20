@@ -1,0 +1,374 @@
+{
+  "status": "passed",
+  "timestamp_utc": "2026-11-20T12:31:00.267052+00:00",
+  "device": "cuda:0",
+  "device_name": "NVIDIA GeForce RTX 5090",
+  "torch": "2.14.0+cu130",
+  "dtype": "float32",
+  "seed": 2026,
+  "cpu_threads": 1,
+  "small_width": false,
+  "network_widths": {
+    "mean": [
+      2048,
+      2048,
+      2048
+    ],
+    "noise": [
+      128,
+      64
+    ],
+    "actor": [
+      2048,
+      1024,
+      512,
+      256
+    ],
+    "critic": [
+      256,
+      128
+    ]
+  },
+  "warmup": 1,
+  "repeats": 3,
+  "scope": "Fixed model C policy: stochastic rollout, full belief, actor backward and two critic epochs; excludes collection and prefix replay",
+  "model_unchanged": true,
+  "prefix_reconstruction_seconds": 0.06673029810190201,
+  "numerical": {
+    "actor_directional_analytic": 0.0069666095077991486,
+    "actor_directional_finite_difference": 0.006970018148422241,
+    "absolute_error": 3.4086406230926514e-06,
+    "relative_error": 0.0004890433046966791,
+    "finite_difference_epsilon": 0.002,
+    "film_hidden_gradient_norm": 0.0010915282182395458,
+    "terminal_covariance_gradient_norm": 181.73385620117188,
+    "microbatch_actor_gradient_relative_l2_error": 9.021256346386508e-07
+  },
+  "configurations": [
+    {
+      "horizon": 2,
+      "samples": 1,
+      "batch_size": 3,
+      "microbatch_size": 2,
+      "last_microbatch": 1,
+      "seconds": [
+        0.8080646120943129,
+        0.8006238411180675,
+        0.7886809189803898
+      ],
+      "mean_seconds": 0.7991231240642568,
+      "peak_allocated_bytes": 300120576,
+      "retained_allocated_bytes": [
+        256391680,
+        256391680,
+        256391680
+      ],
+      "metrics": {
+        "Policy/return": 0.2612491846084595,
+        "Policy/raw_reward": 0.07707350701093674,
+        "Policy/bootstrap": 0.10786362737417221,
+        "Policy/bootstrap_fraction": 0.4128763973712921,
+        "Policy/final_survival": 1.0,
+        "Policy/valid_steps": 6.0,
+        "Policy/action_saturation": 0.0,
+        "Policy/film_gamma": 0.00943534355610609,
+        "Policy/film_beta": 0.009491224773228168,
+        "Policy/value_clamp_fraction": 0.0,
+        "Policy/critic_loss": 0.012020080350339413,
+        "Policy/explained_variance": 0.02348726987838745,
+        "Grad/actor_norm": 0.05170107260346413,
+        "Grad/critic_norm": 1.979264497756958
+      }
+    },
+    {
+      "horizon": 2,
+      "samples": 2,
+      "batch_size": 3,
+      "microbatch_size": 2,
+      "last_microbatch": 2,
+      "seconds": [
+        1.1817310201004148,
+        1.18436782900244,
+        1.2367601133883
+      ],
+      "mean_seconds": 1.2009529874970515,
+      "peak_allocated_bytes": 308528640,
+      "retained_allocated_bytes": [
+        256394752,
+        256394752,
+        256394752
+      ],
+      "metrics": {
+        "Policy/return": 0.2603530287742615,
+        "Policy/raw_reward": 0.07650580257177353,
+        "Policy/bootstrap": 0.10809437930583954,
+        "Policy/bootstrap_fraction": 0.4151839017868042,
+        "Policy/final_survival": 1.0,
+        "Policy/valid_steps": 12.0,
+        "Policy/action_saturation": 0.0,
+        "Policy/film_gamma": 0.009488715790212154,
+        "Policy/film_beta": 0.009491509757936,
+        "Policy/value_clamp_fraction": 0.0,
+        "Policy/critic_loss": 0.011831585317850113,
+        "Policy/explained_variance": 0.02250051498413086,
+        "Grad/actor_norm": 0.05445919185876846,
+        "Grad/critic_norm": 1.9628887176513672
+      }
+    },
+    {
+      "horizon": 2,
+      "samples": 4,
+      "batch_size": 3,
+      "microbatch_size": 2,
+      "last_microbatch": 2,
+      "seconds": [
+        2.380898466799408,
+        2.3636059779673815,
+        2.3607657458633184
+      ],
+      "mean_seconds": 2.3684233968767026,
+      "peak_allocated_bytes": 308950528,
+      "retained_allocated_bytes": [
+        256401408,
+        256401408,
+        256401408
+      ],
+      "metrics": {
+        "Policy/return": 0.26092150807380676,
+        "Policy/raw_reward": 0.0768323466181755,
+        "Policy/bootstrap": 0.108009934425354,
+        "Policy/bootstrap_fraction": 0.4139556586742401,
+        "Policy/final_survival": 1.0,
+        "Policy/valid_steps": 24.0,
+        "Policy/action_saturation": 0.0,
+        "Policy/film_gamma": 0.009337598457932472,
+        "Policy/film_beta": 0.00950070470571518,
+        "Policy/value_clamp_fraction": 0.0,
+        "Policy/critic_loss": 0.01190229319036007,
+        "Policy/explained_variance": 0.022280335426330566,
+        "Grad/actor_norm": 0.04928673803806305,
+        "Grad/critic_norm": 1.967923879623413
+      }
+    },
+    {
+      "horizon": 4,
+      "samples": 1,
+      "batch_size": 3,
+      "microbatch_size": 2,
+      "last_microbatch": 1,
+      "seconds": [
+        1.4236066066659987,
+        1.4340236359275877,
+        1.4253951641730964
+      ],
+      "mean_seconds": 1.4276751355888944,
+      "peak_allocated_bytes": 314966528,
+      "retained_allocated_bytes": [
+        256117248,
+        256117248,
+        256117248
+      ],
+      "metrics": {
+        "Policy/return": 0.38166558742523193,
+        "Policy/raw_reward": 0.0701676458120346,
+        "Policy/bootstrap": 0.10495563596487045,
+        "Policy/bootstrap_fraction": 0.2749937176704407,
+        "Policy/final_survival": 1.0,
+        "Policy/valid_steps": 12.0,
+        "Policy/action_saturation": 0.0,
+        "Policy/film_gamma": 0.009677953086793423,
+        "Policy/film_beta": 0.00957327801734209,
+        "Policy/value_clamp_fraction": 0.0,
+        "Policy/critic_loss": 0.027744807302951813,
+        "Policy/explained_variance": 0.01427239179611206,
+        "Grad/actor_norm": 0.11982101947069168,
+        "Grad/critic_norm": 2.8397562503814697
+      }
+    },
+    {
+      "horizon": 4,
+      "samples": 2,
+      "batch_size": 3,
+      "microbatch_size": 2,
+      "last_microbatch": 2,
+      "seconds": [
+        2.171192883979529,
+        2.14245214080438,
+        2.149229028262198
+      ],
+      "mean_seconds": 2.154291351015369,
+      "peak_allocated_bytes": 333560320,
+      "retained_allocated_bytes": [
+        256123904,
+        256123904,
+        256123904
+      ],
+      "metrics": {
+        "Policy/return": 0.37990936636924744,
+        "Policy/raw_reward": 0.06976757198572159,
+        "Policy/bootstrap": 0.10476895421743393,
+        "Policy/bootstrap_fraction": 0.2757735550403595,
+        "Policy/final_survival": 1.0,
+        "Policy/valid_steps": 24.0,
+        "Policy/action_saturation": 0.0,
+        "Policy/film_gamma": 0.009763883426785469,
+        "Policy/film_beta": 0.01008764747530222,
+        "Policy/value_clamp_fraction": 0.0,
+        "Policy/critic_loss": 0.027241671457886696,
+        "Policy/explained_variance": 0.014827370643615723,
+        "Grad/actor_norm": 0.10563868284225464,
+        "Grad/critic_norm": 2.817045211791992
+      }
+    },
+    {
+      "horizon": 4,
+      "samples": 4,
+      "batch_size": 3,
+      "microbatch_size": 2,
+      "last_microbatch": 2,
+      "seconds": [
+        4.251468520145863,
+        4.31055795494467,
+        4.3424822418019176
+      ],
+      "mean_seconds": 4.301502905630817,
+      "peak_allocated_bytes": 334171136,
+      "retained_allocated_bytes": [
+        256136704,
+        256136704,
+        256136704
+      ],
+      "metrics": {
+        "Policy/return": 0.3804662227630615,
+        "Policy/raw_reward": 0.06992144882678986,
+        "Policy/bootstrap": 0.10471662878990173,
+        "Policy/bootstrap_fraction": 0.2752324044704437,
+        "Policy/final_survival": 1.0,
+        "Policy/valid_steps": 48.0,
+        "Policy/action_saturation": 0.0,
+        "Policy/film_gamma": 0.009788553230464458,
+        "Policy/film_beta": 0.009952432475984097,
+        "Policy/value_clamp_fraction": 0.0,
+        "Policy/critic_loss": 0.027360063046216965,
+        "Policy/explained_variance": 0.0149763822555542,
+        "Grad/actor_norm": 0.113454170525074,
+        "Grad/critic_norm": 2.8225064277648926
+      }
+    },
+    {
+      "horizon": 8,
+      "samples": 1,
+      "batch_size": 3,
+      "microbatch_size": 2,
+      "last_microbatch": 1,
+      "seconds": [
+        2.717445744201541,
+        2.7167826630175114,
+        2.7036332711577415
+      ],
+      "mean_seconds": 2.7126205594589314,
+      "peak_allocated_bytes": 350970880,
+      "retained_allocated_bytes": [
+        256877568,
+        256877568,
+        256877568
+      ],
+      "metrics": {
+        "Policy/return": 0.5387332439422607,
+        "Policy/raw_reward": 0.05659748241305351,
+        "Policy/bootstrap": 0.09912779182195663,
+        "Policy/bootstrap_fraction": 0.184001624584198,
+        "Policy/final_survival": 0.9999992251396179,
+        "Policy/valid_steps": 24.0,
+        "Policy/action_saturation": 0.0,
+        "Policy/film_gamma": 0.010324276983737946,
+        "Policy/film_beta": 0.010185782797634602,
+        "Policy/value_clamp_fraction": 0.0,
+        "Policy/critic_loss": 0.04827111214399338,
+        "Policy/explained_variance": 0.01031041145324707,
+        "Grad/actor_norm": 0.4140940308570862,
+        "Grad/critic_norm": 3.491593837738037
+      }
+    },
+    {
+      "horizon": 8,
+      "samples": 2,
+      "batch_size": 3,
+      "microbatch_size": 2,
+      "last_microbatch": 2,
+      "seconds": [
+        4.059956580400467,
+        4.092804692685604,
+        4.06150861736387
+      ],
+      "mean_seconds": 4.071423296816647,
+      "peak_allocated_bytes": 385635840,
+      "retained_allocated_bytes": [
+        256890368,
+        256890368,
+        256890368
+      ],
+      "metrics": {
+        "Policy/return": 0.538756787776947,
+        "Policy/raw_reward": 0.05663307011127472,
+        "Policy/bootstrap": 0.09895794838666916,
+        "Policy/bootstrap_fraction": 0.18367832899093628,
+        "Policy/final_survival": 0.999999463558197,
+        "Policy/valid_steps": 48.0,
+        "Policy/action_saturation": 0.0,
+        "Policy/film_gamma": 0.010560810565948486,
+        "Policy/film_beta": 0.010377079248428345,
+        "Policy/value_clamp_fraction": 0.0,
+        "Policy/critic_loss": 0.048531465232372284,
+        "Policy/explained_variance": 0.011417508125305176,
+        "Grad/actor_norm": 0.399495393037796,
+        "Grad/critic_norm": 3.5127530097961426
+      }
+    },
+    {
+      "horizon": 8,
+      "samples": 4,
+      "batch_size": 3,
+      "microbatch_size": 2,
+      "last_microbatch": 2,
+      "seconds": [
+        8.11400849185884,
+        8.264236068818718,
+        8.265902038663626
+      ],
+      "mean_seconds": 8.214715533113727,
+      "peak_allocated_bytes": 388803072,
+      "retained_allocated_bytes": [
+        258233856,
+        258233856,
+        258233856
+      ],
+      "metrics": {
+        "Policy/return": 0.5393888354301453,
+        "Policy/raw_reward": 0.05670487880706787,
+        "Policy/bootstrap": 0.09904073923826218,
+        "Policy/bootstrap_fraction": 0.18361659348011017,
+        "Policy/final_survival": 0.9999985694885254,
+        "Policy/valid_steps": 96.0,
+        "Policy/action_saturation": 0.0,
+        "Policy/film_gamma": 0.010347315110266209,
+        "Policy/film_beta": 0.010270693339407444,
+        "Policy/value_clamp_fraction": 0.0,
+        "Policy/critic_loss": 0.04875286668539047,
+        "Policy/explained_variance": 0.011121213436126709,
+        "Grad/actor_norm": 0.4220440983772278,
+        "Grad/critic_norm": 3.517272472381592
+      }
+    }
+  ],
+  "source_commit": "20b4b74eb39b0e76e2e09a0e017c993a2cfed1a2",
+  "source_files_sha256": {
+    "src/supermimic/scripts/check_eit_scale.py": "014230280f58553d49cf8138dc622a94d98bed4dd211238414bb134807c680a3",
+    "src/supermimic/learners/belief_policy_learner.py": "fbdcf45a2b2017b28553dc90b44cea08629b57ea8f7dd0e34757012de6748abf",
+    "src/supermimic/critic_inputs.py": "260fa0a1f1e90c0a0ae57bb18cda338d93b3ca166425fcc418831e40703af43c",
+    "src/supermimic/envs/world_model_env.py": "684df1c0d2011835e07645af1ef913e4bdf48818dc87593287bbc18999dcc680",
+    "src/supermimic/models.py": "170632710490ffe1de14c7136b37dd43e2c9ca3ab747fdd96bc72bdb7c28b694",
+    "src/supermimic/estimator.py": "831eccfdfc6beb4d38d6fe483a0602e32994913a63483e0ff27ba001693097fe",
+    "src/supermimic/representations.py": "b3ff833f6a7d2614c8d88abb6b5c0e401bd21b7602383280573f1b7093ee116d"
+  }
+}

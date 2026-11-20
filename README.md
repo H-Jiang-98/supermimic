@@ -454,7 +454,7 @@ provider 自身的状态更新及其调用前的噪声采样不在环境回滚�
 
 输入阶段可运行采集和短序列计算图验证，`run()` / policy learner `update()` 明确拒绝
 完整策略训练。第二步接入真实滤波器，第三步通过独立 `train_belief` 入口联合训练
-均值模型和噪声头；belief critic、策略优化和闭环控制性能验证由后续阶段完成。
+均值模型和噪声头；第四步通过 `train_eit` 接通 belief critic、策略优化和短程闭环评估。
 现有 play、viewer、benchmark 和 ONNX exporter 对新版本明确报错。
 
 CPU 验收测试（无需完整 MuJoCo 闭环）：
@@ -580,7 +580,7 @@ OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-step2-mpl \
   .venv/bin/python -m supermimic.scripts.check_estimator
 ```
 
-MuJoCo smoke 自动生成四帧静止参考，使用 2 个环境、容量为 2 的环形 buffer、8 步真实采集和两步随机想象。脚本独立核对从保留片段重建的完整均值和 covariance，再检查想象回报对 actor 的梯度和纯想象帧快照恢复，输出 JSON 诊断。使用 `--device cuda:0` 可运行 GPU 验收。策略/模型联合调度和 belief critic 属于后续阶段。
+MuJoCo smoke 自动生成四帧静止参考，使用 2 个环境、容量为 2 的环形 buffer、8 步真实采集和两步随机想象。脚本独立核对从保留片段重建的完整均值和 covariance，再检查想象回报对 actor 的梯度和纯想象帧快照恢复，输出 JSON 诊断。使用 `--device cuda:0` 可运行 GPU 验收。策略/模型联合调度和 belief critic 见第四步。
 
 第二步历史验收（2026-11-20）：Git 提交候选树完整回归 **433 passed**，另有 4 份
 被忽略的本地测试在同一候选代码上 **47 passed**；两部分对应此前工作区的 480 项。
@@ -645,6 +645,69 @@ OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.check_belief_scale --he
 batch=4、horizon=4 的 NLL 前向/反向约 0.20 秒，峰值分配显存约 273 MiB；该测量
 不包含采集、前缀重建、optimizer 或整轮 replay 内存。
 完整范围和可复现 JSON 记录见 [第三步实施记录](plan_step3.md#实施记录2026-11-20)。
+
+## Estimator 第四步：完整策略与模型交替训练
+
+[plan_step4.md](plan_step4.md) 的完整训练入口是 `train_eit`。每轮依次采集、
+更新模型归一化、联合学习均值和噪声头、重建后验并更新 actor/critic 归一化、
+冻结世界模型执行随机想象策略梯度与 critic 回归，然后保存和 reset。
+`train_belief` 继续用于固定 actor 的模型学习，旧确定性训练仍使用原入口。
+
+A 的 critic 不含 belief；B/C 使用相同结构，包含完整后验均值和 70×70 covariance。
+三组 critic 共同读取真值、参考、控制历史、剩余 clip 时间和 context。
+策略想象的 K 条轨迹共享起点与后验，独立采样过程及测量噪声；冻结参数时保留
+动作穿过滤波、covariance、FiLM、soft survival 和价值 bootstrap 的导数。
+clip 最后一个评分动作后停止回报，普通策略 horizon 截断保留 bootstrap。
+
+新训练默认在输出目录的父目录创建或读取 `eit_initialization_seed<seed>.pt`，
+可用 `--initialization logs/eit-initial.pt` 显式指定共同初始化包。三组使用同一文件，
+不兼容的结构或配置会报错，不覆盖已有初值。
+各组独立采集与更新。以下是初始工程配置，尚未验证长时控制收敛。
+
+```bash
+OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
+  .venv/bin/python -m supermimic.scripts.train_eit \
+  --motion-file data/motions/walk1_subject1.npz --device cuda:0 \
+  --group B --output logs/eit-b --initialization logs/eit-initial.pt \
+  --num-envs 8 --rounds 10
+```
+
+默认 N=4、K=2、H=4、microbatch=2，每轮一次 actor 更新及两轮 critic 回归；
+模型使用 step3 的 batch=4、microbatch=2、T=2、每轮十次更新。
+`--policy-horizon`、`--samples`、`--policy-batch-size`、`--policy-microbatch-size`
+分别控制想象长度、噪声轨迹数、起点数与分块。更大规模应先测量完整训练显存。
+
+恢复时配置和组别从 checkpoint 读取，`--rounds` 表示新增轮数：
+
+```bash
+OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.train_eit \
+  --motion-file data/motions/walk1_subject1.npz --device cuda:0 \
+  --output logs/eit-b --resume logs/eit-b/training.pt --rounds 10
+OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.eval_eit \
+  --checkpoint logs/eit-b/training.pt \
+  --motion-file data/motions/walk1_subject1.npz --device cuda:0 \
+  --num-envs 8 --steps 500
+```
+
+`eit_training_v1` 保存模型、actor、critic、三个 optimizer、归一化和 RNG。
+恢复前在私有副本上校验全部组件。恢复后清空 replay 并重置真实环境；固定相同
+原始输入和噪声可以验证优化器续训一致，但不承诺恢复物理模拟轨迹。
+`eval_eit` 在独立进程中关闭动作探索，保留传感噪声及在线滤波，三组均使用后验均值。
+
+可复现两轮真实训练、固定输入恢复和独立评估验收：
+
+```bash
+OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
+  .venv/bin/python -m supermimic.scripts.check_eit_training --device cpu
+OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
+  .venv/bin/python -m supermimic.scripts.check_eit_training --device cuda:0 --full-width
+```
+
+step4 验收结果与范围见 [实施记录](plan_step4.md#实施记录)：CPU 回归 644 passed、
+3 skipped；A/B/C 在 CPU 和 RTX 5090 上均完成两轮真实训练、固定输入恢复及独立评估。
+默认宽度 GPU 策略基准覆盖 H=2/4/8、K=1/2/4；N=3、K=2、H=4、microbatch=2
+时完整策略更新约 2.15 秒，PyTorch 峰值分配约 318 MiB（不含 Warp/驱动）。
+这些是流程与数值验收，不代表三组控制性能排序。
 
 ## Acknowledgements
 
