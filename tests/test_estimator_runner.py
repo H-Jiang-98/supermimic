@@ -442,7 +442,7 @@ def test_invalid_actor_weights_leave_all_parameters_and_normalizers_unchanged(
 
 def test_input_stage_cannot_silently_start_incomplete_policy_training():
   runner = _runner()
-  with pytest.raises(NotImplementedError, match="step-1"):
+  with pytest.raises(NotImplementedError, match="train_belief"):
     runner.run()
   policy = InputStagePolicy(
     build_actor(runner.cfg, runner._wm, "cpu"), runner.cfg.policy

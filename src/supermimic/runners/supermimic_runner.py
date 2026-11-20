@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
-from copy import copy
+from copy import copy, deepcopy
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime
 from pathlib import Path
@@ -27,6 +27,10 @@ from supermimic.estimator_inputs import (
   PosteriorInput,
   PosteriorProvider,
   build_actor_features,
+)
+from supermimic.learners.belief_wm_learner import (
+  BeliefWorldModelLearner,
+  BeliefWorldModelLearnerCfg,
 )
 from supermimic.learners.policy_learner import (
   ActorCriticPolicyLearner,
@@ -89,13 +93,16 @@ ActorCriticCfg = Annotated[
 @dataclass
 class SuperMimicRunnerCfg(BaseRunnerCfg):
   estimator_inputs: EITInputConfig | None = None
-  """Opt-in input/FiLM scaffold; complete estimator training is a later stage."""
+  """Opt-in estimator inputs/FiLM; policy/critic optimization is a later stage."""
   process_noise: ProcessNoiseConfig | None = None
-  """Opt-in full right-local stochastic dynamics for the step-2 filter."""
+  """Opt-in full right-local stochastic dynamics and posterior-NLL learning."""
   filter_config: FilterConfig = field(default_factory=FilterConfig)
   initial_prior: GaussianStatePrior = field(default_factory=GaussianStatePrior)
+  belief_wm: BeliefWorldModelLearnerCfg = field(
+    default_factory=BeliefWorldModelLearnerCfg
+  )
   freeze_estimator_normalization: bool = True
-  """Keep the step-2 collection model/actor snapshot fixed with a real provider."""
+  """Keep the collection snapshot fixed; model training updates stats by round."""
   max_iterations: int = 1000000
   replay_ratio: int = 16
   latent_dim: int = 32
@@ -161,6 +168,28 @@ class WorldModel:
   num_actions: int
   filter_config: FilterConfig = field(default_factory=FilterConfig)
   initial_prior: GaussianStatePrior = field(default_factory=GaussianStatePrior)
+
+  def migrate_bundle(self, bundle: dict) -> dict:
+    """Migrate older integrator weights and preserve their filter settings."""
+    if self.dynamics.process_noise_config is None:
+      raise ValueError("Bundle migration requires stochastic dynamics")
+    migrated = deepcopy(bundle)
+    metadata = migrated.get("estimator", {})
+    if metadata.get("version") != 1:
+      raise ValueError("Expected a versioned estimator bundle for migration")
+    if migrated["dynamics"]["metadata"]["format_version"] == "stochastic_dynamics_v1":
+      old_filter = metadata.get("filter_config", {})
+      added = {"jacobian_backend", "jacobian_chunk_size", "jacobian_batch_chunk_size"}
+      if set(old_filter) != {f.name for f in fields(FilterConfig)} - added:
+        raise ValueError("Expected a complete step-2 filter configuration")
+      metadata["filter_config"] = {
+        **old_filter,
+        **{key: getattr(self.filter_config, key) for key in added},
+      }
+    migrated["dynamics"] = self.dynamics.migrate_checkpoint(migrated["dynamics"])
+    # Validate without modifying this model or any active provider.
+    deepcopy(self).load_bundle(migrated)
+    return migrated
 
   def bundle(self) -> dict:
     """The ``world_model.pt`` contents."""
@@ -548,13 +577,24 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       device=self.device,
       initial_prior=wm.initial_prior,
     )
-    self.world_model_learner = WorldModelLearner(
-      self._dynamics,
-      self._representation,
-      self.cfg.wm,
-      device=self.device,
-      cuda_graphs=self.cfg.cuda_graphs,
-    )
+    if self._dynamics.process_noise_config is not None:
+      self.world_model_learner = BeliefWorldModelLearner(
+        LieBeliefFilter(
+          self._dynamics,
+          self._representation.measurement_config,
+          self._representation._default_joint_pos,
+          config=wm.filter_config,
+        ),
+        self.cfg.belief_wm,
+      )
+    else:
+      self.world_model_learner = WorldModelLearner(
+        self._dynamics,
+        self._representation,
+        self.cfg.wm,
+        device=self.device,
+        cuda_graphs=self.cfg.cuda_graphs,
+      )
 
     self._pending_norm_updates: list[tuple] = []
     self._sim_history: torch.Tensor | None = None
@@ -887,6 +927,9 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       self._representation._default_joint_pos,
       config=self._wm.filter_config,
     )
+    learner = getattr(self, "world_model_learner", None)
+    if isinstance(learner, BeliefWorldModelLearner):
+      learner.estimator = estimator
     self.posterior_provider = BeliefProvider(
       estimator, prior_factory, differentiable=False
     )
@@ -1202,9 +1245,8 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
   def run(self) -> None:
     if self.cfg.estimator_inputs is not None:
       raise NotImplementedError(
-        "Estimator inputs retain the step-1 training guard. Collection and "
-        "keyed replay and short belief rollouts are supported; full joint "
-        "training and belief critic updates come later."
+        "Full estimator policy/critic training is a later stage. Use "
+        "python -m supermimic.scripts.train_belief for posterior-NLL model learning."
       )
     log_dir = self._create_log_dir()
     self._init_wandb(log_dir)

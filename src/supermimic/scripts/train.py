@@ -98,8 +98,8 @@ def main() -> None:
   chosen_task, args = parse_train_args()
   if args.runner.estimator_inputs is not None:
     raise NotImplementedError(
-      "Estimator inputs support collection, keyed replay and short belief rollouts; "
-      "complete estimator/belief critic training is not enabled"
+      "Full estimator policy/critic training is a later stage; use "
+      "python -m supermimic.scripts.train_belief for posterior-NLL model learning"
     )
   if args.config is not None:
     print(f"[INFO] Loaded training config: {args.config}")
