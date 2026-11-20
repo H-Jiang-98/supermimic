@@ -98,7 +98,7 @@ def main() -> None:
   chosen_task, args = parse_train_args()
   if args.runner.estimator_inputs is not None:
     raise NotImplementedError(
-      "Full estimator policy/critic training is a later stage; use "
+      "Use python -m supermimic.scripts.train_eit for joint EIT training, or "
       "python -m supermimic.scripts.train_belief for posterior-NLL model learning"
     )
   if args.config is not None:

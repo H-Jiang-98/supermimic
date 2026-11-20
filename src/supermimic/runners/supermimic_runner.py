@@ -93,7 +93,7 @@ ActorCriticCfg = Annotated[
 @dataclass
 class SuperMimicRunnerCfg(BaseRunnerCfg):
   estimator_inputs: EITInputConfig | None = None
-  """Opt-in estimator inputs/FiLM; policy/critic optimization is a later stage."""
+  """Opt-in estimator inputs/FiLM; joint optimization uses EITTraining."""
   process_noise: ProcessNoiseConfig | None = None
   """Opt-in full right-local stochastic dynamics and posterior-NLL learning."""
   filter_config: FilterConfig = field(default_factory=FilterConfig)
@@ -464,7 +464,7 @@ class InputStagePolicy:
 
   def update(self):
     raise NotImplementedError(
-      "Complete estimator and belief critic training is a later stage"
+      "Input-only actor cannot optimize; use EITTraining or train_eit"
     )
 
 
@@ -1245,7 +1245,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
   def run(self) -> None:
     if self.cfg.estimator_inputs is not None:
       raise NotImplementedError(
-        "Full estimator policy/critic training is a later stage. Use "
+        "Use python -m supermimic.scripts.train_eit for joint EIT training, or "
         "python -m supermimic.scripts.train_belief for posterior-NLL model learning."
       )
     log_dir = self._create_log_dir()

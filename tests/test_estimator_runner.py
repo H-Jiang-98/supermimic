@@ -447,5 +447,5 @@ def test_input_stage_cannot_silently_start_incomplete_policy_training():
   policy = InputStagePolicy(
     build_actor(runner.cfg, runner._wm, "cpu"), runner.cfg.policy
   )
-  with pytest.raises(NotImplementedError, match="later stage"):
+  with pytest.raises(NotImplementedError, match="train_eit"):
     policy.update()
