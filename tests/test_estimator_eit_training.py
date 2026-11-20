@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from supermimic.learners.belief_policy_learner import BeliefPolicyLearnerCfg
+from supermimic.motion_loader import motion_content_digest
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
 from supermimic.runners.eit_training import EITTraining, EITTrainingCfg
 from tests.test_estimator_belief_training import _RoundRunner, assert_tree
@@ -74,9 +75,9 @@ def test_two_rounds_update_all_components_and_exclude_validation_normalization()
   normalized = []
   original = loop.update_input_normalization
 
-  def normalize(frames):
+  def normalize(frames, policy_keys):
     normalized.extend(frames["episode_id"].tolist())
-    return original(frames)
+    return original(frames, policy_keys)
 
   with patch.object(loop, "update_input_normalization", side_effect=normalize):
     first, second = loop.run_round(), loop.run_round()
@@ -300,3 +301,58 @@ def test_single_target_resumes_in_place_and_checks_metric_history(tmp_path, lega
   second = resumed.run(1, tmp_path, resume=checkpoint)[0]
   assert second["round"] == 2
   assert second["policy"][field] is None
+
+
+def test_round_policy_samples_singleton_training_episode():
+  loop = training()
+  # Seal one-frame episodes 0 and 1. The round collects four-frame episodes 2
+  # and 3. Odd IDs are training episodes; only 3 has a recorded successor.
+  loop.refresh_collection()
+  loop.runner.step(record_episode_stats=False)
+  loop.runner.finish_collection_round()
+  loop.refresh_collection()
+  loop.policy.generators["sampling"].manual_seed(1)
+  with patch.object(
+    loop.policy, "update_prepared", wraps=loop.policy.update_prepared
+  ) as update:
+    loop.run_round()
+  starts = update.call_args.args[0]
+  assert starts.batch["episode_id"].tolist() == [1, 3]
+  assert starts.batch["time_index"][0].item() == 0
+
+
+def test_round_reuses_ordered_sampled_starts_after_normalizing_fresh_frames():
+  loop = training()
+  loop.run_round()
+  loop.policy.cfg = replace(loop.policy.cfg, num_batches=2)
+  # Episode 1 is retained from the first round, episode 3 is fresh. Repeat
+  # an older key across optimizer steps and request the newer times out of order.
+  keys = torch.tensor([[3, 3], [1, 2], [1, 2], [3, 1]])
+  env = loop.runner.wm_env
+  normalize = loop.update_input_normalization
+  old_count = int(loop.actor.obs_normalizer.count)
+
+  def counted_normalize(frames, policy_keys):
+    estimator = env.posterior_provider.estimator
+    with patch.object(estimator, "predict", wraps=estimator.predict) as predict:
+      starts = normalize(frames, policy_keys)
+    assert predict.call_count == 3 + 2
+    assert int(loop.actor.obs_normalizer.count) == old_count + 4
+    return starts
+
+  with (
+    patch.object(loop.policy, "sample_start_keys", return_value=keys),
+    patch.object(loop, "update_input_normalization", side_effect=counted_normalize),
+    patch.object(loop.policy, "update_from", wraps=loop.policy.update_from) as updates,
+    patch(
+      "supermimic.envs.world_model_env.motion_content_digest",
+      wraps=motion_content_digest,
+    ) as motion_hash,
+  ):
+    loop.run_round()
+  assert motion_hash.call_count == 1
+  assert len(updates.call_args_list) == 2
+  for call, expected in zip(updates.call_args_list, keys.split(2), strict=True):
+    start = call.args[0]
+    actual = torch.stack((start.batch["episode_id"], start.batch["time_index"]), dim=1)
+    assert torch.equal(actual, expected)

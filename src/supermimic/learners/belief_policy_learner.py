@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import copy
 import math
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 
 import torch
@@ -137,15 +137,31 @@ class BeliefActorCriticPolicyLearner:
       for name, width in (("process", 70), ("measurement", 64))
     )
 
+  def sample_start_keys(self, episode_ids):
+    """Draw the logical starts for every actor update, in optimizer-step order."""
+    episodes, times = self.wm_env.sample_policy_keys(
+      self.cfg.batch_size,
+      episode_ids,
+      generator=self.generators["sampling"],
+      num_batches=self.cfg.num_batches,
+    )
+    return torch.stack((episodes, times), dim=1)
+
   def update(self, episode_ids):
+    with self.wm_env.readonly_policy_motion():
+      keys = self.sample_start_keys(episode_ids)
+      starts = self.wm_env.prepare_policy_starts(*keys.unbind(dim=1))
+      return self.update_prepared(starts)
+
+  def update_prepared(self, starts):
+    """Reuse detached initial conditions while each new actor generates its own rollout."""
+    if len(starts) != self.cfg.num_batches * self.cfg.batch_size:
+      raise ValueError("Expected one batch of prepared starts per actor update")
     logs = []
-    for _ in range(self.cfg.num_batches):
-      starts = self.wm_env.sample_policy_starts(
-        self.cfg.batch_size,
-        episode_ids,
-        generator=self.generators["sampling"],
-      )
-      logs.append(self.update_from(starts, *self.draw_noises(starts)))
+    with self.wm_env.readonly_policy_motion():
+      for offset in range(0, len(starts), self.cfg.batch_size):
+        batch = starts.index(slice(offset, offset + self.cfg.batch_size))
+        logs.append(self.update_from(batch, *self.draw_noises(batch)))
     means = {}
     for name in logs[0]:
       values = torch.stack([log[name] for log in logs])
@@ -244,7 +260,8 @@ class BeliefActorCriticPolicyLearner:
     count = len(starts)
     modules = (self.actor, self.critic, env.dynamics, env.representation)
     data, totals = [], {}
-    with _module_modes(modules):
+    # Analytical test environments and custom rollout environments may have no motion.
+    with getattr(env, "readonly_policy_motion", nullcontext)(), _module_modes(modules):
       self.actor.train().requires_grad_(True)
       for module in (self.critic, env.dynamics, env.representation):
         module.eval().requires_grad_(False)

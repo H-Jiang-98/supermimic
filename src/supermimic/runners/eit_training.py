@@ -16,6 +16,7 @@ from pathlib import Path
 import torch
 
 from supermimic.critic_inputs import BeliefCritic
+from supermimic.envs.world_model_env import BeliefRolloutStart
 from supermimic.learners.belief_policy_learner import (
   BeliefActorCriticPolicyLearner,
   BeliefPolicyLearnerCfg,
@@ -90,24 +91,56 @@ class EITTraining(BeliefModelTraining):
     return self.runner.policy_learner
 
   @torch.no_grad()
-  def update_input_normalization(self, frames) -> None:
-    """Use each fresh training frame once, with current-model posterior goals."""
+  def update_input_normalization(
+    self, frames, policy_keys: torch.Tensor | None = None
+  ) -> BeliefRolloutStart | None:
+    """Filter each requested episode once, normalizing fresh rows and keeping sampled Q0s."""
+    env = self.runner.wm_env
     if len(frames) == 0:
-      return
-    # Stage all small statistics before copying; malformed later batches must
-    # not leave half-updated actor/critic normalization.
+      if policy_keys is None:
+        return None
+      return env.prepare_policy_starts(*policy_keys.unbind(dim=1))
+    fresh = torch.stack((frames["episode_id"], frames["time_index"]), dim=1)
+    requested = fresh if policy_keys is None else torch.cat((fresh, policy_keys))
+    fresh_keys = {tuple(key) for key in fresh.tolist()}
+    draw_order = (
+      [] if policy_keys is None else [tuple(key) for key in policy_keys.tolist()]
+    )
+    sampled_keys = set(draw_order)
+    saved = {}
+    # Stage statistics before copying; malformed later batches must not leave
+    # half-updated actor/critic normalization.
     candidate_actor = deepcopy(self.actor)
     candidate_critic = deepcopy(self.policy.critic)
     candidate_actor.train()
     candidate_critic.train()
-    env = self.runner.wm_env
     try:
-      for offset in range(0, len(frames), self.cfg.normalization_batch_size):
-        batch = frames[offset : offset + self.cfg.normalization_batch_size]
-        start = env.prepare_policy_starts(batch["episode_id"], batch["time_index"])
-        obs = env.reset_prepared(start)
-        candidate_actor.update_normalization(obs)
-        candidate_critic.update_normalization(obs["critic"])
+      for chunk in env.iter_policy_starts(
+        *requested.unbind(dim=1), batch_size=self.cfg.normalization_batch_size
+      ):
+        rows = []
+        for i, key in enumerate(
+          zip(
+            chunk.batch["episode_id"].tolist(),
+            chunk.batch["time_index"].tolist(),
+            strict=True,
+          )
+        ):
+          if key in fresh_keys:
+            rows.append(i)
+          if key in sampled_keys:
+            saved[key] = chunk.index(i)
+        if rows:
+          obs = env.reset_prepared(
+            chunk if len(rows) == len(chunk) else chunk.index(rows)
+          )
+          candidate_actor.update_normalization(obs)
+          candidate_critic.update_normalization(obs["critic"])
+      starts = (
+        BeliefRolloutStart.cat([saved[key] for key in draw_order])
+        if draw_order
+        else None
+      )
       for module in (candidate_actor.obs_normalizer, candidate_actor.goal_normalizers):
         if not all(torch.isfinite(t).all() for t in module.buffers()):
           raise ValueError("Non-finite actor normalization statistics")
@@ -119,6 +152,7 @@ class EITTraining(BeliefModelTraining):
       )
       # Critic candidates differ only in their explicit normalizer buffers.
       self.policy.critic.load_checkpoint(candidate_critic.checkpoint())
+      return starts
     finally:
       env.clear_rollout()
       self.actor.eval()
@@ -158,9 +192,18 @@ class EITTraining(BeliefModelTraining):
         learner.cfg.horizon, self.cfg.validation_batch_size, episode_ids=valid_ids
       )
     )
-    self.update_input_normalization(train_frames)
     model_before_policy = runner._dynamics.model_version
-    policy_logs = self.policy.update(episode_ids=train_ids)
+    # A singleton fragment still has a valid policy start. Only NLL needs a successor.
+    policy_ids = [
+      episode
+      for episode in runner.replay_buffer.training_episode_lengths()
+      if episode % self.cfg.validation_stride
+    ]
+    with runner.wm_env.readonly_policy_motion():
+      policy_keys = self.policy.sample_start_keys(policy_ids)
+      starts = self.update_input_normalization(train_frames, policy_keys)
+      assert starts is not None
+      policy_logs = self.policy.update_prepared(starts)
     if runner._dynamics.model_version != model_before_policy:
       raise RuntimeError("Policy update modified the frozen world model")
     self.rounds += 1

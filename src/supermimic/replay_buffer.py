@@ -218,7 +218,11 @@ class ReplayBuffer:
     return prior.clone(), frames
 
   def retained_frames(
-    self, episode_ids=None, *, newest_count: int | None = None
+    self,
+    episode_ids=None,
+    *,
+    newest_count: int | None = None,
+    fields: tuple[str, ...] | None = None,
   ) -> TensorDict:
     """Chronological retained frames, optionally restricted to training episodes.
 
@@ -242,7 +246,8 @@ class ReplayBuffer:
       ids = torch.as_tensor(list(episode_ids), device=self.device, dtype=torch.long)
       selected = torch.isin(self._storage["episode_id"][rows, slots], ids)
       rows, slots = rows[selected], slots[selected]
-    return self._storage[rows.reshape(-1), slots.reshape(-1)].detach().clone()
+    storage = self._storage if fields is None else self._storage.select(*fields)
+    return storage[rows.reshape(-1), slots.reshape(-1)].detach().clone()
 
   def training_episode_lengths(self) -> dict[int, int]:
     """Retained frame counts for sealed fragments, including singleton episodes."""

@@ -17,7 +17,10 @@ single-actor policy and the multi-encoder actor, and may override
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import asdict, dataclass, replace
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, fields, replace
+from itertools import batched, groupby
+from operator import itemgetter
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
@@ -34,7 +37,7 @@ from supermimic.estimator_inputs import (
   build_actor_features,
   sample_proprio,
 )
-from supermimic.motion_loader import motion_content_digest
+from supermimic.motion_loader import motion_content_digest, motion_tensor_versions
 from supermimic.replay_buffer import ReplayBuffer
 from supermimic.utils.helpers import matrix_to_quat, normalized_action_limits
 from supermimic.utils.lie_state import LieState
@@ -59,6 +62,15 @@ class _BeliefFrame(NamedTuple):
   generation: int
   episode_id: torch.Tensor
   time_index: torch.Tensor
+
+
+def _cat_beliefs(beliefs: list[BeliefState]) -> BeliefState:
+  return BeliefState(
+    LieState(
+      *(torch.cat([getattr(b.mean, f.name) for b in beliefs]) for f in fields(LieState))
+    ),
+    torch.cat([b.covariance for b in beliefs]),
+  )
 
 
 @dataclass(frozen=True)
@@ -88,6 +100,26 @@ class BeliefRolloutStart:
       batch=self.batch[selection].clone(),
       belief=self.belief.index(selection).clone(),
       remaining_steps=self.remaining_steps[selection].clone(),
+    )
+
+  @staticmethod
+  def cat(starts: list[BeliefRolloutStart]) -> BeliefRolloutStart:
+    if not starts:
+      raise ValueError("Cannot concatenate an empty list of policy starts")
+    first = starts[0]
+    for start in starts[1:]:
+      if (
+        start.replay_buffer is not first.replay_buffer
+        or start.insert_count != first.insert_count
+        or start.model_version != first.model_version
+        or start.motion_digest != first.motion_digest
+      ):
+        raise ValueError("Policy starts must share replay, model and motion versions")
+    return replace(
+      first,
+      batch=torch.cat([start.batch for start in starts]),
+      belief=_cat_beliefs([start.belief for start in starts]),
+      remaining_steps=torch.cat([start.remaining_steps for start in starts]),
     )
 
   def repeat_interleave(self, repeats: int):
@@ -160,6 +192,7 @@ class WorldModelEnv(ABC):
     self._num_actions = env.num_actions
     motion_cmd = env.unwrapped.command_manager.get_term("motion")
     self.motion = motion_cmd.motion
+    self._readonly_motion = None
     self._anchor_index = motion_cmd.motion_anchor_body_index
 
     if termination_softness <= 0.0:
@@ -303,6 +336,8 @@ class WorldModelEnv(ABC):
 
   def _check_belief_frame(self) -> None:
     """Cached goals and policy actions must still refer to the committed posterior."""
+    if self._readonly_motion is not None:
+      self._policy_motion_digest()
     provider, frame = self.posterior_provider, self._belief_frame
     if frame is None and not isinstance(provider, BeliefProvider):
       return
@@ -344,41 +379,61 @@ class WorldModelEnv(ABC):
     episodes, times = indices(episode_id), indices(time_index)
     provider = self.posterior_provider
     version = provider.model_version
-    targets, histories, means, covariances = [], [], [], []
-    # The rollout treats Q[t|t] as its initial condition. Relinearize every
-    # recorded transition but do not retain its model-training graph.
     with torch.inference_mode(False), torch.no_grad():
+      batches, beliefs = [], []
       for episode, t in zip(episodes.tolist(), times.tolist(), strict=True):
-        prior, frames = self.replay_buffer.training_prefix(
-          episode, t, relative=relative
+        batch, belief = next(
+          self._rebuild_episode(episode, [t], batch_size=1, relative=relative)
         )
-        measurements = frames["actor_obs"][..., :64]
-        current = provider.estimator.correct(
-          prior.index(None).clone(), measurements[:1]
-        )
-        for k in range(1, len(frames)):
-          predicted = provider.estimator.predict(
-            current, frames["action"][k - 1 : k], frames["sim_ctx"][k - 1 : k]
-          )
-          current = provider.estimator.correct(predicted, measurements[k : k + 1])
-        means.append(current.mean.to_full())
-        covariances.append(current.covariance)
-        targets.append(frames[-1])
-        history_indices = (
-          len(frames) - 1 + torch.arange(1 - self.history_length, 1, device=self.device)
-        ).clamp_min(0)
-        histories.append(frames["actor_obs"][history_indices])
-      batch = torch.stack(targets)
-      batch["sensor_window"] = torch.stack(histories)
-      belief = BeliefState(LieState.from_full(torch.cat(means)), torch.cat(covariances))
+        batches.append(batch)
+        beliefs.append(belief)
+      batch = torch.cat(batches)
       candidate = provider.prepare_restore(
-        belief,
+        _cat_beliefs(beliefs),
         batch["sim_ctx"],
         model_version=version,
         episode_id=episodes,
         time_index=batch["segment_time"],
       )
     return batch, candidate
+
+  def _rebuild_episode(self, episode, times, *, batch_size, relative=False):
+    """Filter a sealed episode through its sorted requested times in one pass."""
+    estimator = self.posterior_provider.estimator
+    with torch.inference_mode(False), torch.no_grad():
+      prior, frames = self.replay_buffer.training_prefix(
+        episode, times[-1], relative=relative
+      )
+      # Physical indices may start after zero when replay wrapped; relative
+      # indices already count from that retained head.
+      first = times[-1] - len(frames) + 1
+      if times[0] < first:
+        raise ValueError(f"Episode {episode} frame {times[0]} unavailable in replay")
+      sensors = frames["actor_obs"]
+      offsets = torch.arange(1 - self.history_length, 1, device=self.device)
+      current = estimator.correct(prior.index(None).clone(), sensors[:1, :64])
+      next_step = 1
+
+    for requested in batched(times, batch_size, strict=False):
+      with torch.inference_mode(False), torch.no_grad():
+        means, covariances = [], []
+        positions = [t - first for t in requested]
+        for position in positions:
+          for k in range(next_step, position + 1):
+            predicted = estimator.predict(
+              current, frames["action"][k - 1 : k], frames["sim_ctx"][k - 1 : k]
+            )
+            current = estimator.correct(predicted, sensors[k : k + 1, :64])
+          next_step = position + 1
+          means.append(current.mean.to_full())
+          covariances.append(current.covariance)
+        indices = torch.tensor(positions, device=self.device)
+        batch = frames[indices]
+        batch["sensor_window"] = sensors[(indices[:, None] + offsets).clamp_min(0)]
+        belief = BeliefState(
+          LieState.from_full(torch.cat(means)), torch.cat(covariances)
+        )
+      yield batch, belief
 
   def _last_reference_frame(self, frames):
     if (
@@ -390,8 +445,39 @@ class WorldModelEnv(ABC):
     clips = torch.searchsorted(self.motion.motion_ends, frames, right=True)
     return self.motion.motion_ends[clips] - 1
 
-  def prepare_policy_starts(self, episode_id, time_index) -> BeliefRolloutStart:
-    """Reconstruct each unique physical frame once, without changing live state."""
+  @contextmanager
+  def readonly_policy_motion(self):
+    """Pin the reference content digest for preparation and policy optimization.
+
+    All reference tensors and their backing storage are read-only throughout
+    this scope. PyTorch mutation counters catch ordinary in-place writes;
+    callers must also respect this contract for externally aliased storage
+    and inference tensors, which do not maintain mutation counters.
+    """
+    if self._readonly_motion is not None:
+      self._policy_motion_digest()
+      yield
+      return
+    self._readonly_motion = (
+      self.motion,
+      motion_tensor_versions(self.motion),
+      motion_content_digest(self.motion),
+    )
+    try:
+      yield
+      self._policy_motion_digest()
+    finally:
+      self._readonly_motion = None
+
+  def _policy_motion_digest(self):
+    if self._readonly_motion is None:
+      return motion_content_digest(self.motion)
+    motion, versions, digest = self._readonly_motion
+    if self.motion is not motion or motion_tensor_versions(self.motion) != versions:
+      raise ValueError("Reference motion changed during read-only policy training")
+    return digest
+
+  def _unique_policy_keys(self, episode_id, time_index):
     self._check_posterior_source(None)
     if not isinstance(self.posterior_provider, BeliefProvider):
       raise ValueError("Policy starts require a full belief provider")
@@ -405,39 +491,78 @@ class WorldModelEnv(ABC):
       or times.dtype != torch.long
     ):
       raise ValueError("Policy start keys require equal nonempty int64 vectors")
-    keys, inverse = torch.unique(
-      torch.stack((episodes, times), -1), dim=0, return_inverse=True
-    )
-    previous_size = self.num_envs
-    try:
-      self.num_envs = len(keys)
-      batch, candidate = self._rebuild_from_replay(keys[:, 0], keys[:, 1])
-    finally:
-      self.num_envs = previous_size
-    with torch.inference_mode(False), torch.no_grad():
-      batch = batch.detach().clone()
-      start = BeliefRolloutStart(
-        batch,
-        candidate.state.belief.detach().clone(),
-        candidate.state.model_version,
-        self.replay_buffer,
-        self.replay_buffer.insert_count,
-        motion_content_digest(self.motion),
-        self._last_reference_frame(batch["motion_time"]) - batch["motion_time"] + 1,
-      )
-      return start.index(inverse)
+    return torch.unique(torch.stack((episodes, times), -1), dim=0, return_inverse=True)
 
-  def sample_policy_starts(self, batch_size: int, episode_ids, generator=None):
+  def _iter_policy_starts(self, keys, batch_size):
     if type(batch_size) is not int or batch_size < 1:
       raise ValueError("Policy start batch size must be positive")
-    frames = self.replay_buffer.retained_frames(episode_ids=episode_ids)
+    version = self.posterior_provider.model_version
+    replay = self.replay_buffer
+    insert_count = replay.insert_count
+    digest = self._policy_motion_digest()
+    for episode, group in groupby(keys.tolist(), key=itemgetter(0)):
+      times = [time for _, time in group]
+      for batch, belief in self._rebuild_episode(episode, times, batch_size=batch_size):
+        with torch.inference_mode(False), torch.no_grad():
+          candidate = self.posterior_provider.prepare_restore(
+            belief,
+            batch["sim_ctx"],
+            model_version=version,
+            episode_id=batch["episode_id"],
+            time_index=batch["segment_time"],
+          )
+          remaining = (
+            self._last_reference_frame(batch["motion_time"]) - batch["motion_time"] + 1
+          )
+          start = BeliefRolloutStart(
+            batch,
+            candidate.state.belief,
+            version,
+            replay,
+            insert_count,
+            digest,
+            remaining,
+          )
+        yield start
+
+  def iter_policy_starts(self, episode_id, time_index, *, batch_size):
+    """Yield detached unique starts by episode and time, in bounded batches."""
+    keys, _ = self._unique_policy_keys(episode_id, time_index)
+    yield from self._iter_policy_starts(keys, batch_size)
+
+  def prepare_policy_starts(self, episode_id, time_index) -> BeliefRolloutStart:
+    """Return current-model starts in request order, including repeated keys."""
+    keys, inverse = self._unique_policy_keys(episode_id, time_index)
+    with torch.inference_mode(False), torch.no_grad():
+      start = BeliefRolloutStart.cat(list(self._iter_policy_starts(keys, len(keys))))
+      return start.index(inverse)
+
+  def sample_policy_keys(
+    self, batch_size: int, episode_ids, generator=None, *, num_batches: int = 1
+  ):
+    """Draw consecutive policy batches from one copy of the eligible keys."""
+    if type(batch_size) is not int or batch_size < 1:
+      raise ValueError("Policy start batch size must be positive")
+    if type(num_batches) is not int or num_batches < 1:
+      raise ValueError("Number of policy start batches must be positive")
+    frames = self.replay_buffer.retained_frames(
+      episode_ids=episode_ids, fields=("episode_id", "time_index")
+    )
     if not len(frames):
       raise ValueError("No training frames available for policy starts")
-    selected = torch.randint(
-      len(frames), (batch_size,), device=self.device, generator=generator
+    selected = torch.cat(
+      [
+        torch.randint(
+          len(frames), (batch_size,), device=self.device, generator=generator
+        )
+        for _ in range(num_batches)
+      ]
     )
+    return frames["episode_id"][selected], frames["time_index"][selected]
+
+  def sample_policy_starts(self, batch_size: int, episode_ids, generator=None):
     return self.prepare_policy_starts(
-      frames["episode_id"][selected], frames["time_index"][selected]
+      *self.sample_policy_keys(batch_size, episode_ids, generator)
     )
 
   def reset_prepared(self, start: BeliefRolloutStart) -> TensorDict:
@@ -448,7 +573,7 @@ class WorldModelEnv(ABC):
     if (
       start.replay_buffer is not self.replay_buffer
       or start.insert_count != self.replay_buffer.insert_count
-      or start.motion_digest != motion_content_digest(self.motion)
+      or start.motion_digest != self._policy_motion_digest()
       or start.model_version != self.dynamics.model_version
     ):
       raise ValueError("Stale rollout start: model, replay or motion changed")

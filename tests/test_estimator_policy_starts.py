@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from supermimic.critic_inputs import CriticInputConfig
+from supermimic.envs import world_model_env
 from tests.test_estimator_belief_integration import setup_env
 
 
@@ -58,6 +59,42 @@ def test_stale_prepared_start_rejected_without_mutating_live_frame():
     env.reset_prepared(start)
   assert env.posterior_provider.state is before
   assert env.num_envs == 2
+
+
+def test_readonly_policy_motion_hashes_once_across_preparations_and_resets(monkeypatch):
+  env, _, _ = setup_env()
+  digest = Mock(wraps=world_model_env.motion_content_digest)
+  monkeypatch.setattr(world_model_env, "motion_content_digest", digest)
+  with env.readonly_policy_motion():
+    starts = env.prepare_policy_starts(torch.tensor([0, 1]), torch.tensor([0, 0]))
+    with env.readonly_policy_motion():
+      env.reset_prepared(starts.index(0))
+    env.clear_rollout()
+    env.reset_prepared(starts.index(1))
+  assert digest.call_count == 1
+
+  env.motion.body_pos_w[0, 0, 0] += 1
+  with pytest.raises(ValueError, match="Stale rollout start"):
+    env.reset_prepared(starts)
+  assert digest.call_count == 2
+
+
+@pytest.mark.parametrize("replace_tensor", [False, True])
+def test_motion_mutation_is_rejected_during_policy_phase(replace_tensor):
+  env, _, _ = setup_env()
+  with pytest.raises(ValueError, match="read-only policy"):
+    with env.readonly_policy_motion():
+      starts = env.prepare_policy_starts(torch.tensor([0]), torch.tensor([0]))
+      env.reset_prepared(starts)
+      if replace_tensor:
+        env.motion.joint_pos = env.motion.joint_pos.clone()
+      else:
+        env.motion.joint_pos[0, 0] += 1
+      env.step(torch.zeros(1, 29))
+      pytest.fail("Policy step proceeded with a changed motion")
+  # A new phase may use the updated motion after an exceptional exit.
+  with env.readonly_policy_motion():
+    env.reset_prepared(env.prepare_policy_starts(torch.tensor([0]), torch.tensor([0])))
 
 
 def test_finished_clip_gets_zero_remaining_time_and_cannot_step_again():

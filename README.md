@@ -659,6 +659,12 @@ A 的 critic 不含 belief；B/C 使用相同结构，包含完整后验均值�
 动作穿过滤波、covariance、FiLM、soft survival 和价值 bootstrap 的导数。
 clip 最后一个评分动作后停止回报，普通策略 horizon 截断保留 bootstrap。
 
+每轮模型更新完毕后，先从所有保留的训练帧抽取本轮各次策略更新的起点，单帧片段也可入选。
+按 episode 从保留片段的先验顺序滤波，直到该 episode 最后一个需要的帧。只有本轮新采集的
+训练帧参与 actor/critic 归一化，每帧计一次。保存抽中起点的后验与控制历史，归一化更新后
+按原抽样顺序启动 rollout。起点准备和策略更新期间，参考 motion 张量及其底层存储只读；
+进入该阶段时计算一次内容摘要，随后各 microbatch 共用。
+
 新训练默认在输出目录的父目录创建或读取 `eit_initialization_seed<seed>.pt`，
 可用 `--initialization logs/eit-initial.pt` 显式指定共同初始化包。三组使用同一文件，
 不兼容的结构或配置会报错，不覆盖已有初值。
