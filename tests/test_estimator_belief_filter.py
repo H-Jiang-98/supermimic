@@ -121,6 +121,34 @@ def test_transition_jacobian_and_covariance_match_finite_differences():
   )
 
 
+@pytest.mark.parametrize("entrypoint", ["transition_jacobian", "predict"])
+def test_filter_rejects_inference_mode_instead_of_dropping_prior_covariance(entrypoint):
+  estimator, belief, action, context = _fixture(batch=1)
+  state = belief.mean if entrypoint == "transition_jacobian" else belief
+  with torch.inference_mode(), pytest.raises(RuntimeError, match="local autograd"):
+    getattr(estimator, entrypoint)(state, action, context)
+
+
+def test_no_grad_prediction_preserves_transition_and_prior_covariance():
+  estimator, belief, action, context = _fixture(batch=1)
+  expected, reference = estimator.predict(
+    belief, action, context, return_diagnostics=True
+  )
+  with torch.no_grad():
+    actual, diagnostics = estimator.predict(
+      belief, action, context, return_diagnostics=True
+    )
+  assert not actual.covariance.requires_grad
+  assert not diagnostics.transition_jacobian.requires_grad
+  assert (actual.covariance - diagnostics.process_covariance).abs().max() > 0.001
+  torch.testing.assert_close(actual.covariance, expected.covariance)
+  torch.testing.assert_close(
+    diagnostics.transition_jacobian, reference.transition_jacobian
+  )
+  for output, target in zip(actual.mean.to_rep(), expected.mean.to_rep(), strict=True):
+    torch.testing.assert_close(output, target)
+
+
 def test_euclidean_subproblem_matches_standard_kalman_update():
   estimator, belief, _, _ = _fixture()
   diagonal = torch.linspace(0.01, 0.07, 70, dtype=torch.float64)

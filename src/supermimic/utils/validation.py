@@ -4,6 +4,24 @@ import torch
 
 
 @torch.no_grad()
+def validate_state_dict(module: torch.nn.Module, supplied: dict, name: str) -> None:
+  """Check every tensor before load_state_dict can copy a partial checkpoint."""
+  expected = module.state_dict()
+  if not isinstance(supplied, dict) or supplied.keys() != expected.keys():
+    raise ValueError(f"{name} checkpoint parameter/buffer keys mismatch")
+  for key, value in supplied.items():
+    if (
+      not isinstance(value, torch.Tensor)
+      or value.shape != expected[key].shape
+      or value.dtype != expected[key].dtype
+      or value.layout != expected[key].layout
+      or value.is_meta
+      or not bool(torch.isfinite(value).all())
+    ):
+      raise ValueError(f"Invalid {name} checkpoint tensor: {key}")
+
+
+@torch.no_grad()
 def validate_rotation(rotation: torch.Tensor) -> None:
   if not rotation.is_floating_point() or rotation.shape[-2:] != (3, 3):
     raise ValueError("Rotation must be a floating-point 3 by 3 matrix")

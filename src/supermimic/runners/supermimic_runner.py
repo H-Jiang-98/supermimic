@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
+from copy import copy
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime
 from pathlib import Path
@@ -52,6 +53,7 @@ from supermimic.utils.helpers import (
 )
 from supermimic.utils.lie_state import LieState
 from supermimic.utils.logger import Logger
+from supermimic.utils.validation import validate_state_dict
 from supermimic.utils.wandb_artifacts import download_model_dir, log_model_artifact
 
 
@@ -182,7 +184,8 @@ class WorldModel:
     return bundle
 
   def load_bundle(self, bundle: dict) -> None:
-    """Load a ``world_model.pt`` bundle."""
+    """Validate all components before committing a ``world_model.pt`` bundle."""
+    metadata = None
     if self.dynamics.process_noise_config is not None:
       metadata = bundle.get("estimator")
       if metadata is None:
@@ -216,14 +219,25 @@ class WorldModel:
           and self.representation.actor_obs_mode != "proprio"
         ):
           raise ValueError("Estimator checkpoint measurement configuration mismatch")
-      self.dynamics.load_checkpoint(bundle["dynamics"])
-      if metadata is not None:
-        self.filter_config, self.initial_prior = filter_config, prior
         if measurement is not None:
-          self.representation.configure_estimator_measurement(measurement)
+          # Configuration validation must not change the live representation.
+          copy(self.representation).configure_estimator_measurement(measurement)
+      self.dynamics.validate_checkpoint(bundle["dynamics"])
+      dynamics_state = bundle["dynamics"]["state_dict"]
     else:
-      self.dynamics.load_state_dict(bundle["dynamics"])
-    self.sim_context.load_state_dict(bundle["sim_context"])
+      dynamics_state = bundle["dynamics"]
+      validate_state_dict(self.dynamics, dynamics_state, "Dynamics")
+    context_state = bundle["sim_context"]
+    validate_state_dict(self.sim_context, context_state, "Simulation context")
+    if isinstance(self.sim_context, SimContext) and (context_state["scale"] <= 0).any():
+      raise ValueError("Simulation context checkpoint scale must be positive")
+
+    self.dynamics.load_state_dict(dynamics_state)
+    self.sim_context.load_state_dict(context_state)
+    if metadata is not None:
+      self.filter_config, self.initial_prior = filter_config, prior
+      if measurement is not None:
+        self.representation.measurement_config = measurement
 
 
 def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
@@ -370,6 +384,7 @@ def load_actor_checkpoint(
   if inputs is None:
     if "input_config" in checkpoint:
       raise ValueError("Estimator input checkpoint cannot be loaded as a legacy actor")
+    validate_state_dict(actor, checkpoint, "Actor")
     actor.load_state_dict(checkpoint)
     return
   if "input_config" not in checkpoint:
@@ -388,6 +403,7 @@ def load_actor_checkpoint(
   }
   if checkpoint.get("architecture") != expected:
     raise ValueError("Actor architecture mismatch")
+  validate_state_dict(actor, checkpoint["actor"], "Actor")
   actor.load_state_dict(checkpoint["actor"])
 
 

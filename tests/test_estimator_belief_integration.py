@@ -766,3 +766,58 @@ def test_model_bundle_restores_filter_noise_and_prior_without_online_state():
   del bundle["estimator"]["filter_config"]["jitter_max"]
   with pytest.raises(ValueError, match="Incomplete"):
     restored.load_bundle(bundle)
+
+
+@pytest.mark.parametrize("stochastic", [False, True])
+@pytest.mark.parametrize(
+  "mutation", ["missing", "shape", "dtype", "nan", "zero_scale", "dynamics"]
+)
+def test_invalid_bundle_does_not_partially_restore_model_or_configuration(
+  stochastic, mutation
+):
+  from supermimic.belief import GaussianStatePrior
+  from supermimic.estimator import FilterConfig
+  from supermimic.estimator_inputs import GaussianMeasurementConfig
+  from supermimic.runners.supermimic_runner import WorldModel
+  from supermimic.sim_context import FootFrictionSpec, SimContext
+  from tests.test_estimator_stochastic_dynamics import make_dynamics
+
+  def build(std):
+    model, rep = make_dynamics(stochastic=stochastic)
+    rep.actor_obs_mode = "proprio"
+    rep.configure_estimator_measurement(GaussianMeasurementConfig(gravity_std=std))
+    context = SimContext([FootFrictionSpec()], [(0.2, 1.4)])
+    return WorldModel(rep, model, context, 700, 29)
+
+  source, target = build(0.02), build(0.01)
+  source.filter_config = FilterConfig(jitter_initial=1e-6)
+  source.initial_prior = GaussianStatePrior((0.02,) * 6)
+  source.sim_context.mean.add_(0.1)
+  source.sim_context.scale.mul_(2)
+  version = target.dynamics.model_version
+  measurement = target.representation.measurement_config
+  bundle = source.bundle()
+  assert source.dynamics.model_version != version
+  if mutation == "missing":
+    del bundle["sim_context"]["scale"]
+  elif mutation == "shape":
+    bundle["sim_context"]["scale"] = torch.ones(2)
+  elif mutation == "dtype":
+    bundle["sim_context"]["scale"] = torch.ones(1, dtype=torch.float64)
+  elif mutation == "nan":
+    bundle["sim_context"]["mean"] = torch.full((1,), float("nan"))
+  elif mutation == "zero_scale":
+    bundle["sim_context"]["scale"] = torch.zeros(1)
+  else:
+    weights = bundle["dynamics"]["state_dict"] if stochastic else bundle["dynamics"]
+    del weights["mlp.3.bias"]
+  # state_dict returns tensor aliases: snapshot the live context independently.
+  context_before = {k: v.clone() for k, v in target.sim_context.state_dict().items()}
+  with pytest.raises(ValueError, match="checkpoint"):
+    target.load_bundle(bundle)
+  assert target.dynamics.model_version == version
+  assert target.filter_config == FilterConfig()
+  assert target.initial_prior == GaussianStatePrior()
+  assert target.representation.measurement_config == measurement
+  for key, value in target.sim_context.state_dict().items():
+    torch.testing.assert_close(value, context_before[key], atol=0, rtol=0)

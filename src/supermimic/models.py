@@ -12,6 +12,8 @@ import torch.nn.functional as F
 from rsl_rl.modules import EmpiricalNormalization
 from tensordict import TensorDict
 
+from supermimic.utils.validation import validate_state_dict
+
 if TYPE_CHECKING:
   from supermimic.representations import StateRepresentation
   from supermimic.tasks.task_spec import TaskSpec
@@ -261,26 +263,20 @@ class Dynamics(nn.Module):
       "model_version": self._content_digest(metadata, state),
     }
 
-  def load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
-    """Validate the complete snapshot before mutating the live model."""
+  def validate_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+    """Validate without changing parameters, buffers or the model version."""
     if checkpoint.get("metadata") != self._checkpoint_metadata():
       raise ValueError("Dynamics checkpoint configuration or state layout mismatch")
     supplied = checkpoint.get("state_dict")
-    expected = self.state_dict()
-    if not isinstance(supplied, dict) or supplied.keys() != expected.keys():
-      raise ValueError("Dynamics checkpoint parameter/buffer keys mismatch")
-    for name, value in supplied.items():
-      if (
-        not isinstance(value, torch.Tensor)
-        or value.shape != expected[name].shape
-        or value.dtype != expected[name].dtype
-        or not bool(torch.isfinite(value).all())
-      ):
-        raise ValueError(f"Invalid Dynamics checkpoint tensor: {name}")
+    validate_state_dict(self, supplied, "Dynamics")
     digest = self._content_digest(checkpoint["metadata"], supplied)
     if digest != checkpoint.get("model_version"):
       raise ValueError("Dynamics checkpoint content does not match its model version")
-    self.load_state_dict(supplied, strict=True)
+
+  def load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+    """Validate the complete snapshot before mutating the live model."""
+    self.validate_checkpoint(checkpoint)
+    self.load_state_dict(checkpoint["state_dict"], strict=True)
 
   def normalizers(self) -> list[_CudaGraphNormalization]:
     return [self.state_normalizer, self.action_normalizer]

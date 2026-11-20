@@ -407,6 +407,39 @@ def test_incompatible_checkpoint_is_rejected_before_loading_parameters(mutation)
   )
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("mutation", ["missing", "extra", "shape", "dtype", "nan"])
+def test_invalid_actor_weights_leave_all_parameters_and_normalizers_unchanged(
+  legacy, mutation
+):
+  runner = _runner()
+  cfg = replace(runner.cfg, estimator_inputs=None) if legacy else runner.cfg
+  source = build_actor(cfg, runner._wm, "cpu")
+  target = build_actor(cfg, runner._wm, "cpu")
+  for name, buffer in source.named_buffers():
+    if name.endswith("_mean"):
+      buffer.add_(0.1)
+  checkpoint = copy.deepcopy(actor_checkpoint(source, cfg))
+  state = checkpoint if legacy else checkpoint["actor"]
+  key = next(k for k in state if k.startswith("decoder.") and k.endswith("weight"))
+  before = copy.deepcopy(target.state_dict())
+  assert not torch.equal(state[key], before[key])
+  if mutation == "missing":
+    del state[key]
+  elif mutation == "extra":
+    state["unexpected"] = torch.zeros(1)
+  elif mutation == "shape":
+    state[key] = state[key][:-1]
+  elif mutation == "dtype":
+    state[key] = state[key].double()
+  else:
+    state[key].flatten()[0] = float("nan")
+  with pytest.raises(ValueError, match="Actor checkpoint"):
+    load_actor_checkpoint(target, cfg, checkpoint)
+  for name, value in target.state_dict().items():
+    torch.testing.assert_close(value, before[name], atol=0, rtol=0)
+
+
 def test_input_stage_cannot_silently_start_incomplete_policy_training():
   runner = _runner()
   with pytest.raises(NotImplementedError, match="step-1"):

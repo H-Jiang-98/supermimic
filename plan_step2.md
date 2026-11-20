@@ -312,3 +312,11 @@ OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-step2-mpl .venv/bin/python -m sup
 | Smoke 耗时 | 采集 1.49 秒；想象前向/反向及快照验证 13.73 秒；总计 16.42 秒 |
 
 完整回归覆盖参考位置、朝向、关节和各速度字段的原地变化、等长 clip 内容变化与重排、缺失指纹/旧 v1 快照拒绝，以及相同参考下的恢复与梯度一致性。警告来自 TorchScript/ONNX 弃用提示与 NVML 初始化；本机无可用 CUDA，未验证 GPU。上述结果只证明 CPU 小规模接口、数值与计算图可用，尚未验证完整 EIT 学习或闭环控制性能。
+
+**审阅修正及验收（2026-11-20，基于 `46882f4`）。**
+
+直接调用滤波核心时，`transition_jacobian` 现在拒绝 `torch.inference_mode()`，避免返回全零传播矩阵而丢失先验 covariance。无外层梯度的评估使用 `torch.no_grad()`；真实 provider 继续通过已有的局部 inference-mode 退出和普通 tensor 克隆计算 Jacobian。
+
+世界模型加载先校验 dynamics、sim context 和 estimator 配置，再写入参数与配置；actor 加载也在复制前校验全部参数和 buffer。校验覆盖键集合、形状、dtype、tensor layout、有限值及 sim context 的正尺度。新增失败恢复测试使用不同的来源/目标权重，检查目标模型指纹、归一化和配置在失败后保持原值。
+
+本批新增 25 项回归，已跟踪根目录测试 **428 passed**（304.06 秒），`tests/public_mjlab` **30 passed**（1.50 秒），合计 **458 passed**。七个修改的 Python 文件通过 Ruff lint/format；CPU float32 MuJoCo smoke 通过，batch=2、8 步采集、2 步随机想象，actor 梯度有限、快照恢复成功，总计 15.32 秒。GPU 与完整联合训练仍未验证。

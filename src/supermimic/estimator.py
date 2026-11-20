@@ -297,7 +297,15 @@ class LieBeliefFilter:
     A shared tangent vector perturbs every independent batch row. Its Jacobian
     has shape ``(*batch, 70, 70)`` without materializing batch cross-blocks.
     Dynamics must not couple batch rows (fixed empirical normalization is OK).
+
+    Evaluation may use no_grad(), but inference_mode disables the local AD
+    needed even when no outer model/action gradients are requested.
     """
+    if torch.is_inference_mode_enabled():
+      raise RuntimeError(
+        "Transition Jacobians require local autograd; use torch.no_grad() "
+        "instead of torch.inference_mode(), or use BeliefProvider"
+      )
     if nominal is None:
       aux, rep = mean.to_rep()
       next_aux, next_rep = self.dynamics(rep, action, aux, context)
