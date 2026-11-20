@@ -20,10 +20,9 @@ class _AnalyticDynamics(nn.Module):
     self.mean_weight = nn.Parameter(torch.tensor(0.8, dtype=torch.float64))
     self.noise_weight = nn.Parameter(torch.tensor(-3.0, dtype=torch.float64))
 
-  def forward(self, rep, action, aux, context):
-    state = LieState.from_rep(aux, rep)
+  def mean_lie(self, state, action, context):
     dt, weight = 0.02, self.mean_weight
-    moved = LieState(
+    return LieState(
       state.rotation @ so3_exp(dt * (state.omega + weight * action[..., :3])),
       state.position + dt * state.velocity,
       state.velocity + dt * weight * (action[..., :3] + state.velocity.tanh()),
@@ -31,13 +30,12 @@ class _AnalyticDynamics(nn.Module):
       state.joint_pos + dt * state.joint_vel,
       state.joint_vel + dt * weight * (state.joint_pos + action).tanh(),
     )
-    return moved.to_rep()
 
-  def distribution(self, rep, action, aux, context):
-    next_aux, next_rep = self(rep, action, aux, context)
+  def distribution_lie(self, state, action, context):
+    mean = self.mean_lie(state, action, context)
     diagonal = nn.functional.softplus(self.noise_weight) + 1e-6
-    factor = diagonal * torch.eye(70, dtype=rep.dtype, device=rep.device)
-    return next_aux, next_rep, factor.expand(*rep.shape[:-1], 70, 70)
+    factor = diagonal * torch.eye(70, dtype=action.dtype, device=action.device)
+    return mean, factor.expand(*action.shape[:-1], 70, 70)
 
 
 def _fixture(batch=2, *, dtype=torch.float64, measurement=None, config=None):
@@ -104,8 +102,8 @@ def test_transition_jacobian_and_covariance_match_finite_differences():
     delta[index] = 2e-6
     residuals = []
     for sign in (1, -1):
-      aux, rep = boxplus(belief.mean, delta * sign).to_rep()
-      moved = LieState.from_rep(*estimator.dynamics(rep, action, aux, context))
+      perturbed = boxplus(belief.mean, delta * sign)
+      moved = estimator.dynamics.mean_lie(perturbed, action, context)
       residuals.append(local_error(predicted.mean, moved))
     finite_columns.append((residuals[0] - residuals[1]) / 4e-6)
   reference = torch.stack(finite_columns, -1)

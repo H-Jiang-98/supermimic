@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from rsl_rl.modules import EmpiricalNormalization
 from tensordict import TensorDict
 
+from supermimic.utils.lie_state import LieState, boxplus
 from supermimic.utils.validation import validate_state_dict
 
 if TYPE_CHECKING:
@@ -108,6 +109,10 @@ class Dynamics(nn.Module):
     self.dt = representation.dt
     self._apply_prediction = representation.apply_prediction
     self.process_noise_config = process_noise
+    # Bound methods avoid registering the representation (and its simulator
+    # helpers) as a submodule. Deterministic legacy forward stays unchanged.
+    self._represent_lie = getattr(representation, "represent_lie", None)
+    self._apply_prediction_lie = getattr(representation, "apply_prediction_lie", None)
 
     self.register_buffer("action_scale", action_scale.clone())
     self.register_buffer("action_offset", action_offset.clone())
@@ -159,8 +164,59 @@ class Dynamics(nn.Module):
     aux_state: torch.Tensor,
     sim_ctx: torch.Tensor,
   ) -> tuple[torch.Tensor, torch.Tensor]:
+    if self.process_noise_config is not None:
+      return self.mean_lie(
+        LieState.from_rep(aux_state, rep_state), action, sim_ctx
+      ).to_rep()
     prediction = self.mlp(self._normalized_inputs(rep_state, action, sim_ctx))
     return self._apply_prediction(aux_state, rep_state, prediction, self.dt)
+
+  def mean_lie(
+    self, state: LieState, action: torch.Tensor, sim_ctx: torch.Tensor
+  ) -> LieState:
+    """Matrix mean transition; validation belongs outside jacrev/vmap."""
+    if self._represent_lie is None or self._apply_prediction_lie is None:
+      raise ValueError("Lie dynamics requires GenCoord representation")
+    inputs = self._normalized_inputs(self._represent_lie(state), action, sim_ctx)
+    return self._apply_prediction_lie(state, self.mlp(inputs), self.dt)
+
+  def _noise_factor(self, inputs: torch.Tensor) -> torch.Tensor:
+    if self.noise_head is None or self.process_noise_config is None:
+      raise ValueError("distribution() requires an explicit ProcessNoiseConfig")
+    values = self.noise_head(inputs)
+    values = torch.where(
+      self._noise_diagonal,
+      F.softplus(values) + self.process_noise_config.diagonal_floor,
+      values,
+    )
+    indices = self._noise_indices.expand_as(values)
+    lower = values.new_zeros(*values.shape[:-1], 4900).scatter(-1, indices, values)
+    return lower.reshape(*values.shape[:-1], 70, 70)
+
+  def distribution_lie(
+    self, state: LieState, action: torch.Tensor, sim_ctx: torch.Tensor
+  ) -> tuple[LieState, torch.Tensor]:
+    """Matrix mean and full right-local process factor, sharing model inputs."""
+    if self._represent_lie is None or self._apply_prediction_lie is None:
+      raise ValueError("Lie dynamics requires GenCoord representation")
+    inputs = self._normalized_inputs(self._represent_lie(state), action, sim_ctx)
+    return (
+      self._apply_prediction_lie(state, self.mlp(inputs), self.dt),
+      self._noise_factor(inputs),
+    )
+
+  def sample_lie(
+    self,
+    state: LieState,
+    action: torch.Tensor,
+    sim_ctx: torch.Tensor,
+    epsilon: torch.Tensor,
+  ) -> LieState:
+    """Reparameterized matrix sample with caller-owned standard normal noise."""
+    if epsilon.shape != (*state.position.shape[:-1], 70):
+      raise ValueError("Process epsilon must match the batch shape and have 70 entries")
+    mean, lower = self.distribution_lie(state, action, sim_ctx)
+    return boxplus(mean, (lower @ epsilon.unsqueeze(-1)).squeeze(-1))
 
   def _normalized_inputs(
     self, rep_state: torch.Tensor, action: torch.Tensor, sim_ctx: torch.Tensor
@@ -179,19 +235,11 @@ class Dynamics(nn.Module):
     """Return deterministic mean and its full right-local Cholesky factor."""
     if self.noise_head is None or self.process_noise_config is None:
       raise ValueError("distribution() requires an explicit ProcessNoiseConfig")
-    inputs = self._normalized_inputs(rep_state, action, sim_ctx)
-    next_aux, next_rep = self._apply_prediction(
-      aux_state, rep_state, self.mlp(inputs), self.dt
+    mean, factor = self.distribution_lie(
+      LieState.from_rep(aux_state, rep_state), action, sim_ctx
     )
-    values = self.noise_head(inputs)
-    values = torch.where(
-      self._noise_diagonal,
-      F.softplus(values) + self.process_noise_config.diagonal_floor,
-      values,
-    )
-    indices = self._noise_indices.expand_as(values)
-    lower = values.new_zeros(*values.shape[:-1], 4900).scatter(-1, indices, values)
-    return next_aux, next_rep, lower.reshape(*values.shape[:-1], 70, 70)
+    next_aux, next_rep = mean.to_rep()
+    return next_aux, next_rep, factor
 
   def sample(
     self,
@@ -202,19 +250,15 @@ class Dynamics(nn.Module):
     epsilon: torch.Tensor,
   ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reparameterized sample using caller-owned standard normal noise."""
-    from supermimic.utils.lie_state import LieState, boxplus
-
-    next_aux, next_rep, lower = self.distribution(rep_state, action, aux_state, sim_ctx)
-    if epsilon.shape != (*rep_state.shape[:-1], 70):
-      raise ValueError("Process epsilon must match the batch shape and have 70 entries")
-    delta = (lower @ epsilon.unsqueeze(-1)).squeeze(-1)
-    return boxplus(LieState.from_rep(next_aux, next_rep), delta).to_rep()
+    return self.sample_lie(
+      LieState.from_rep(aux_state, rep_state), action, sim_ctx, epsilon
+    ).to_rep()
 
   def _checkpoint_metadata(self) -> dict[str, Any]:
     from supermimic.utils.lie_state import STATE_LAYOUT_VERSION, TANGENT_VERSION
 
     return {
-      "format_version": "stochastic_dynamics_v1",
+      "format_version": "stochastic_dynamics_v2",
       "state_layout": STATE_LAYOUT_VERSION,
       "tangent_version": TANGENT_VERSION,
       "process_noise": (
@@ -222,6 +266,7 @@ class Dynamics(nn.Module):
       ),
       "dt": self.dt,
       "integration": {
+        "version": "right_matrix_v2" if self.process_noise_config else "quaternion_v1",
         "representation": type(self._apply_prediction.__self__).__name__,
         "substep_coeff": getattr(
           self._apply_prediction.__self__, "substep_coeff", None
@@ -272,6 +317,41 @@ class Dynamics(nn.Module):
     digest = self._content_digest(checkpoint["metadata"], supplied)
     if digest != checkpoint.get("model_version"):
       raise ValueError("Dynamics checkpoint content does not match its model version")
+
+  def migrate_checkpoint(self, checkpoint: dict[str, Any]) -> dict[str, Any]:
+    """Migrate verified weights from either earlier stochastic integrator.
+
+    This returns a new snapshot, without loading it. Active posterior caches
+    must be discarded because its model version changes. Optimizer migration
+    and online state are intentionally not inferred from a weights snapshot.
+    """
+    if self.process_noise_config is None:
+      raise ValueError("Checkpoint migration requires stochastic dynamics")
+    metadata = self._checkpoint_metadata()
+    old_quaternion = {
+      **metadata,
+      "format_version": "stochastic_dynamics_v1",
+      "integration": {
+        key: value for key, value in metadata["integration"].items() if key != "version"
+      },
+    }
+    old_matrix = {
+      **metadata,
+      "integration": {**metadata["integration"], "version": "right_matrix_v1"},
+    }
+    source = checkpoint.get("metadata")
+    if source not in (old_quaternion, old_matrix):
+      raise ValueError("Unknown or incompatible stochastic dynamics checkpoint")
+    supplied = checkpoint.get("state_dict")
+    validate_state_dict(self, supplied, "Dynamics")
+    if self._content_digest(source, supplied) != checkpoint.get("model_version"):
+      raise ValueError("Dynamics checkpoint content does not match its model version")
+    state = {key: value.detach().clone() for key, value in supplied.items()}
+    return {
+      "metadata": metadata,
+      "state_dict": state,
+      "model_version": self._content_digest(metadata, state),
+    }
 
   def load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
     """Validate the complete snapshot before mutating the live model."""

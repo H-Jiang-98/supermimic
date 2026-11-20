@@ -50,8 +50,13 @@ def test_distribution_preserves_mean_and_initial_physical_scale():
     torch.testing.assert_close(parameter, dict(stochastic.named_parameters())[name])
   expected = legacy(*args)
   aux, rep, lower = stochastic.distribution(*args)
-  torch.testing.assert_close(aux, expected[0], atol=0, rtol=0)
-  torch.testing.assert_close(rep, expected[1], atol=0, rtol=0)
+  # The native matrix path and retained quaternion reference implement the
+  # same integration, with different floating-point roundoff.
+  torch.testing.assert_close(aux, expected[0], atol=3e-10, rtol=3e-10)
+  torch.testing.assert_close(rep, expected[1], atol=3e-10, rtol=3e-10)
+  actual_mean = stochastic(*args)
+  torch.testing.assert_close(aux, actual_mean[0], atol=0, rtol=0)
+  torch.testing.assert_close(rep, actual_mean[1], atol=0, rtol=0)
   std = stochastic.process_noise_config.standard_deviations(dtype=lower.dtype)
   torch.testing.assert_close(
     lower, torch.diag(std).expand(2, 70, 70), rtol=1e-6, atol=1e-9

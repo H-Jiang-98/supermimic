@@ -2,7 +2,8 @@
 
 Run with ``OMP_NUM_THREADS=1 python -m supermimic.scripts.check_matrix_jacobian``.
 Assertions check values and outer gradients; stdout is a JSON test record.
-The small prototype leaves the production dynamics and filter unchanged.
+The independent prototype is retained alongside the production matrix backend;
+the quaternion reference explicitly calls the original integration adapter.
 """
 
 import json
@@ -13,7 +14,7 @@ import torch
 from torch.func import jacrev, vmap
 
 from supermimic.belief import BeliefState
-from supermimic.estimator import LieBeliefFilter, posterior_nll
+from supermimic.estimator import FilterConfig, LieBeliefFilter, posterior_nll
 from supermimic.estimator_inputs import GaussianMeasurementConfig
 from supermimic.models import Dynamics, ProcessNoiseConfig
 from supermimic.representations import GenCoordRepresentation
@@ -117,6 +118,26 @@ class MatrixFilter(LieBeliefFilter):
     return BeliefState(mean, (covariance + covariance.mT) * 0.5)
 
 
+class QuaternionReference(torch.nn.Module):
+  """Explicit old adapter, unaffected by the production matrix default."""
+
+  def __init__(self, model):
+    super().__init__()
+    self.model = model
+
+  def mean_lie(self, state, action, context):
+    aux, rep = state.to_rep()
+    inputs = self.model._normalized_inputs(rep, action, context)
+    return LieState.from_rep(
+      *self.model._apply_prediction(aux, rep, self.model.mlp(inputs), self.model.dt)
+    )
+
+  def distribution_lie(self, state, action, context):
+    _, rep = state.to_rep()
+    inputs = self.model._normalized_inputs(rep, action, context)
+    return self.mean_lie(state, action, context), self.model._noise_factor(inputs)
+
+
 def fixture(batch, dtype=torch.float64):
   rep = GenCoordRepresentation(29, torch.zeros(29, dtype=dtype))
   rep.dt, rep.substep_coeff = 0.02, 0.6
@@ -196,7 +217,10 @@ def run():
   vec = MatrixFilter(model, representation.substep_coeff, "vmap")
   eager = MatrixFilter(model, representation.substep_coeff, "eager")
   legacy = LieBeliefFilter(
-    model, GaussianMeasurementConfig(), torch.zeros(29, dtype=torch.float64)
+    QuaternionReference(model),
+    GaussianMeasurementConfig(),
+    torch.zeros(29, dtype=torch.float64),
+    FilterConfig(jacobian_backend="eager"),
   )
 
   # Integration values over several absolute orientations, including near pi.
@@ -204,8 +228,7 @@ def run():
   for angle in (0.0, 1e-8, 0.8, 3.14):
     theta = torch.tensor([angle, 0.0, 0.0], dtype=torch.float64).expand(2, 3)
     sample = replace(state, rotation=so3_exp(theta))
-    aux, rep = sample.to_rep()
-    old = LieState.from_rep(*model(rep, action, aux, context))
+    old = legacy.mean_step(sample, action, context)
     new = vec.mean_step(sample, action, context)
     parity.append(
       max(

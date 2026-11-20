@@ -8,10 +8,11 @@ must explicitly commit its returned candidate belief and manage model versions.
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from typing import TYPE_CHECKING
 
 import torch
+from torch.func import jacrev, vmap
 
 from supermimic.belief import BeliefState
 from supermimic.estimator_inputs import GaussianMeasurementConfig, PosteriorInput
@@ -47,9 +48,16 @@ class FilterConfig:
   jitter_attempts: int = 5
   covariance_atol: float = 1e-10
   covariance_rtol: float = 1e-5
+  jacobian_backend: str = "vmap"
+  jacobian_batch_chunk_size: int | None = None
+  jacobian_chunk_size: int | None = None
 
   def __post_init__(self) -> None:
-    values = asdict(self)
+    values = {
+      key: value
+      for key, value in asdict(self).items()
+      if not key.startswith("jacobian_")
+    }
     if any(not math.isfinite(value) for value in values.values()):
       raise ValueError("Filter numerical settings must be finite")
     if self.jitter_initial <= 0 or self.jitter_max < self.jitter_initial:
@@ -60,6 +68,11 @@ class FilterConfig:
       raise ValueError("jitter_attempts must be a nonnegative integer")
     if self.covariance_atol < 0 or self.covariance_rtol < 0:
       raise ValueError("Covariance validation tolerances must be nonnegative")
+    if self.jacobian_backend not in ("vmap", "eager"):
+      raise ValueError("jacobian_backend must be 'vmap' or 'eager'")
+    for chunk in (self.jacobian_batch_chunk_size, self.jacobian_chunk_size):
+      if chunk is not None and (type(chunk) is not int or chunk < 1):
+        raise ValueError("Jacobian chunk sizes must be positive integers or None")
 
 
 @dataclass(frozen=True)
@@ -229,6 +242,10 @@ class LieBeliefFilter:
     default_joint_pos: torch.Tensor,
     config: FilterConfig | None = None,
   ) -> None:
+    if not callable(getattr(dynamics, "mean_lie", None)) or not callable(
+      getattr(dynamics, "distribution_lie", None)
+    ):
+      raise TypeError("Belief dynamics must implement mean_lie and distribution_lie")
     if default_joint_pos.shape != (29,) or not bool(
       torch.isfinite(default_joint_pos).all()
     ):
@@ -294,9 +311,8 @@ class LieBeliefFilter:
   ) -> torch.Tensor:
     """Derivative in epsilon only, retaining all outer parameter dependencies.
 
-    A shared tangent vector perturbs every independent batch row. Its Jacobian
-    has shape ``(*batch, 70, 70)`` without materializing batch cross-blocks.
-    Dynamics must not couple batch rows (fixed empirical normalization is OK).
+    The vectorized backend differentiates each independent sample then batches
+    the result, without materializing cross-batch blocks. Normalization is fixed.
 
     Evaluation may use no_grad(), but inference_mode disables the local AD
     needed even when no outer model/action gradients are requested.
@@ -307,26 +323,57 @@ class LieBeliefFilter:
         "instead of torch.inference_mode(), or use BeliefProvider"
       )
     if nominal is None:
-      aux, rep = mean.to_rep()
-      next_aux, next_rep = self.dynamics(rep, action, aux, context)
-      nominal = LieState.from_rep(next_aux, next_rep)
+      nominal = self.mean_step(mean, action, context)
 
     def residual(epsilon: torch.Tensor) -> torch.Tensor:
       perturbed = boxplus(mean, epsilon)
-      aux, rep = perturbed.to_rep()
-      next_aux, next_rep = self.dynamics(rep, action, aux, context)
-      return local_error(nominal, LieState.from_rep(next_aux, next_rep))
+      return local_error(nominal, self.mean_step(perturbed, action, context))
 
     zero = mean.position.new_zeros(TANGENT_DIM)
-    # GenCoord currently calls TorchScript quaternion primitives. Their nested
-    # functorch backward can either fail under vmap or silently give incorrect
-    # mixed parameter derivatives, including with jacrev(chunk_size=1). Keep
-    # this eager reference on ordinary autograd until those primitives have a
-    # separately verified transform-safe implementation. create_graph is
-    # essential for model learning and action gradients through covariance.
-    return torch.autograd.functional.jacobian(
-      residual, zero, create_graph=torch.is_grad_enabled(), vectorize=False
+    if self.config.jacobian_backend == "eager":
+      return torch.autograd.functional.jacobian(
+        residual, zero, create_graph=torch.is_grad_enabled(), vectorize=False
+      )
+
+    def single(epsilon, state_values, nominal_values, a, ctx):
+      state = LieState(*state_values)
+      base = LieState(*nominal_values)
+      return local_error(base, self.mean_step(boxplus(state, epsilon), a, ctx))
+
+    # Flatten arbitrary leading batch axes. The nominal is constant only for
+    # epsilon differentiation; passing its tensors preserves outer gradients.
+    def flatten(state):
+      return tuple(
+        getattr(state, field.name).reshape(
+          -1,
+          *(
+            (3, 3)
+            if field.name == "rotation"
+            else (getattr(state, field.name).shape[-1],)
+          ),
+        )
+        for field in fields(state)
+      )
+
+    batch_shape = mean.position.shape[:-1]
+    state_values, nominal_values = flatten(mean), flatten(nominal)
+    count = state_values[0].shape[0]
+    result = vmap(
+      jacrev(single, argnums=0, chunk_size=self.config.jacobian_chunk_size),
+      chunk_size=self.config.jacobian_batch_chunk_size,
+    )(
+      zero.expand(count, TANGENT_DIM),
+      state_values,
+      nominal_values,
+      action.reshape(count, action.shape[-1]),
+      context.reshape(count, context.shape[-1]),
     )
+    return result.reshape(*batch_shape, TANGENT_DIM, TANGENT_DIM)
+
+  def mean_step(
+    self, mean: LieState, action: torch.Tensor, context: torch.Tensor
+  ) -> LieState:
+    return self.dynamics.mean_lie(mean, action, context)
 
   def predict(
     self,
@@ -344,9 +391,7 @@ class LieBeliefFilter:
       raise ValueError("Context batch shape must match the belief")
     if not bool(torch.isfinite(action).all() and torch.isfinite(context).all()):
       raise ValueError("Action and context must be finite")
-    aux, rep = belief.mean.to_rep()
-    next_aux, next_rep, factor = self.dynamics.distribution(rep, action, aux, context)
-    nominal = LieState.from_rep(next_aux, next_rep)
+    nominal, factor = self.dynamics.distribution_lie(belief.mean, action, context)
     jacobian = self.transition_jacobian(belief.mean, action, context, nominal)
     process = factor @ factor.transpose(-1, -2)
     covariance = _symmetric(

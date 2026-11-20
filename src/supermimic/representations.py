@@ -50,6 +50,7 @@ from supermimic.utils.helpers import (
   rodrigues_precompute,
   rot6d_to_matrix,
 )
+from supermimic.utils.lie_state import LieState, so3_exp
 from supermimic.utils.maxcoord_helpers import (
   compute_maxcoord_rep_state,
   decompose_maxcoord_rep_state,
@@ -549,6 +550,42 @@ class GenCoordRepresentation(StateRepresentation):
       rotation=rotation,
       position=aux_state[..., :3],
       velocity=(rotation @ v_b.unsqueeze(-1)).squeeze(-1),
+    )
+
+  def represent_lie(self, state: LieState) -> torch.Tensor:
+    """Native matrix features; no quaternion conversion inside local AD."""
+    return torch.cat(
+      (
+        state.position[..., 2:3],
+        -state.rotation[..., 2, :],
+        (state.rotation.mT @ state.velocity.unsqueeze(-1)).squeeze(-1),
+        state.omega,
+        state.joint_pos,
+        state.joint_vel,
+      ),
+      dim=-1,
+    )
+
+  def apply_prediction_lie(
+    self, state: LieState, prediction: torch.Tensor, dt: float
+  ) -> LieState:
+    """Right matrix integration with angular velocity in the new body frame."""
+    dv, dw, dj = prediction.split((3, 3, self.num_joints), dim=-1)
+    c = self.substep_coeff
+    increment = so3_exp(dt * (state.omega + c * dw))
+    rotation = state.rotation @ increment
+    # One Newton–Schulz polar iteration removes first-order orthogonality drift.
+    # This polynomial is smooth at SO(3) and preserves tangential derivatives.
+    identity = torch.eye(3, device=rotation.device, dtype=rotation.dtype)
+    rotation = rotation + 0.5 * (rotation @ (identity - rotation.mT @ rotation))
+    world_dv = (state.rotation @ dv.unsqueeze(-1)).squeeze(-1)
+    return LieState(
+      rotation,
+      state.position + dt * (state.velocity + c * world_dv),
+      state.velocity + world_dv,
+      (increment.mT @ (state.omega + dw).unsqueeze(-1)).squeeze(-1),
+      state.joint_pos + dt * (state.joint_vel + c * dj),
+      state.joint_vel + dj,
     )
 
   def apply_prediction(
