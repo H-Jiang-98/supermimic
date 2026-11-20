@@ -27,6 +27,7 @@ from supermimic.runners.belief_training import (
   BeliefTrainingCfg,
   _round_training_metrics,
 )
+from supermimic.runners.run_config import validate_eit_checkpoint_contract
 from supermimic.runners.supermimic_runner import (
   SuperMimicRunner,
   actor_checkpoint,
@@ -244,10 +245,7 @@ class EITTraining(BeliefModelTraining):
 
   @staticmethod
   def _check_checkpoint_version(state: dict) -> None:
-    if state.get("version") != "eit_training_v1":
-      raise ValueError(
-        "EIT continuation requires eit_training_v1; model-only checkpoints require explicit weight import"
-      )
+    validate_eit_checkpoint_contract(state)
 
   def load_state_dict(self, state: dict) -> None:
     self._check_checkpoint_version(state)

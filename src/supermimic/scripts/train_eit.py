@@ -12,6 +12,7 @@ import torch
 from mjlab.tasks.registry import load_env_cfg
 
 import supermimic.tasks  # noqa: F401
+from supermimic.critic_inputs import CRITIC_INPUT_VERSION
 from supermimic.estimator import FilterConfig
 from supermimic.learners.belief_policy_learner import BeliefPolicyLearnerCfg
 from supermimic.learners.belief_wm_learner import BeliefWorldModelLearnerCfg
@@ -31,7 +32,7 @@ def main():
   parser.add_argument(
     "--initialization",
     type=Path,
-    help="Shared A/B/C initial weights; default: output parent/eit_initialization_seed<seed>.pt",
+    help=f"Shared A/B/C initial weights (default: output parent/eit_initialization_{CRITIC_INPUT_VERSION}_seed<seed>.pt)",
   )
   parser.add_argument("--group", choices=("A", "B", "C"), default="B")
   parser.add_argument(
@@ -123,7 +124,8 @@ def main():
     if not args.resume:
       initialization = (
         args.initialization
-        or args.output.parent / f"eit_initialization_seed{args.seed}.pt"
+        or args.output.parent
+        / f"eit_initialization_{CRITIC_INPUT_VERSION}_seed{args.seed}.pt"
       )
       if initialization.exists():
         initial = torch.load(

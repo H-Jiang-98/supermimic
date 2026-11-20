@@ -1,8 +1,9 @@
-"""Full-belief privileged critic inputs and explicitly updated normalizers.
+"""RPV-belief privileged critic inputs and explicitly updated normalizers.
 
 The common prefix is [truth68, truth_goal700, history465, remaining_seconds,
-context]. B/C append a relative full mean (73) and the full right-local
-covariance (2485). A never reads the supplied belief, including during eval.
+context]. B/C append a relative RPV mean (12) and the right-local 9x9 marginal
+covariance (45). The provider still owns the full 70-dimensional belief.
+A never reads the supplied belief, including during eval.
 """
 
 from __future__ import annotations
@@ -16,14 +17,15 @@ import torch
 from torch import nn
 
 from supermimic.belief import BeliefState
+from supermimic.estimator_inputs import extract_rpv_covariance
 from supermimic.models import _CudaGraphNormalization, build_mlp
 from supermimic.utils.lie_state import TANGENT_VERSION, LieState
 from supermimic.utils.validation import check_covariance, validate_state_dict
 
-CRITIC_INPUT_VERSION = "eit_full_belief_critic_v1"
+CRITIC_INPUT_VERSION = "eit_rpv_belief_critic_v2"
 COMMON_DIM = 1234
-MEAN_DIM = 73
-COVARIANCE_DIM = 2485
+MEAN_DIM = 12
+COVARIANCE_DIM = 45
 
 
 @dataclass(frozen=True)
@@ -31,9 +33,9 @@ class CriticInputConfig:
   group: Literal["A", "B", "C"] = "B"
   version: str = CRITIC_INPUT_VERSION
   tangent_version: str = TANGENT_VERSION
-  covariance_encoding: str = "full70_log_std_corr_v1"
-  covariance_scales: tuple[float, ...] = (1.0,) * 6
-  mean_scales: tuple[float, ...] = (1.0,) * 5
+  covariance_encoding: str = "rpv9_log_std_corr_v1"
+  covariance_scales: tuple[float, ...] = (1.0,) * 3  # theta, rho, nu
+  mean_scales: tuple[float, ...] = (1.0,) * 2  # position, velocity; rot6d is unitless
   epsilon_std: float = 1e-6
   remaining_time_scale: float = 1.0
 
@@ -43,10 +45,10 @@ class CriticInputConfig:
     if (
       self.version != CRITIC_INPUT_VERSION
       or self.tangent_version != TANGENT_VERSION
-      or self.covariance_encoding != "full70_log_std_corr_v1"
+      or self.covariance_encoding != "rpv9_log_std_corr_v1"
     ):
       raise ValueError("Unsupported critic input/covariance version")
-    for name, length in (("covariance_scales", 6), ("mean_scales", 5)):
+    for name, length in (("covariance_scales", 3), ("mean_scales", 2)):
       values = getattr(self, name)
       if len(values) != length or any(not math.isfinite(v) or v <= 0 for v in values):
         raise ValueError(f"{name} requires {length} finite positive scales")
@@ -71,23 +73,17 @@ def _config(config: CriticInputConfig | None, group: str | None):
   return config
 
 
-def encode_full_covariance(
+def encode_rpv_covariance(
   covariance: torch.Tensor, config: CriticInputConfig | None = None
 ) -> torch.Tensor:
-  """Encode all full70 marginal scales and correlations, without conditioning."""
+  """Encode a theta/rho/nu marginal as nine log stds and 36 correlations."""
   cfg = config or CriticInputConfig()
-  if covariance.shape[-2:] != (70, 70) or not covariance.is_floating_point():
-    raise ValueError("Critic covariance must have shape (...,70,70)")
+  if covariance.shape[-2:] != (9, 9) or not covariance.is_floating_point():
+    raise ValueError("Critic RPV covariance must have shape (...,9,9)")
   check_covariance(
     covariance, "Critic covariance", rtol=128 * torch.finfo(covariance.dtype).eps
   )
-  scale = covariance.new_tensor(
-    [
-      s
-      for s, n in zip(cfg.covariance_scales, (3, 3, 3, 3, 29, 29), strict=True)
-      for _ in range(n)
-    ]
-  )
+  scale = covariance.new_tensor(cfg.covariance_scales).repeat_interleave(3)
   scaled = (
     (covariance + covariance.mT) * 0.5 / scale.unsqueeze(-1) / scale.unsqueeze(-2)
   )
@@ -101,7 +97,7 @@ def encode_full_covariance(
     raise ValueError("Critic scales/floor are not representable in this dtype")
   std = scaled.diagonal(dim1=-2, dim2=-1).clamp_min(floor).sqrt()
   correlation = scaled / std.unsqueeze(-1) / std.unsqueeze(-2)
-  rows, cols = torch.triu_indices(70, 70, offset=1, device=covariance.device)
+  rows, cols = torch.triu_indices(9, 9, offset=1, device=covariance.device)
   features = torch.cat((std.log(), correlation[..., rows, cols].clamp(-1, 1)), -1)
   if not torch.isfinite(features).all():
     raise ValueError("Critic covariance encoding produced non-finite features")
@@ -123,6 +119,8 @@ def build_critic_features(
 
   Remaining time is in seconds. History contains five frames, oldest first,
   with the actually executed previous action in each frame's final 29 channels.
+  Validate the provider's complete belief, then project only RPV into B/C inputs.
+  Marginal extraction preserves the rollout graph and never conditions on truth.
   """
   cfg = _config(config, group)
   truth.validate()
@@ -182,22 +180,17 @@ def build_critic_features(
         rotation[..., :2].flatten(-2),
         (inverse @ (mean.position - truth.position).unsqueeze(-1)).squeeze(-1),
         (inverse @ (mean.velocity - truth.velocity).unsqueeze(-1)).squeeze(-1),
-        mean.omega,
-        mean.joint_pos,
-        mean.joint_vel,
       ),
       -1,
     )
     scale = mean_features.new_tensor(
-      [1.0] * 6
-      + [
-        s
-        for s, n in zip(cfg.mean_scales, (3, 3, 3, 29, 29), strict=True)
-        for _ in range(n)
-      ]
+      [1.0] * 6 + [s for s in cfg.mean_scales for _ in range(3)]
     )
     pieces.extend(
-      (mean_features / scale, encode_full_covariance(belief.covariance, cfg))
+      (
+        mean_features / scale,
+        encode_rpv_covariance(extract_rpv_covariance(belief.covariance), cfg),
+      )
     )
   features = torch.cat(pieces, -1)
   if not torch.isfinite(features).all():
@@ -296,9 +289,14 @@ class BeliefCritic(nn.Module):
     return {"contract": self.contract(), "state_dict": copy.deepcopy(self.state_dict())}
 
   def validate_checkpoint(self, checkpoint: dict) -> None:
-    if (
-      not isinstance(checkpoint, dict) or checkpoint.get("contract") != self.contract()
-    ):
+    contract = checkpoint.get("contract") if isinstance(checkpoint, dict) else None
+    version = contract.get("version") if isinstance(contract, dict) else None
+    if version != CRITIC_INPUT_VERSION:
+      raise ValueError(
+        f"Group {self.group} requires critic contract {CRITIC_INPUT_VERSION!r}, "
+        f"got {version!r}"
+      )
+    if contract != self.contract():
       raise ValueError("Critic checkpoint contract mismatch")
     state = checkpoint.get("state_dict")
     validate_state_dict(self, state, "critic")

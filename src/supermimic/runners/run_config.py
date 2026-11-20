@@ -1,4 +1,4 @@
-"""Rebuild and validate a runner config from a wandb run's serialized config."""
+"""Decode serialized runner configs and validate EIT checkpoint metadata."""
 
 from __future__ import annotations
 
@@ -6,8 +6,55 @@ import dataclasses
 import types
 from typing import Any, Union, get_args, get_origin, get_type_hints
 
+import torch
+
+from supermimic.critic_inputs import CRITIC_INPUT_VERSION, CriticInputConfig
 from supermimic.estimator_inputs import EITInputConfig
 from supermimic.runners.supermimic_runner import SuperMimicRunnerCfg
+
+
+def validate_eit_checkpoint_contract(saved: dict) -> None:
+  """Check the joint checkpoint's input layout before constructing any models."""
+  if not isinstance(saved, dict) or saved.get("version") != "eit_training_v1":
+    raise ValueError(
+      "Expected eit_training_v1; model-only checkpoints require explicit weight import"
+    )
+  error = f"EIT checkpoint requires the {CRITIC_INPUT_VERSION} critic contract"
+  try:
+    contract = saved["critic"]["contract"]
+    config_data = contract["config"]
+    config = CriticInputConfig(**config_data)
+    group = saved["runner_config"]["estimator_inputs"]["group"]
+    context_dim = contract["context_dim"]
+    input_dim = config.input_dim(context_dim)
+    context_scale = saved["world_model"]["sim_context"]["scale"]
+    input_weight = saved["critic"]["state_dict"]["mlp.0.weight"]
+    compatible = (
+      contract["version"] == config.version
+      and config_data == dataclasses.asdict(config)
+      and config.group == group
+      and contract["input_dim"] == input_dim
+    )
+  except (KeyError, TypeError, ValueError) as exc:
+    raise ValueError(error) from exc
+  if not compatible:
+    raise ValueError(error)
+  if not isinstance(context_scale, torch.Tensor) or not isinstance(
+    input_weight, torch.Tensor
+  ):
+    raise ValueError(
+      f"{error}: world-model context scale and critic input weights must be tensors"
+    )
+  if context_scale.shape != (context_dim,):
+    raise ValueError(
+      f"{error}: critic expects {context_dim} context channels, "
+      f"world-model context scale has shape {tuple(context_scale.shape)}"
+    )
+  if input_weight.ndim != 2 or input_weight.shape[1] != input_dim:
+    raise ValueError(
+      f"{error}: critic expects {input_dim} inputs, "
+      f"mlp.0.weight has shape {tuple(input_weight.shape)}"
+    )
 
 
 def load_runner_cfg(run_config: dict[str, Any]) -> SuperMimicRunnerCfg:

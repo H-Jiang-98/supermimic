@@ -7,6 +7,7 @@ from dataclasses import asdict, replace
 import pytest
 import torch
 
+from supermimic.critic_inputs import CRITIC_INPUT_VERSION, BeliefCritic
 from supermimic.models import ProcessNoiseConfig
 from supermimic.runners.eit_inference import (
   EITPolicyAdapter,
@@ -161,6 +162,9 @@ def test_evaluation_loader_is_private_and_checks_estimator_contract(tmp_path):
   with physical_runner(tmp_path, "B") as runner:
     saved = {
       "version": "eit_training_v1",
+      "critic": BeliefCritic(
+        "B", runner._sim_context.output_dim, runner.cfg.critic_hidden_dims
+      ).checkpoint(),
       "runner_config": asdict(runner.cfg),
       "world_model": deepcopy(runner._wm.bundle()),
       "actor": deepcopy(actor_checkpoint(runner.policy_learner.actor, runner.cfg)),
@@ -189,6 +193,57 @@ def test_evaluation_loader_is_private_and_checks_estimator_contract(tmp_path):
 def test_evaluation_config_rejects_model_only_resume():
   with pytest.raises(ValueError, match="eit_training_v1"):
     evaluation_config({"version": "belief_model_training_v2"})
+
+
+@pytest.mark.parametrize("group", ["A", "B", "C"])
+@pytest.mark.parametrize(
+  "fault",
+  [
+    "full70",
+    "missing_contract",
+    "wrong_group",
+    "old_encoding",
+    "wrong_context",
+    "wrong_weights",
+  ],
+)
+def test_inference_rejects_incompatible_critic_before_building_models(group, fault):
+  cfg = SuperMimicRunnerCfg.for_estimator_inputs(
+    group, process_noise=ProcessNoiseConfig(), critic_hidden_dims=(8,)
+  )
+  cfg.estimator_inputs = replace(cfg.estimator_inputs, mode="eval")
+  context_dim = 33
+  critic = BeliefCritic(group, context_dim, cfg.critic_hidden_dims).checkpoint()
+  contract = critic["contract"]
+  saved = {
+    "version": "eit_training_v1",
+    "runner_config": asdict(cfg),
+    "critic": critic,
+    "world_model": {"sim_context": {"scale": torch.ones(context_dim)}},
+  }
+  evaluation_config(saved)
+  error = CRITIC_INPUT_VERSION
+  if fault == "full70":
+    contract["version"] = contract["config"]["version"] = "eit_full_belief_critic_v1"
+  elif fault == "missing_contract":
+    del saved["critic"]["contract"]
+  elif fault == "wrong_group":
+    contract["config"]["group"] = "B" if group == "A" else "A"
+  elif fault == "old_encoding":
+    contract["config"]["covariance_encoding"] = "full70_log_std_corr_v1"
+  elif fault == "wrong_context":
+    saved["critic"] = BeliefCritic(
+      group, context_dim + 1, cfg.critic_hidden_dims
+    ).checkpoint()
+    error = f"expects {context_dim + 1} context channels"
+  else:
+    state = critic["state_dict"]
+    state["mlp.0.weight"] = state["mlp.0.weight"][:, :-1]
+    error = f"expects {contract['input_dim']} inputs"
+  with pytest.raises(ValueError, match=error):
+    evaluation_config(saved)
+  with pytest.raises(ValueError, match=error):
+    load_evaluation_models(None, cfg, saved, "cpu")
 
 
 @pytest.mark.parametrize("reference_change", ["time", "alignment"])

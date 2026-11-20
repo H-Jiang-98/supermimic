@@ -106,7 +106,7 @@ class EITInputConfig:
 
   @property
   def critic_uses_belief(self) -> bool:
-    """A future full critic uses belief for B/C, regardless of actor FiLM."""
+    """The critic uses RPV belief for B/C, regardless of actor FiLM."""
     return self.group != "A"
 
   def to_dict(self) -> dict[str, Any]:

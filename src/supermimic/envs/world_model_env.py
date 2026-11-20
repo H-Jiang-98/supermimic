@@ -690,7 +690,7 @@ class WorldModelEnv(ABC):
     }
     if self.eit_critic:
       snapshot["eit_critic"] = True
-      snapshot["critic_config"] = asdict(self._full_critic_config())
+      snapshot["critic_config"] = asdict(self._eit_critic_config())
       snapshot["frame"]["reference_finished"] = (
         self._reference_finished.detach().clone()
       )
@@ -715,7 +715,7 @@ class WorldModelEnv(ABC):
       raise ValueError("Imagined snapshot reference motion content mismatch")
     if snapshot.get("eit_critic", False) != self.eit_critic or (
       self.eit_critic
-      and snapshot.get("critic_config") != asdict(self._full_critic_config())
+      and snapshot.get("critic_config") != asdict(self._eit_critic_config())
     ):
       raise ValueError("Imagined snapshot critic configuration mismatch")
     candidate = self.posterior_provider.prepare_load_state_dict(snapshot["provider"])
@@ -829,7 +829,7 @@ class WorldModelEnv(ABC):
     if self.eit_critic:
       if candidate is None:
         raise ValueError("Full critic reset requires a complete keyed belief")
-      self._build_full_critic(
+      self._build_eit_critic(
         aux,
         rep,
         goals.critic,
@@ -971,7 +971,7 @@ class WorldModelEnv(ABC):
       history = torch.cat(
         (self._sensor_history()[:, 1:], pending["sensor"].unsqueeze(1)), dim=1
       )
-      self._build_full_critic(
+      self._build_eit_critic(
         pending["aux"],
         pending["rep"],
         goals.critic,
@@ -1108,7 +1108,7 @@ class WorldModelEnv(ABC):
   def _critic_obs(self) -> torch.Tensor:
     """The privileged critic input — full WM state, not the actor's sensor obs."""
     if self.eit_critic:
-      return self._build_full_critic(
+      return self._build_eit_critic(
         self.aux_state,
         self.rep_state,
         self._wm_goal_obs,
@@ -1120,14 +1120,14 @@ class WorldModelEnv(ABC):
       )
     return torch.cat([self.rep_state, self._wm_goal_obs, self.sim_ctx], dim=-1)
 
-  def _full_critic_config(self):
+  def _eit_critic_config(self):
     from supermimic.critic_inputs import CriticInputConfig
 
     return self.critic_input_config or CriticInputConfig(
       group=self.estimator_input_config.group
     )
 
-  def _build_full_critic(
+  def _build_eit_critic(
     self, aux, rep, goal, history, context, times, belief, finished
   ):
     """Preflight staged frames before committing provider or environment state."""
@@ -1145,7 +1145,7 @@ class WorldModelEnv(ABC):
       context,
       remaining,
       belief,
-      config=self._full_critic_config(),
+      config=self._eit_critic_config(),
       group=self.estimator_input_config.group,
     )
 

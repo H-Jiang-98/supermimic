@@ -169,6 +169,7 @@ def main():
         reports.append(
           {
             "group": group,
+            "critic_contract": training.policy.critic.contract(),
             "rounds": 2,
             "round_seconds": elapsed,
             "fixed_input_resume_exact": True,
@@ -208,6 +209,8 @@ def main():
     "src/supermimic/critic_inputs.py",
     "src/supermimic/learners/belief_policy_learner.py",
     "src/supermimic/runners/eit_training.py",
+    "src/supermimic/runners/run_config.py",
+    "src/supermimic/runners/eit_inference.py",
     "src/supermimic/envs/world_model_env.py",
     "src/supermimic/belief_provider.py",
     "src/supermimic/scripts/train_eit.py",

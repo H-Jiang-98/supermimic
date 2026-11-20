@@ -15,7 +15,10 @@ from supermimic.belief import GaussianStatePrior
 from supermimic.belief_provider import BeliefProvider
 from supermimic.estimator import LieBeliefFilter
 from supermimic.estimator_inputs import build_actor_features
-from supermimic.runners.run_config import load_runner_cfg
+from supermimic.runners.run_config import (
+  load_runner_cfg,
+  validate_eit_checkpoint_contract,
+)
 from supermimic.runners.supermimic_runner import (
   SuperMimicRunnerCfg,
   WorldModel,
@@ -30,8 +33,7 @@ from supermimic.utils.lie_state import LieState
 
 def evaluation_config(saved: dict) -> SuperMimicRunnerCfg:
   """Decode a complete EIT checkpoint without importing training state."""
-  if saved.get("version") != "eit_training_v1":
-    raise ValueError("EIT evaluation requires an eit_training_v1 checkpoint")
+  validate_eit_checkpoint_contract(saved)
   cfg = load_runner_cfg({"runner_cfg": saved["runner_config"]})
   if cfg.estimator_inputs is None or cfg.process_noise is None:
     raise ValueError("EIT evaluation requires estimator inputs and process noise")
@@ -50,8 +52,7 @@ def load_evaluation_models(env, cfg, saved: dict, device: str):
   physics. Call the adapter's reset after the final evaluation reset or clip seek.
   Motion identity is deliberately not a weight compatibility constraint here.
   """
-  if saved.get("version") != "eit_training_v1":
-    raise ValueError("EIT evaluation requires an eit_training_v1 checkpoint")
+  validate_eit_checkpoint_contract(saved)
   if cfg.estimator_inputs is None or cfg.estimator_inputs.mode != "eval":
     raise ValueError("Evaluation models require estimator_inputs.mode='eval'")
   wm = build_world_model(cfg, env, device)

@@ -13,6 +13,7 @@ from supermimic.learners.belief_policy_learner import BeliefPolicyLearnerCfg
 from supermimic.motion_loader import motion_content_digest
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
 from supermimic.runners.eit_training import EITTraining, EITTrainingCfg
+from supermimic.sim_context import SimContext
 from tests.test_estimator_belief_training import _RoundRunner, assert_tree
 from tests.test_estimator_world_model_env import _env
 
@@ -20,7 +21,11 @@ from tests.test_estimator_world_model_env import _env
 def training(seed=31):
   runner = _RoundRunner(seed)
   runner.cfg.critic_hidden_dims = (12,)
-  runner._sim_context = SimpleNamespace(output_dim=2)
+  context_dim = runner._dynamics.sim_ctx_dim
+  runner._sim_context = SimContext(
+    [SimpleNamespace(dim=context_dim)], [(-1.0, 1.0)] * context_dim
+  ).double()
+  runner._wm.sim_context = runner._sim_context
   template = runner.template
   template["motion_time"] = torch.arange(len(template))
   template["alignment_rotation"] = (
@@ -102,7 +107,15 @@ def test_two_rounds_update_all_components_and_exclude_validation_normalization()
 
 @pytest.mark.parametrize(
   "component",
-  ["critic", "policy_optimizer", "model_optimizer", "actor", "rng", "config"],
+  [
+    "critic",
+    "legacy_critic",
+    "policy_optimizer",
+    "model_optimizer",
+    "actor",
+    "rng",
+    "config",
+  ],
 )
 def test_failed_restore_changes_no_component_or_rng(component):
   source, target = training(31), training(81)
@@ -111,6 +124,8 @@ def test_failed_restore_changes_no_component_or_rng(component):
   checkpoint = source.state_dict()
   if component == "critic":
     checkpoint["critic"]["state_dict"]["mlp.0.weight"][0, 0] = float("nan")
+  elif component == "legacy_critic":
+    checkpoint["critic"]["contract"]["version"] = "eit_full_belief_critic_v1"
   elif component == "policy_optimizer":
     checkpoint["policy"]["actor_optimizer"]["state"][0]["exp_avg"] = torch.zeros(1)
   elif component == "model_optimizer":
@@ -197,7 +212,7 @@ def test_no_fresh_training_frames_preserves_actor_normalizers():
 
 
 @pytest.mark.parametrize(
-  "component", ["unused_actor", "unused_critic", "missing_group"]
+  "component", ["unused_actor", "unused_critic", "legacy_critic", "missing_group"]
 )
 def test_initialization_preflights_all_groups_before_any_mutation(component):
   source, target = training(31), training(81)
@@ -206,6 +221,8 @@ def test_initialization_preflights_all_groups_before_any_mutation(component):
     bundle["actors"]["C"]["actor"]["decoder.0.weight"][0, 0] = float("nan")
   elif component == "unused_critic":
     bundle["critics"]["C"]["state_dict"]["mlp.0.weight"][0, 0] = float("nan")
+  elif component == "legacy_critic":
+    bundle["critics"]["C"]["contract"]["version"] = "eit_full_belief_critic_v1"
   else:
     bundle["actors"].pop("A")
   before = target.state_dict()

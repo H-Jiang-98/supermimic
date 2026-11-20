@@ -103,7 +103,7 @@ def test_finished_clip_gets_zero_remaining_time_and_cannot_step_again():
   env.dynamics.requires_grad_(False)
   start = env.sample_policy_starts(1, [2])
   obs = env.reset_prepared(start)
-  assert obs["critic"].shape == (1, 3793)
+  assert obs["critic"].shape == (1, 1292)
   assert obs["critic"][0, 1233] == pytest.approx(0.02)
   obs, _, _, _ = env.step(
     torch.zeros(1, 29),
@@ -142,20 +142,20 @@ def test_invalid_prepared_frame_preserves_live_provider_and_batch_size(field):
     torch.testing.assert_close(env.get_observations()[name], value)
 
 
-def test_full_critic_reset_preflight_precedes_provider_commit(monkeypatch):
+def test_eit_critic_reset_preflight_precedes_provider_commit(monkeypatch):
   env, _, _ = setup_env()
   env.eit_critic = True
   start = env.sample_policy_starts(2, [0])
   original = env.reset_prepared(start)
   provider_state = env.posterior_provider.state
-  build = env._build_full_critic
+  build = env._build_eit_critic
 
   def reject(*args, **kwargs):
     build(*args, **kwargs)
     raise ValueError("test critic rejection")
 
   with monkeypatch.context() as context:
-    context.setattr(env, "_build_full_critic", reject)
+    context.setattr(env, "_build_eit_critic", reject)
     with pytest.raises(ValueError, match="test critic rejection"):
       env.reset_prepared(start.index([0]))
   assert env.num_envs == 2
@@ -164,7 +164,7 @@ def test_full_critic_reset_preflight_precedes_provider_commit(monkeypatch):
     torch.testing.assert_close(env.get_observations()[name], value)
 
 
-def test_full_critic_step_preflight_preserves_transition_for_retry(monkeypatch):
+def test_eit_critic_step_preflight_preserves_transition_for_retry(monkeypatch):
   env, _, _ = setup_env()
   env.eit_critic = True
   env.dynamics.requires_grad_(False)
@@ -202,13 +202,17 @@ def test_finished_snapshot_restore_cannot_add_another_scoring_action():
     env.step(torch.zeros(1, 29))
 
 
-def test_full_critic_snapshot_contract_rejects_encoding_changes():
+@pytest.mark.parametrize("change", ["scale", "legacy_version"])
+def test_eit_critic_snapshot_contract_rejects_encoding_changes(change):
   env, _, _ = setup_env()
   env.eit_critic = True
   env.reset_prepared(env.sample_policy_starts(1, [0]))
   snapshot = env.snapshot()
   state = env.posterior_provider.state
-  env.critic_input_config = CriticInputConfig(group="C", remaining_time_scale=2.0)
+  if change == "scale":
+    env.critic_input_config = CriticInputConfig(group="C", remaining_time_scale=2.0)
+  else:
+    snapshot["critic_config"]["version"] = "eit_full_belief_critic_v1"
   with pytest.raises(ValueError, match="critic configuration"):
     env.restore(snapshot)
   assert env.posterior_provider.state is state

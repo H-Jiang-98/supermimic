@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 import torch
 
+from supermimic.critic_inputs import BeliefCritic
 from supermimic.models import ProcessNoiseConfig
 from supermimic.runners.eit_inference import EITPolicyAdapter
 from supermimic.runners.supermimic_runner import (
@@ -230,6 +231,11 @@ def test_local_eit_play_runs_native_viewer_step_without_wandb(
   torch.save(
     {
       "version": "eit_training_v1",
+      "critic": BeliefCritic(
+        adapter.cfg.estimator_inputs.group,
+        adapter.wm.sim_context.output_dim,
+        adapter.cfg.critic_hidden_dims,
+      ).checkpoint(),
       "runner_config": asdict(adapter.cfg),
       "world_model": adapter.wm.bundle(),
       "actor": actor_checkpoint(adapter.actor, adapter.cfg),

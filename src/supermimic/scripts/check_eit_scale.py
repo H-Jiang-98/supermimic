@@ -314,7 +314,7 @@ def main():
     },
     "warmup": args.warmup,
     "repeats": args.repeats,
-    "scope": "Fixed model C policy: stochastic rollout, full belief, actor backward and two critic epochs; excludes collection and prefix replay",
+    "scope": "Fixed model C policy: stochastic rollout, full belief filter, RPV critic, actor backward and two critic epochs; excludes collection and prefix replay",
     "model_unchanged": True,
     "prefix_reconstruction_seconds": prefix_seconds,
     "numerical": numerical,
