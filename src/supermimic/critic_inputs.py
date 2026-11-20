@@ -1,0 +1,336 @@
+"""Full-belief privileged critic inputs and explicitly updated normalizers.
+
+The common prefix is [truth68, truth_goal700, history465, remaining_seconds,
+context]. B/C append a relative full mean (73) and the full right-local
+covariance (2485). A never reads the supplied belief, including during eval.
+"""
+
+from __future__ import annotations
+
+import copy
+import math
+from dataclasses import asdict, dataclass, replace
+from typing import Literal
+
+import torch
+from torch import nn
+
+from supermimic.belief import BeliefState
+from supermimic.models import _CudaGraphNormalization, build_mlp
+from supermimic.utils.lie_state import TANGENT_VERSION, LieState
+from supermimic.utils.validation import check_covariance, validate_state_dict
+
+CRITIC_INPUT_VERSION = "eit_full_belief_critic_v1"
+COMMON_DIM = 1234
+MEAN_DIM = 73
+COVARIANCE_DIM = 2485
+
+
+@dataclass(frozen=True)
+class CriticInputConfig:
+  group: Literal["A", "B", "C"] = "B"
+  version: str = CRITIC_INPUT_VERSION
+  tangent_version: str = TANGENT_VERSION
+  covariance_encoding: str = "full70_log_std_corr_v1"
+  covariance_scales: tuple[float, ...] = (1.0,) * 6
+  mean_scales: tuple[float, ...] = (1.0,) * 5
+  epsilon_std: float = 1e-6
+  remaining_time_scale: float = 1.0
+
+  def __post_init__(self):
+    if self.group not in ("A", "B", "C"):
+      raise ValueError("Critic group must be A, B or C")
+    if (
+      self.version != CRITIC_INPUT_VERSION
+      or self.tangent_version != TANGENT_VERSION
+      or self.covariance_encoding != "full70_log_std_corr_v1"
+    ):
+      raise ValueError("Unsupported critic input/covariance version")
+    for name, length in (("covariance_scales", 6), ("mean_scales", 5)):
+      values = getattr(self, name)
+      if len(values) != length or any(not math.isfinite(v) or v <= 0 for v in values):
+        raise ValueError(f"{name} requires {length} finite positive scales")
+    for name in ("epsilon_std", "remaining_time_scale"):
+      value = getattr(self, name)
+      if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be finite and positive")
+
+  def input_dim(self, context_dim: int) -> int:
+    if type(context_dim) is not int or context_dim < 0:
+      raise ValueError("context_dim must be a nonnegative integer")
+    return (
+      COMMON_DIM + context_dim + (0 if self.group == "A" else MEAN_DIM + COVARIANCE_DIM)
+    )
+
+
+def _config(config: CriticInputConfig | None, group: str | None):
+  if config is None:
+    return CriticInputConfig(group="B" if group is None else group)
+  if group is not None and config.group != group:
+    raise ValueError("Critic group and input configuration disagree")
+  return config
+
+
+def encode_full_covariance(
+  covariance: torch.Tensor, config: CriticInputConfig | None = None
+) -> torch.Tensor:
+  """Encode all full70 marginal scales and correlations, without conditioning."""
+  cfg = config or CriticInputConfig()
+  if covariance.shape[-2:] != (70, 70) or not covariance.is_floating_point():
+    raise ValueError("Critic covariance must have shape (...,70,70)")
+  check_covariance(
+    covariance, "Critic covariance", rtol=128 * torch.finfo(covariance.dtype).eps
+  )
+  scale = covariance.new_tensor(
+    [
+      s
+      for s, n in zip(cfg.covariance_scales, (3, 3, 3, 3, 29, 29), strict=True)
+      for _ in range(n)
+    ]
+  )
+  scaled = (
+    (covariance + covariance.mT) * 0.5 / scale.unsqueeze(-1) / scale.unsqueeze(-2)
+  )
+  floor = covariance.new_tensor(cfg.epsilon_std).square()
+  if not (
+    torch.isfinite(scale.square()).all()
+    and (scale.square() > 0).all()
+    and torch.isfinite(floor)
+    and floor > 0
+  ):
+    raise ValueError("Critic scales/floor are not representable in this dtype")
+  std = scaled.diagonal(dim1=-2, dim2=-1).clamp_min(floor).sqrt()
+  correlation = scaled / std.unsqueeze(-1) / std.unsqueeze(-2)
+  rows, cols = torch.triu_indices(70, 70, offset=1, device=covariance.device)
+  features = torch.cat((std.log(), correlation[..., rows, cols].clamp(-1, 1)), -1)
+  if not torch.isfinite(features).all():
+    raise ValueError("Critic covariance encoding produced non-finite features")
+  return features
+
+
+def build_critic_features(
+  truth: LieState,
+  true_goal: torch.Tensor,
+  history: torch.Tensor,
+  sim_ctx: torch.Tensor,
+  remaining_time: torch.Tensor,
+  belief: BeliefState | None = None,
+  *,
+  config: CriticInputConfig | None = None,
+  group: str | None = None,
+) -> torch.Tensor:
+  """Build raw critic features; the caller verifies provider frame identity.
+
+  Remaining time is in seconds. History contains five frames, oldest first,
+  with the actually executed previous action in each frame's final 29 channels.
+  """
+  cfg = _config(config, group)
+  truth.validate()
+  batch = truth.position.shape[:-1]
+  if remaining_time.shape == batch:
+    remaining_time = remaining_time.unsqueeze(-1)
+  if sim_ctx.ndim != len(batch) + 1 or sim_ctx.shape[:-1] != batch:
+    raise ValueError("Critic context must match truth batch shape")
+  for name, value, shape in (
+    ("goal", true_goal, (*batch, 700)),
+    ("history", history, (*batch, 5, 93)),
+    ("context", sim_ctx, (*batch, sim_ctx.shape[-1])),
+    ("remaining_time", remaining_time, (*batch, 1)),
+  ):
+    if (
+      value.shape != shape
+      or value.dtype != truth.position.dtype
+      or value.device != truth.position.device
+      or not torch.isfinite(value).all()
+    ):
+      raise ValueError(f"Invalid critic {name} shape, dtype, device or values")
+  if (remaining_time < 0).any():
+    raise ValueError("Critic remaining_time must be nonnegative")
+  inverse = truth.rotation.mT
+  rep = torch.cat(
+    (
+      truth.position[..., 2:3],
+      -truth.rotation[..., 2, :],
+      (inverse @ truth.velocity.unsqueeze(-1)).squeeze(-1),
+      truth.omega,
+      truth.joint_pos,
+      truth.joint_vel,
+    ),
+    -1,
+  )
+  pieces = [
+    rep,
+    true_goal,
+    history.flatten(-2),
+    remaining_time / cfg.remaining_time_scale,
+    sim_ctx,
+  ]
+  if cfg.group != "A":
+    if not isinstance(belief, BeliefState):
+      raise ValueError("B/C critic requires a complete BeliefState")
+    belief.validate()
+    mean = belief.mean
+    if (
+      mean.position.shape != truth.position.shape
+      or mean.position.dtype != truth.position.dtype
+      or mean.position.device != truth.position.device
+    ):
+      raise ValueError("Critic belief must match truth batch, dtype and device")
+    rotation = inverse @ mean.rotation
+    mean_features = torch.cat(
+      (
+        rotation[..., :2].flatten(-2),
+        (inverse @ (mean.position - truth.position).unsqueeze(-1)).squeeze(-1),
+        (inverse @ (mean.velocity - truth.velocity).unsqueeze(-1)).squeeze(-1),
+        mean.omega,
+        mean.joint_pos,
+        mean.joint_vel,
+      ),
+      -1,
+    )
+    scale = mean_features.new_tensor(
+      [1.0] * 6
+      + [
+        s
+        for s, n in zip(cfg.mean_scales, (3, 3, 3, 29, 29), strict=True)
+        for _ in range(n)
+      ]
+    )
+    pieces.extend(
+      (mean_features / scale, encode_full_covariance(belief.covariance, cfg))
+    )
+  features = torch.cat(pieces, -1)
+  if not torch.isfinite(features).all():
+    raise ValueError("Critic encoding produced non-finite features")
+  return features
+
+
+class BeliefCritic(nn.Module):
+  """Group-specific value network; forward never updates normalization."""
+
+  def __init__(
+    self,
+    group: str,
+    context_dim: int,
+    hidden_dims: tuple[int, ...] = (256, 128),
+    *,
+    config: CriticInputConfig | None = None,
+  ):
+    super().__init__()
+    self.config = _config(config, group)
+    self.group, self.context_dim = group, context_dim
+    self.hidden_dims = tuple(hidden_dims)
+    if not self.hidden_dims or any(
+      type(n) is not int or n < 1 for n in self.hidden_dims
+    ):
+      raise ValueError("Critic hidden dimensions must be positive integers")
+    self.input_dim = self.config.input_dim(context_dim)
+    self.state_normalizer = _CudaGraphNormalization(68)
+    self.goal_normalizer = _CudaGraphNormalization(700)
+    self.history_normalizer = _CudaGraphNormalization(93)
+    self.mlp = build_mlp(self.input_dim, self.hidden_dims, 1)
+    nn.init.zeros_(self.mlp[-1].weight)
+    nn.init.zeros_(self.mlp[-1].bias)
+
+  def normalizers(self):
+    return (self.state_normalizer, self.goal_normalizer, self.history_normalizer)
+
+  def _split(self, features):
+    if features.ndim < 2 or features.shape[-1] != self.input_dim:
+      raise ValueError(f"Critic input must have shape (...,{self.input_dim})")
+    if (
+      features.dtype != self.mlp[0].weight.dtype
+      or features.device != self.mlp[0].weight.device
+    ):
+      raise ValueError("Critic features must match network dtype and device")
+    return (
+      features[..., :68],
+      features[..., 68:768],
+      features[..., 768:1233].reshape(*features.shape[:-1], 5, 93),
+    )
+
+  def forward(self, features: torch.Tensor) -> torch.Tensor:
+    state, goal, history = self._split(features)
+    normalized = torch.cat(
+      (
+        self.state_normalizer(state),
+        self.goal_normalizer(goal),
+        self.history_normalizer(history).flatten(-2),
+        features[..., 1233:],
+      ),
+      -1,
+    )
+    return self.mlp(normalized)
+
+  @torch.no_grad()
+  def update_normalization(self, features: torch.Tensor) -> None:
+    """Update from fresh real training frames, counting only the newest sensor."""
+    values = self._split(features)
+    if features.numel() == 0 or not torch.isfinite(features).all():
+      raise ValueError("Critic normalization requires nonempty finite features")
+    values = (
+      values[0].reshape(-1, 68),
+      values[1].reshape(-1, 700),
+      values[2][..., -1, :].reshape(-1, 93),
+    )
+    candidates = copy.deepcopy(self.normalizers())
+    for module, value in zip(candidates, values, strict=True):
+      module.train()
+      module.update(value)
+      if not all(torch.isfinite(buffer).all() for buffer in module.buffers()):
+        raise ValueError("Critic normalization produced non-finite statistics")
+    for module, candidate in zip(self.normalizers(), candidates, strict=True):
+      module.load_state_dict(candidate.state_dict())
+      module.eval()
+
+  def contract(self) -> dict:
+    return {
+      "version": CRITIC_INPUT_VERSION,
+      "config": asdict(self.config),
+      "context_dim": self.context_dim,
+      "hidden_dims": self.hidden_dims,
+      "input_dim": self.input_dim,
+    }
+
+  def checkpoint(self) -> dict:
+    return {"contract": self.contract(), "state_dict": copy.deepcopy(self.state_dict())}
+
+  def validate_checkpoint(self, checkpoint: dict) -> None:
+    if (
+      not isinstance(checkpoint, dict) or checkpoint.get("contract") != self.contract()
+    ):
+      raise ValueError("Critic checkpoint contract mismatch")
+    state = checkpoint.get("state_dict")
+    validate_state_dict(self, state, "critic")
+    for name in ("state_normalizer", "goal_normalizer", "history_normalizer"):
+      if (
+        state[f"{name}.count"] < 0
+        or (state[f"{name}._var"] < 0).any()
+        or (state[f"{name}._std"] < 0).any()
+        or not torch.allclose(
+          state[f"{name}._std"].square(), state[f"{name}._var"], rtol=1e-5, atol=1e-8
+        )
+      ):
+        raise ValueError("Invalid critic checkpoint normalization statistics")
+
+  def load_checkpoint(self, checkpoint: dict) -> None:
+    self.validate_checkpoint(checkpoint)
+    self.load_state_dict(checkpoint["state_dict"])
+
+  @torch.no_grad()
+  def copy_common_initialization_from(self, source: BeliefCritic) -> None:
+    if (
+      replace(self.config, group="A") != replace(source.config, group="A")
+      or self.context_dim != source.context_dim
+      or self.hidden_dims != source.hidden_dims
+    ):
+      raise ValueError("Critic common initialization contracts differ")
+    for destination, origin in zip(
+      self.normalizers(), source.normalizers(), strict=True
+    ):
+      destination.load_state_dict(origin.state_dict())
+    columns = min(self.input_dim, source.input_dim)
+    self.mlp[0].weight[:, :columns].copy_(source.mlp[0].weight[:, :columns])
+    self.mlp[0].bias.copy_(source.mlp[0].bias)
+    for destination, origin in zip(self.mlp[1:], source.mlp[1:], strict=True):
+      destination.load_state_dict(origin.state_dict())
