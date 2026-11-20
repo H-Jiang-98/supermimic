@@ -1,9 +1,14 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import hashlib
+import json
+import math
+from dataclasses import asdict, dataclass
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from rsl_rl.modules import EmpiricalNormalization
 from tensordict import TensorDict
 
@@ -43,6 +48,38 @@ def build_mlp(
   return nn.Sequential(*layers)
 
 
+@dataclass(frozen=True)
+class ProcessNoiseConfig:
+  """One-control-step right-local process noise, in physical tangent units.
+
+  ``initial_std`` follows theta, rho, nu, omega_body, q, qdot. Each value
+  expands across its block (3, 3, 3, 3, 29, 29); no additional dt scaling
+  is applied. These are initialization settings, not calibrated estimates.
+  """
+
+  initial_std: tuple[float, ...] = (0.01, 0.001, 0.05, 0.05, 0.005, 0.05)
+  diagonal_floor: float = 1e-6
+  hidden_dims: tuple[int, ...] = (128, 64)
+
+  def __post_init__(self) -> None:
+    if not math.isfinite(self.diagonal_floor) or self.diagonal_floor <= 0:
+      raise ValueError("Process-noise diagonal_floor must be finite and positive")
+    if len(self.initial_std) != 6 or any(
+      not math.isfinite(s) or s <= self.diagonal_floor for s in self.initial_std
+    ):
+      raise ValueError("initial_std requires six finite values above diagonal_floor")
+    if any(not isinstance(d, int) or d < 1 for d in self.hidden_dims):
+      raise ValueError("Process-noise hidden widths must be positive integers")
+
+  def standard_deviations(self, *, device=None, dtype=None) -> torch.Tensor:
+    return torch.cat(
+      [
+        torch.full((width,), value, device=device, dtype=dtype)
+        for width, value in zip((3, 3, 3, 3, 29, 29), self.initial_std, strict=True)
+      ]
+    )
+
+
 class Dynamics(nn.Module):
   """Differentiable forward model: ``(rep_state, action, aux_state) -> (next_aux, next_rep)``.
 
@@ -59,13 +96,16 @@ class Dynamics(nn.Module):
     action_scale: torch.Tensor,
     action_offset: torch.Tensor,
     hidden_dims: tuple[int, ...],
+    process_noise: ProcessNoiseConfig | None = None,
   ):
     super().__init__()
 
+    self.sim_ctx_dim = sim_ctx_dim
     self.num_rep_state = representation.rep_state_dim
     self.num_actions = num_actions
     self.dt = representation.dt
     self._apply_prediction = representation.apply_prediction
+    self.process_noise_config = process_noise
 
     self.register_buffer("action_scale", action_scale.clone())
     self.register_buffer("action_offset", action_offset.clone())
@@ -78,6 +118,33 @@ class Dynamics(nn.Module):
       hidden_dims,
       output_dim=representation.prediction_dim,
     )
+    self.noise_head: nn.Sequential | None = None
+    if process_noise is not None:
+      from supermimic.representations import GenCoordRepresentation
+
+      if not isinstance(representation, GenCoordRepresentation) or num_actions != 29:
+        raise ValueError(
+          "Stochastic dynamics currently requires G1 GenCoord (29 joints)"
+        )
+      if representation.num_joints != 29:
+        raise ValueError("Stochastic dynamics requires a 70-dimensional tangent")
+      self.noise_head = build_mlp(
+        self.num_rep_state + num_actions + sim_ctx_dim,
+        process_noise.hidden_dims,
+        output_dim=2485,
+      )
+      rows, cols = torch.tril_indices(70, 70)
+      self.register_buffer("_noise_indices", rows * 70 + cols, persistent=False)
+      self.register_buffer("_noise_diagonal", rows == cols, persistent=False)
+      output = self.noise_head[-1]
+      nn.init.zeros_(output.weight)
+      nn.init.zeros_(output.bias)
+      std = process_noise.standard_deviations(dtype=torch.float64)
+      target = std - process_noise.diagonal_floor
+      # Numerically stable inverse softplus, giving the requested initial std.
+      inverse = target + torch.log(-torch.expm1(-target))
+      with torch.no_grad():
+        output.bias[self._noise_diagonal] = inverse.to(output.bias)
 
   def proc(self, action: torch.Tensor) -> torch.Tensor:
     """Map raw policy output to proc joint commands: ``action * scale + offset``."""
@@ -90,10 +157,130 @@ class Dynamics(nn.Module):
     aux_state: torch.Tensor,
     sim_ctx: torch.Tensor,
   ) -> tuple[torch.Tensor, torch.Tensor]:
-    state_norm = self.state_normalizer(rep_state)
-    action_norm = self.action_normalizer(self.proc(action))
-    prediction = self.mlp(torch.cat([state_norm, action_norm, sim_ctx], dim=-1))
+    prediction = self.mlp(self._normalized_inputs(rep_state, action, sim_ctx))
     return self._apply_prediction(aux_state, rep_state, prediction, self.dt)
+
+  def _normalized_inputs(
+    self, rep_state: torch.Tensor, action: torch.Tensor, sim_ctx: torch.Tensor
+  ) -> torch.Tensor:
+    state_norm = self.state_normalizer(rep_state).reshape_as(rep_state)
+    action_norm = self.action_normalizer(self.proc(action)).reshape_as(action)
+    return torch.cat([state_norm, action_norm, sim_ctx], dim=-1)
+
+  def distribution(
+    self,
+    rep_state: torch.Tensor,
+    action: torch.Tensor,
+    aux_state: torch.Tensor,
+    sim_ctx: torch.Tensor,
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return deterministic mean and its full right-local Cholesky factor."""
+    if self.noise_head is None or self.process_noise_config is None:
+      raise ValueError("distribution() requires an explicit ProcessNoiseConfig")
+    inputs = self._normalized_inputs(rep_state, action, sim_ctx)
+    next_aux, next_rep = self._apply_prediction(
+      aux_state, rep_state, self.mlp(inputs), self.dt
+    )
+    values = self.noise_head(inputs)
+    values = torch.where(
+      self._noise_diagonal,
+      F.softplus(values) + self.process_noise_config.diagonal_floor,
+      values,
+    )
+    indices = self._noise_indices.expand_as(values)
+    lower = values.new_zeros(*values.shape[:-1], 4900).scatter(-1, indices, values)
+    return next_aux, next_rep, lower.reshape(*values.shape[:-1], 70, 70)
+
+  def sample(
+    self,
+    rep_state: torch.Tensor,
+    action: torch.Tensor,
+    aux_state: torch.Tensor,
+    sim_ctx: torch.Tensor,
+    epsilon: torch.Tensor,
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reparameterized sample using caller-owned standard normal noise."""
+    from supermimic.utils.lie_state import LieState, boxplus
+
+    next_aux, next_rep, lower = self.distribution(rep_state, action, aux_state, sim_ctx)
+    if epsilon.shape != (*rep_state.shape[:-1], 70):
+      raise ValueError("Process epsilon must match the batch shape and have 70 entries")
+    delta = (lower @ epsilon.unsqueeze(-1)).squeeze(-1)
+    return boxplus(LieState.from_rep(next_aux, next_rep), delta).to_rep()
+
+  def _checkpoint_metadata(self) -> dict[str, Any]:
+    from supermimic.utils.lie_state import STATE_LAYOUT_VERSION, TANGENT_VERSION
+
+    return {
+      "format_version": "stochastic_dynamics_v1",
+      "state_layout": STATE_LAYOUT_VERSION,
+      "tangent_version": TANGENT_VERSION,
+      "process_noise": (
+        asdict(self.process_noise_config) if self.process_noise_config else None
+      ),
+      "dt": self.dt,
+      "integration": {
+        "representation": type(self._apply_prediction.__self__).__name__,
+        "substep_coeff": getattr(
+          self._apply_prediction.__self__, "substep_coeff", None
+        ),
+      },
+    }
+
+  def mark_updated(self) -> None:
+    """Compatibility hook. Version queries now inspect the actual weights."""
+
+  @property
+  def model_version(self) -> str:
+    """Fingerprint the current model at a provider or checkpoint boundary.
+
+    Fused optimizers and CUDA graph replay can change weights without
+    incrementing PyTorch's tensor version counters.
+    """
+    return self._content_digest(self._checkpoint_metadata())
+
+  def _content_digest(self, metadata, state=None) -> str:
+    digest = hashlib.sha256()
+    digest.update(json.dumps(metadata, sort_keys=True).encode())
+    for name, current in (*self.named_parameters(), *self.named_buffers()):
+      # Derived, nonpersistent buffers (e.g. the triangle indices) come
+      # from the model configuration and are also part of the fingerprint.
+      value = current if state is None else state.get(name, current)
+      digest.update(f"{name}:{value.dtype}:{tuple(value.shape)}".encode())
+      raw = value.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
+      digest.update(raw.numpy())
+    return digest.hexdigest()
+
+  def checkpoint(self) -> dict[str, Any]:
+    """Self-describing model snapshot, separate from online belief state."""
+    metadata = self._checkpoint_metadata()
+    state = {key: value.detach().clone() for key, value in self.state_dict().items()}
+    return {
+      "metadata": metadata,
+      "state_dict": state,
+      "model_version": self._content_digest(metadata, state),
+    }
+
+  def load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+    """Validate the complete snapshot before mutating the live model."""
+    if checkpoint.get("metadata") != self._checkpoint_metadata():
+      raise ValueError("Dynamics checkpoint configuration or state layout mismatch")
+    supplied = checkpoint.get("state_dict")
+    expected = self.state_dict()
+    if not isinstance(supplied, dict) or supplied.keys() != expected.keys():
+      raise ValueError("Dynamics checkpoint parameter/buffer keys mismatch")
+    for name, value in supplied.items():
+      if (
+        not isinstance(value, torch.Tensor)
+        or value.shape != expected[name].shape
+        or value.dtype != expected[name].dtype
+        or not bool(torch.isfinite(value).all())
+      ):
+        raise ValueError(f"Invalid Dynamics checkpoint tensor: {name}")
+    digest = self._content_digest(checkpoint["metadata"], supplied)
+    if digest != checkpoint.get("model_version"):
+      raise ValueError("Dynamics checkpoint content does not match its model version")
+    self.load_state_dict(supplied, strict=True)
 
   def normalizers(self) -> list[_CudaGraphNormalization]:
     return [self.state_normalizer, self.action_normalizer]
