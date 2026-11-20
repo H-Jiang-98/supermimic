@@ -97,6 +97,38 @@ def test_config_roundtrip_and_permissions():
     EITInputConfig(version="old")
 
 
+@pytest.mark.parametrize("kind", ["zero", "reflection"])
+def test_injected_and_reference_rotations_must_belong_to_so3(kind):
+  state, reference, cov = _inputs(dtype=torch.float32)
+  invalid = (
+    torch.zeros_like(state.rotation) if kind == "zero" else state.rotation.clone()
+  )
+  if kind == "reflection":
+    invalid[:, :, 0].neg_()
+  posterior = PosteriorInput(replace(state, rotation=invalid), cov)
+  with pytest.raises(ValueError, match="Rotation"):
+    build_actor_features(EITInputConfig(group="B"), state, posterior, reference)
+  with pytest.raises(ValueError, match="Rotation"):
+    build_motion_goal(
+      state, replace(reference, rotation=invalid[:, None].expand_as(reference.rotation))
+    )
+
+
+@pytest.mark.parametrize("invalid", ["negative", "correlation", "deterministic"])
+def test_large_unrelated_variance_cannot_mask_invalid_actor_covariance(invalid):
+  cov = torch.eye(9) * 1e-4
+  cov[8, 8] = 100
+  if invalid == "negative":
+    cov[0, 0] *= -1
+  elif invalid == "correlation":
+    cov[0, 1] = cov[1, 0] = 2e-4
+  else:
+    cov[0, 0] = 0
+    cov[0, 1] = cov[1, 0] = 1e-10
+  with pytest.raises(ValueError, match="semidefinite"):
+    encode_covariance(cov)
+
+
 def test_goal_layout_and_required_inputs():
   state, reference, covariance = _inputs()
   mean = replace(state, position=state.position + 0.3)

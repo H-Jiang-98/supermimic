@@ -14,6 +14,8 @@ from typing import Any, Literal, Protocol
 
 import torch
 
+from supermimic.utils.validation import check_covariance, validate_rotation
+
 INPUT_VERSION = "eit_rpv_v1"
 COVARIANCE_ENCODING = "log_std_corr_v1"
 NUM_REFERENCE_FRAMES = 10
@@ -151,8 +153,8 @@ class PosteriorProvider(Protocol):
   ``measurement`` excludes the previous-action channels. An implementation may
   retain its own per-environment state; reset_mask identifies new collector
   episodes or new imagined rollout slots, never history-padding copies. Starting
-  a synthetic rollout is not restoration of a real filter: current-model replay
-  posterior reconstruction will be a separate explicit operation in a later step.
+  a synthetic rollout is not restoration of a real filter. Full belief providers
+  use the separate keyed replay reset and prepare/commit interfaces instead.
   """
 
   def __call__(
@@ -277,6 +279,7 @@ def _validate_state(state: RpvState) -> None:
       raise ValueError("RpvState components must share dtype and device")
     if not torch.isfinite(value).all():
       raise ValueError("RpvState must contain finite values")
+  validate_rotation(state.rotation)
 
 
 def build_motion_goal(
@@ -312,6 +315,7 @@ def build_motion_goal(
       raise ValueError("Reference and state must share dtype and device")
     if not torch.isfinite(value).all():
       raise ValueError("ReferenceWindow must contain finite values")
+  validate_rotation(reference.rotation)
   inverse = state.rotation.transpose(-1, -2)[:, None]
   position = (
     inverse @ (reference.position - state.position[:, None]).unsqueeze(-1)
@@ -385,18 +389,10 @@ def validate_covariance(covariance: torch.Tensor) -> torch.Tensor:
   """Reject invalid covariance, allowing only roundoff-level asymmetry/PSD error."""
   if covariance.shape[-2:] != (9, 9) or not covariance.is_floating_point():
     raise ValueError("RPV/task covariance must be floating point (...,9,9)")
-  detached = covariance.detach()
-  if not torch.isfinite(detached).all():
-    raise ValueError("Covariance must be finite")
-  scale = detached.abs().amax(dim=(-2, -1)).clamp_min(torch.finfo(detached.dtype).tiny)
-  tolerance = 64 * torch.finfo(detached.dtype).eps * scale
-  asymmetry = (detached - detached.transpose(-1, -2)).abs().amax(dim=(-2, -1))
-  if torch.any(asymmetry > tolerance):
-    raise ValueError("Covariance is significantly asymmetric")
-  symmetric = (covariance + covariance.transpose(-1, -2)) * 0.5
-  if torch.any(torch.linalg.eigvalsh(symmetric.detach())[..., 0] < -tolerance):
-    raise ValueError("Covariance must be positive semidefinite")
-  return symmetric
+  check_covariance(
+    covariance, "Covariance", rtol=64 * torch.finfo(covariance.dtype).eps
+  )
+  return (covariance + covariance.mT) * 0.5
 
 
 def task_error_covariance(
