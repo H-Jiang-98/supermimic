@@ -255,10 +255,12 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
       actor_cfg.enable_corruption
       or actor_cfg.terms["joint_pos"].params.get("biased", False)
       or not getattr(motion_cfg, "fixed_reference_alignment", False)
+      or not getattr(env.unwrapped.cfg, "forward_before_rl_signals", False)
     ):
       raise ValueError(
         "Call configure_estimator_env_cfg before creating the simulation: "
-        "EIT requires single corruption, calibrated proprio and fixed references"
+        "EIT requires single corruption, calibrated proprio, fixed references "
+        "and end-of-step kinematics"
       )
   if cfg.history_length > 1 and cfg.actor_obs != "proprio":
     raise RuntimeError(
@@ -1146,7 +1148,9 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       extra_fields=extra_fields,
     )
 
-  def step(self, *, posterior: PosteriorInput | None = None) -> int:
+  def step(
+    self, *, posterior: PosteriorInput | None = None, record_episode_stats: bool = True
+  ) -> int:
     with torch.inference_mode():
       step = self._pending_collection
       if step is None:
@@ -1162,9 +1166,11 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
           next_obs["actor"].to(self.device), dones, next_sensor=step.next_sensor
         )
         step.history_advanced = True
-      terminated = self.env.unwrapped.termination_manager.terminated
       if not step.logged:
-        self.logger.process_env_step(rewards, terminated, extras)
+        if record_episode_stats:
+          self.logger.process_env_step(
+            rewards, self.env.unwrapped.termination_manager.terminated, extras
+          )
         step.logged = True
 
       if self._sampler is not None and not step.sampler_updated:
@@ -1175,7 +1181,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         step.sampling_weights = self._sampler.record(
           step.fields["motion_time"],
           rewards,
-          terminated.to(self.device, torch.bool) & ~truncated,
+          manager.terminated.to(self.device, torch.bool) & ~truncated,
           clip_end,
           truncated & ~clip_end,
         )

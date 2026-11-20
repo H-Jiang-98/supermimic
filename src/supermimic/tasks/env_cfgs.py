@@ -205,6 +205,12 @@ def configure_estimator_env_cfg(cfg: ManagerBasedRlEnvCfg) -> ManagerBasedRlEnvC
   full_state = cfg.observations.get("full_state")
   if full_state is None or "root_pos" not in full_state.terms:
     raise ValueError("Estimator inputs require the GenCoord full-state layout")
+  if not hasattr(cfg, "forward_before_rl_signals"):
+    raise RuntimeError(
+      "Estimator rewards require the mjlab end-of-step kinematics option. "
+      "Apply patches/mjlab-1.6.0-post-step-kinematics.patch to the mjlab checkout."
+    )
+  cfg.forward_before_rl_signals = True
   motion.fixed_reference_alignment = True
   for name, orientation in (("motion_body_pos", False), ("motion_body_ori", True)):
     term = cfg.rewards[name]

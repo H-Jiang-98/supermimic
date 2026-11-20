@@ -270,7 +270,14 @@ the old environment until the verification commands below pass.
 
 `patches/mjlab-1.6.0-motion-hooks.patch` is retained for reproducing the hooks on
 the original public checkout at `59b6c720698c032388ba8ab9d0f3582f869d34ff`.
-The fork's `dev` branch already contains these hooks; no patch command is needed.
+The fork's `dev` branch already contains the motion hooks.
+
+The estimator task also uses the fork's `forward_before_rl_signals` option.
+For a checkout that predates this option, apply the kinematics patch from `supermimic/`.
+
+```bash
+git -C ../mjlab_for_supermimic apply ../supermimic/patches/mjlab-1.6.0-post-step-kinematics.patch
+```
 
 ### Public mjlab compatibility
 
@@ -409,7 +416,8 @@ decoder 首层 LayerNorm 后的 FiLM。A/B 完全旁路 FiLM。旧配置保持�
 
 奖励保留全局骨盆跟踪与相对身体形态跟踪的混合定义。actor 和全局奖励使用
 固定 episode 参考；刚体位姿奖励在评分时按当前真值根位姿的水平位置和 yaw
-重新对齐参考，两条 rollout 采用相同规则，评分不改变 actor 的参考轨迹。
+重新对齐参考。两条 rollout 都用动作执行满 20 ms 后的机器人状态，对照选择该动作时的参考帧评分。
+真实环境在最后一个物理子步结束后刷新刚体位姿和速度，随后计算终止与奖励，再执行自动 reset 和参考帧更新。
 
 使用 `SuperMimicRunnerCfg.for_estimator_inputs("C")` 创建新配置，也可选择
 `"A"` 或 `"B"`。创建仿真环境前调用
