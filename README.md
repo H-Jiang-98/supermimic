@@ -452,9 +452,9 @@ provider 自身的状态更新及其调用前的噪声采样不在环境回滚�
 从训练配置切换到 `mode="eval"` 时显式传入 `for_evaluation=True`；其余配置
 仍严格匹配。世界模型和估计器后续也须从相同初始权重建立独立实例。
 
-输入阶段可运行采集和短序列计算图验证，`run()` / learner `update()` 明确拒绝
-完整训练，避免将尚未接入 belief 的 critic 当成 B/C 基线。下节的第二步接入
-真实滤波器；完整联合训练调度、critic 和闭环控制性能验证由后续阶段完成。
+输入阶段可运行采集和短序列计算图验证，`run()` / policy learner `update()` 明确拒绝
+完整策略训练。第二步接入真实滤波器，第三步通过独立 `train_belief` 入口联合训练
+均值模型和噪声头；belief critic、策略优化和闭环控制性能验证由后续阶段完成。
 现有 play、viewer、benchmark 和 ONNX exporter 对新版本明确报错。
 
 CPU 验收测试（无需完整 MuJoCo 闭环）：
@@ -478,7 +478,7 @@ OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
 在预测均值右侧注入 Lε。L 的对角使用 softplus 加显式下界。默认初始标准差
 按上述六个误差块依次为 `(0.01, 0.001, 0.05, 0.05, 0.005, 0.05)`，单位与
 对应物理量一致，表示一个控制步的过程噪声。均值和噪声头共同注册为模型参数，
-后续从零以 posterior NLL 联合训练。原 `forward` 保留确定性均值行为。
+第三步从零以 posterior NLL 联合训练。`forward` 返回确定性均值；随机模型使用下述矩阵积分核心。
 
 `LieBeliefFilter` 是纯函数核心，提供 `initialize`、`predict`、`correct`、
 `observation` 及 `to_actor_input`。64 维观测使用第一步的高斯配置。
@@ -534,7 +534,7 @@ saved = runner.wm_env.snapshot()
 obs = runner.wm_env.restore(saved)
 ```
 
-reset 在当前模型版本上重建从片段起点到目标帧的完整后验，以及同一目标帧的 actor 历史、潜在状态、参考和 ξ。该重建不保留历史模型学习图，返回的后验作为想象初始条件；带模型学习图的序列重放和后验缓存留到下一阶段。所选物理帧已被覆盖或片段内部断开时，reset 报错并保留原 rollout。
+reset 在当前模型版本上重建从片段起点到目标帧的完整后验，以及同一目标帧的 actor 历史、潜在状态、参考和 ξ。该重建不保留历史模型学习图，返回的后验作为想象初始条件；第三步 learner 只对选定训练窗口保留计算图，并在每次更新后重新重建前缀。所选物理帧已被覆盖或片段内部断开时，reset 报错并保留原 rollout。
 想象环境的 `snapshot()/restore()` 保存和恢复已提交帧的潜在状态、历史、动作、参考时间与对齐、ξ 及完整后验。可在相同模型和参考运动上直接从纯想象帧继续，恢复时不抽样、不重复融合测量。后续两个噪声参数均为标准正态样本，省略时各采样一次。奖励使用潜在真值。
 
 想象环境快照使用 `version=2`，与 provider 的 v3 是不同的版本标识。
@@ -564,10 +564,11 @@ provider 也尊重调用方的 `inference_mode()`，在内部转换为普通张�
 `BeliefProvider.state_dict()/load_state_dict()` 保存完整 belief、context、episode 序号、帧序号、模型版本
 和滤波配置。
 
-当前传播 Jacobian 使用非向量化 `autograd.functional.jacobian`，并保留高阶
-计算图。已有 TorchScript 四元数运算与 `torch.func.jacrev` 的组合在预热后
-可能报错或给出错误的混合二阶导数；测试包含真实模型的有限差分回归。此版本是
-小 batch 的 eager 正确性基线，扩大并行训练前需要另行验证和优化吞吐。
+第三步的滤波器要求动力学实现 `mean_lie` 和 `distribution_lie`。矩阵积分在每次
+姿态乘法后执行一次 Newton–Schulz 正交化，控制 float32 长序列中的旋转漂移。传播 Jacobian 默认使用
+`vmap(jacrev)` 并保留高阶计算图。`FilterConfig(jacobian_backend="eager")`
+保留普通 autograd 参考；`jacobian_batch_chunk_size` 和 `jacobian_chunk_size`
+控制样本和 Jacobian 行的分块，默认均为 `None`。数值与性能验收见下节。
 
 三个阶段可分别运行以下验收，完整回归使用 `pytest -q`：
 
@@ -579,12 +580,71 @@ OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-step2-mpl \
   .venv/bin/python -m supermimic.scripts.check_estimator
 ```
 
-MuJoCo smoke 自动生成四帧静止参考，使用 2 个环境、容量为 2 的环形 buffer、8 步真实采集和两步随机想象。脚本独立核对从保留片段重建的完整均值和 covariance，再检查想象回报对 actor 的梯度和纯想象帧快照恢复，输出 JSON 诊断。使用 `--device cuda:0` 可运行 GPU 验收。完整联合训练调度和 belief critic 属于后续阶段。
+MuJoCo smoke 自动生成四帧静止参考，使用 2 个环境、容量为 2 的环形 buffer、8 步真实采集和两步随机想象。脚本独立核对从保留片段重建的完整均值和 covariance，再检查想象回报对 actor 的梯度和纯想象帧快照恢复，输出 JSON 诊断。使用 `--device cuda:0` 可运行 GPU 验收。策略/模型联合调度和 belief critic 属于后续阶段。
 
-2026-11-20 分阶段验收：Git 提交候选树完整回归 **433 passed**，另有 4 份
+第二步历史验收（2026-11-20）：Git 提交候选树完整回归 **433 passed**，另有 4 份
 被忽略的本地测试在同一候选代码上 **47 passed**；两部分对应此前工作区的 480 项。
 CPU MuJoCo smoke 及各批 Python 文件的 Ruff lint/format 均通过，GPU 尚未验证。
 具体范围、数值、耗时及基于 `c22a8af` 的四组提交记录见 [plan_step2.md](plan_step2.md)。
+
+## Estimator 第三步：均值与噪声头联合学习
+
+[plan_step3.md](plan_step3.md) 已实现独立 `BeliefWorldModelLearner` 和轮次训练入口。
+均值网络和过程噪声头共同从初始化参数学习，目标为完整 70 维 posterior NLL。
+每个窗口保留 T+1 帧；窗口前缀按当前模型重放，到边界 detach 后进行可微展开。
+没有记录 successor 的终止动作不计分。microbatch 按有效转移总数累积梯度。
+
+启动模型训练（本地 motion，固定 actor）：
+
+```bash
+OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
+  .venv/bin/python -m supermimic.scripts.train_belief \
+  --motion-file data/motions/walk1_subject1.npz \
+  --device cuda:0 --group B --output logs/belief-b \
+  --num-envs 8 --rounds 10 --collection-steps 64 \
+  --updates 10 --batch-size 4 --microbatch-size 2 --horizon 2
+```
+
+将 motion 路径替换为已有文件。默认均值网络为 `(2048, 2048, 2048)`，噪声头为
+`(128, 64)`。每轮固定模型采集，再封存片段、仅用新采集的训练 episode 更新归一化、
+训练、验证和保存，最后 reset 环境、历史和 provider。actor 权重和归一化保持固定。
+验证 episode 按 `episode_id % 5 == 0` 划分，所有窗口与统计共享该划分；buffer 中
+必须同时保留两组有效转移。首次验收建议短窗口，随后依据实际 NLL 和 covariance
+诊断扩大训练，而不是将运行成功视为已经收敛。
+
+本轮只有新验证帧时，训练沿用现有归一化统计，并从保留的训练 episode 取样。
+输出目录包含 `metrics.jsonl` 和 `training.pt`。日志含 posterior/prediction NLL、
+Mahalanobis、log determinant、分块误差及方差、边缘 95% 覆盖率、jitter 和两头梯度范数。
+训练日志中的 `valid_transitions` 为轮次总数，损失和诊断按有效转移数加权，梯度范数按更新次数平均。
+checkpoint 包含完整模型、归一化、固定 actor、optimizer、步数、配置、motion 内容指纹和训练使用的 PyTorch RNG。
+重复同一命令并加入 `--resume logs/belief-b/training.pt` 可继续训练，`--rounds` 指新增轮数。
+恢复时核对 motion 的内容指纹。已有实验目录只接受本目录当前的 `training.pt`，
+也可以指定空目录从某个 checkpoint 另起一次记录。CPU 实验只需 CPU RNG，
+CUDA 实验另存训练设备的 RNG。旧版 `belief_model_training_v1` 缺少 motion 指纹，
+需要使用下述权重迁移接口重新开始训练。
+恢复会清空 replay 并 reset 物理轨迹，固定下一批输入时模型/optimizer 更新一致；
+它不恢复 MuJoCo/Warp 的历史物理轨迹。
+
+矩阵核心接口为 `Dynamics.mean_lie`、`distribution_lie`、`sample_lie`。
+随机模型 checkpoint 使用 `stochastic_dynamics_v2`，积分版本为 `right_matrix_v2`。
+第二步旧 bundle 或正交化之前的 `right_matrix_v1` 权重需显式使用
+`wm.migrate_bundle(old_bundle)`，再 `wm.load_bundle(...)`；
+仅有 dynamics checkpoint 时使用 `dynamics.migrate_checkpoint(...)`。
+迁移后必须重新配置 provider 并 reset，旧后验版本不能继续使用。
+
+可复现验收：
+
+```bash
+OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
+  .venv/bin/python -m supermimic.scripts.check_belief_training --device cuda:0
+OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.check_belief_scale --help
+```
+
+两轮真实 MuJoCo 采集与联合更新、固定输入恢复及随机想象均通过 CPU/GPU float32 验收。
+生产矩阵路径通过 CPU float64 有限差分与混合导数检查。RTX 5090 上，默认均值网络、
+batch=4、horizon=4 的 NLL 前向/反向约 0.20 秒，峰值分配显存约 273 MiB；该测量
+不包含采集、前缀重建、optimizer 或整轮 replay 内存。
+完整范围和可复现 JSON 记录见 [第三步实施记录](plan_step3.md#实施记录2026-11-20)。
 
 ## Acknowledgements
 

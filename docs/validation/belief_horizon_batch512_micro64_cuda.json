@@ -1,0 +1,142 @@
+{
+  "timestamp_utc": "2026-11-20T08:49:07.581854+00:00",
+  "torch": "2.14.0+cu130",
+  "source_commit": "ac611f1888f3d159177ed5519e02afa6c75be5fd",
+  "source_files_sha256": {
+    "src/supermimic/scripts/benchmark_belief_horizon.py": "5e9e21ba576c20c988d9addc763850035548a925876730e1ae6c3833d56c274d",
+    "src/supermimic/models.py": "170632710490ffe1de14c7136b37dd43e2c9ca3ab747fdd96bc72bdb7c28b694",
+    "src/supermimic/representations.py": "b3ff833f6a7d2614c8d88abb6b5c0e401bd21b7602383280573f1b7093ee116d",
+    "src/supermimic/estimator.py": "831eccfdfc6beb4d38d6fe483a0602e32994913a63483e0ff27ba001693097fe",
+    "src/supermimic/utils/lie_state.py": "4b6c7a1acce93c01d1eba02ffc3330dc4edcd2a38f7d0c5cbe492904e82344a5",
+    "src/supermimic/learners/belief_wm_learner.py": "6f26afced77675abc27a309f5bc79d0416537ddba4675ab472422156a26d4d5e"
+  },
+  "device": "cuda:0",
+  "gpu": "NVIDIA GeForce RTX 5090",
+  "dtype": "float32",
+  "threads": 1,
+  "seed": 731,
+  "warmup": 2,
+  "repeats": 5,
+  "mean_hidden_dims": [
+    2048,
+    2048,
+    2048
+  ],
+  "noise_hidden_dims": [
+    128,
+    64
+  ],
+  "sim_context_dim": 33,
+  "filter_config": {
+    "jitter_initial": 1e-08,
+    "jitter_multiplier": 10.0,
+    "jitter_max": 0.0001,
+    "jitter_attempts": 5,
+    "covariance_atol": 1e-10,
+    "covariance_rtol": 1e-05,
+    "jacobian_backend": "vmap",
+    "jacobian_batch_chunk_size": null,
+    "jacobian_chunk_size": null
+  },
+  "includes": "predict/correct/posterior_nll, full higher-order model backward, microbatch gradient accumulation",
+  "excludes": "collection, replay/prefix rebuild, detached diagnostics, optimizer/Adam state",
+  "memory": "maximum torch.cuda.max_memory_allocated across synchronized repeats; includes model, inputs, gradients, temporary graph",
+  "results": [
+    {
+      "batch_size": 512,
+      "microbatch_size": 64,
+      "horizon": 4,
+      "valid_transitions": 2048,
+      "mean_seconds": 1.581365869846195,
+      "median_seconds": 1.5827345619909465,
+      "min_seconds": 1.5749358208850026,
+      "max_seconds": 1.5881154532544315,
+      "seconds": [
+        1.5751838888972998,
+        1.5749358208850026,
+        1.5881154532544315,
+        1.5827345619909465,
+        1.5858596242032945
+      ],
+      "peak_allocated_bytes": 2827477504,
+      "peak_reserved_bytes": 3024093184,
+      "peak_allocated_mib": 2696.49267578125,
+      "loss": 329.45977783203125,
+      "loss_and_all_gradients_finite": true,
+      "parameters": 8931928,
+      "status": "passed"
+    },
+    {
+      "batch_size": 512,
+      "microbatch_size": 64,
+      "horizon": 8,
+      "valid_transitions": 4096,
+      "mean_seconds": 3.2129334385506807,
+      "median_seconds": 3.1987646906636655,
+      "min_seconds": 3.186034408863634,
+      "max_seconds": 3.258743494283408,
+      "seconds": [
+        3.1915386468172073,
+        3.258743494283408,
+        3.186034408863634,
+        3.1987646906636655,
+        3.2295859521254897
+      ],
+      "peak_allocated_bytes": 5274769920,
+      "peak_reserved_bytes": 5574230016,
+      "peak_allocated_mib": 5030.41259765625,
+      "loss": 532.6641845703125,
+      "loss_and_all_gradients_finite": true,
+      "parameters": 8931928,
+      "status": "passed"
+    },
+    {
+      "batch_size": 512,
+      "microbatch_size": 64,
+      "horizon": 16,
+      "valid_transitions": 8192,
+      "mean_seconds": 6.527649964764715,
+      "median_seconds": 6.505186324939132,
+      "min_seconds": 6.490327573847026,
+      "max_seconds": 6.571700108703226,
+      "seconds": [
+        6.5666585196740925,
+        6.571700108703226,
+        6.505186324939132,
+        6.5043772966600955,
+        6.490327573847026
+      ],
+      "peak_allocated_bytes": 10170598912,
+      "peak_reserved_bytes": 10752098304,
+      "peak_allocated_mib": 9699.43896484375,
+      "loss": 742.4478759765625,
+      "loss_and_all_gradients_finite": true,
+      "parameters": 8931928,
+      "status": "passed"
+    },
+    {
+      "batch_size": 512,
+      "microbatch_size": 64,
+      "horizon": 32,
+      "valid_transitions": 16384,
+      "mean_seconds": 13.06650317562744,
+      "median_seconds": 13.055314843077213,
+      "min_seconds": 13.035494921263307,
+      "max_seconds": 13.121144858654588,
+      "seconds": [
+        13.055314843077213,
+        13.048521536868066,
+        13.121144858654588,
+        13.035494921263307,
+        13.072039718274027
+      ],
+      "peak_allocated_bytes": 19968623104,
+      "peak_reserved_bytes": 21042823168,
+      "peak_allocated_mib": 19043.56298828125,
+      "loss": 898.8511352539062,
+      "loss_and_all_gradients_finite": true,
+      "parameters": 8931928,
+      "status": "passed"
+    }
+  ]
+}

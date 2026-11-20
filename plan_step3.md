@@ -96,3 +96,88 @@ OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-matrix-mpl \
 | 两步 NLL 前向/反向，batch=2 | 12.85 s | 39.65 ms |
 
 这些结果支持第五批采用“直接矩阵积分 → 向量化 Jacobian”的路线。当前原型已验证小规模的值、混合导数和性能，生产接口迁移、正式网络内存开销及 GPU 运行仍按上述计划验收。
+
+## 实施记录（2026-11-20）
+
+五批实现已完成。完整策略优化与 belief critic 仍按本计划留在后续阶段；本步的入口固定 actor，联合训练均值模型与过程噪声头。
+
+| 批次 | 已落地接口与行为 |
+|---|---|
+| 1 | `BeliefWorldModelLearner` 与独立配置；启用 `process_noise` 的 runner 分派到 posterior-NLL learner，原确定性 learner 保持原接口 |
+| 2 | `BeliefTrainingSequence`、`belief_sequence`、`sample_belief_sequences`；T+1 帧窗口和当前片段前缀，支持短窗口、覆盖后的片段起点，缺失 successor 的末动作不计分 |
+| 3 | 当前模型重放前缀并在窗口边界 detach；窗口内部保留均值、A、L、修正和 covariance 梯度；按有效转移加权累积 microbatch，检查有限损失/梯度并裁剪；两头共享 Adam |
+| 4 | `BeliefModelTraining` / `train_belief`：固定模型采集、封存、仅训练 episode 新帧更新归一化、训练、验证、保存、reset；每次更新重新重建前缀，不缓存旧后验 |
+| 5 | `represent_lie` / `apply_prediction_lie`，以及 `Dynamics.mean_lie` / `distribution_lie` / `sample_lie`；生产滤波默认矩阵 `vmap(jacrev)`，保留 eager 参考及两类分块；CPU/GPU 数值、规模、物理采集和恢复验收通过 |
+
+训练配置默认 `batch_size=4`、`microbatch_size=2`、`horizon=2`、每轮 10 次更新、学习率 `2e-4`、梯度范数上限 1。均值网络默认 `(2048, 2048, 2048)`，噪声网络 `(128, 64)`。均值和噪声头共同初始化；噪声输出层仍按指定初始 covariance 零权重初始化。测试确认输出层第一次更新后，噪声头前层获得非零梯度；固定小数据训练 12 步后的 NLL 低于初值，归一化在这些更新中保持不变。
+
+验证 episode 的默认规则为 `episode_id % 5 == 0`，跨 buffer 覆盖和轮次保持固定。封存后每个片段的长度和边界只校验一次。归一化使用本轮新采集且仍保留的训练帧，检查四元数、转换后的特征和两组候选统计量后统一写入。若本轮只有新验证帧，则沿用已有统计，从保留的训练窗口继续更新。轮次日志累计有效转移数，按转移数汇总 NLL、Mahalanobis、log determinant、分块误差与方差、覆盖率、jitter 和一步预测指标，按优化器更新次数平均两头梯度范数。
+
+`training.pt` 保存模型 bundle、固定 actor、optimizer、步数、归一化、配置及 PyTorch RNG。先在私有副本上校验全部组件，再修改活动模型；同时检查 bundle 中的滤波、先验和测量设置与 runner 配置一致。恢复后清空 replay、reset 物理环境并重建 provider，保证固定下一批原始输入时继续更新一致。它不保证复现恢复前的 MuJoCo/Warp 物理轨迹。CUDA 恢复显式把非 capturable Adam 的标量 step 时钟放回 CPU，并拒绝错误 dtype、非标量、非法布局和非有限 optimizer 状态。
+
+滤波器要求原生矩阵动力学接口 `mean_lie` 和 `distribution_lie`。两种 Jacobian 后端都在矩阵核心上计算。每次旋转矩阵积分后执行一次 Newton–Schulz 正交化。随机动力学权重使用 `stochastic_dynamics_v2` / `right_matrix_v2`。通过 `Dynamics.migrate_checkpoint` 或 `WorldModel.migrate_bundle` 可校验并迁移第二步模型和 `right_matrix_v1` 的权重。第二步 bundle 中缺失的 Jacobian 设置取自目标模型，旧矩阵 bundle 则沿用保存的设置。迁移后重建活动后验与想象快照。
+
+训练 checkpoint `belief_model_training_v2` 记录 motion 内容指纹、CPU RNG 和训练使用的 CUDA 设备 RNG。恢复到已有目录时核对 checkpoint 和最后一轮日志，也可从 checkpoint 写入新目录。旧版训练 checkpoint 缺少 motion 指纹，只支持提取模型权重后显式迁移。
+
+实际训练命令见 [README 第三步](README.md#estimator-第三步均值与噪声头联合学习)。例如：
+
+```bash
+OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
+  .venv/bin/python -m supermimic.scripts.train_belief \
+  --motion-file /path/to/motion.npz --device cuda:0 --group B \
+  --output logs/belief-b --num-envs 8 --rounds 10
+```
+
+同一配置加入 `--resume logs/belief-b/training.pt` 继续新增轮次。`metrics.jsonl` 和 `training.pt` 保存在本地输出目录。
+
+**审阅修正后的验收。** 当前工作区完整 `pytest -q` 共 **571 passed、2 skipped**，包含本地测试。覆盖旧接口拒绝、长序列旋转、权重显式迁移、归一化原子更新、片段索引失效、轮次指标、跨设备数恢复、motion 身份校验和输出目录保护。
+
+本轮另修复 provider 覆盖调用方梯度模式的问题：`prepare()` 与 `prepare_restore()` 在退出 inference mode 前记录外层梯度设置，评估时提交无图的普通张量，局部 Jacobian 继续正常计算。新增 6 项测试覆盖 `no_grad()`、`inference_mode()`、部分 reset、恢复后的梯度权限、评估后恢复动作梯度及 8 步想象中的后验图释放；修复前其中 5 项失败，修复后全部通过。provider/integration 两组共 63 项通过。本轮 CPU 的 `check_estimator` 和 `check_belief_training` 均重跑通过；CUDA 不可用，下面的 GPU 数值与规模结果沿用此前验证记录。
+
+| 验收项 | 结果与记录 |
+|---|---|
+| CPU float64 生产路径 | A 对 eager 最大差 2.22×10⁻¹⁶；70 方向有限差分最大差 3.80×10⁻¹⁰；两步 NLL 参数/动作方向导数相对差不超过 8.56×10⁻⁹；[CPU 记录](docs/validation/belief_scale_cpu.json) |
+| CUDA float32 生产路径 | RTX 5090，A 对 eager 最大差 1.19×10⁻⁷，混合导数最大差 3.05×10⁻⁵，两步 NLL 梯度最大相对 L2 差 2.29×10⁻⁶。[CUDA 记录](docs/validation/belief_scale_cuda.json) |
+| float32 连续旋转 | 2.3204725 rad/s 匀速旋转，dt = 0.02 秒，执行 1,000 次完整 predict/correct。CPU/GPU 的 RᵀR 对单位矩阵最大绝对误差分别为 1.16×10⁻⁷ 和 1.29×10⁻⁷，末帧旋转对解析解的最大绝对误差分别为 1.86×10⁻⁶ 和 4.18×10⁻⁶。 |
+| 规模 | CPU/GPU 共 16 个组合，覆盖网络 32²、256²、2048³、batch 1/2/4、horizon 2/4、两类分块；完整 NLL 前后向均有限 |
+| 默认宽度开销 | 2048³、batch=4、horizon=4，CPU 约 0.73 秒，RTX 5090 约 0.195 秒，峰值分配显存约 273 MiB。单线程、预热 1 次、重复 3 次，CUDA 同步计时 |
+| 两轮真实 MuJoCo 学习 | CPU/GPU float32，2 环境，每轮 8 步采集、2 次联合更新；两头变化、actor 与其归一化不变、下一轮使用新模型；[CPU](docs/validation/belief_training_cpu.json)、[CUDA](docs/validation/belief_training_cuda.json) |
+| 保存恢复 | CPU/GPU 固定下一批输入的 loss、参数及 Adam 状态逐位一致；异常模型/actor/optimizer/配置恢复不修改活动状态或 RNG |
+| 随机想象 | 新矩阵路径上 CPU/GPU 均通过原 `check_estimator`：8 步真实采集、2 步随机想象、完整后验前缀对照、actor 梯度有限、快照恢复成功 |
+| 命令行入口 | RTX 5090 上使用 `walk1_subject1.npz`、B 组、默认网络宽度和 8 环境启动一轮，再在新进程从磁盘恢复第二轮。累计 1,024 个物理帧、20 次更新，两轮分别计入 79 和 78 个训练转移。 |
+| CPU checkpoint 可移植性 | 在可见 RTX 5090 的主机上以 CPU 保存，用 `CUDA_VISIBLE_DEVICES=''` 启动 CPU 进程并完成第三轮。更换为 `dance1_subject1.npz` 时能检测到 motion 内容变化。 |
+
+规模测量隔离 Jacobian、滤波前向、NLL 前向和 NLL 前后向，未包含采集、前缀重建、optimizer、完整 replay 和整轮训练内存。因此默认先采用 microbatch=2、horizon=2。当前测量中，分块减少单次 Jacobian 临时显存，但完整反向的图保留更大、耗时也增加；正式默认不分块，进一步扩大规模时再测量。
+
+另用默认网络在 RTX 5090 上测量梯度累积，覆盖 horizon 4、8、16、32，每个配置预热两次后计时五次。batch 4、microbatch 2 的四种窗口均通过。batch 512 整批反向时，horizon 4 的峰值分配约为 19.6 GiB，horizon 8、16、32 均超出显存。改用 microbatch 64 后四种窗口均通过，horizon 32 每次完整前后向平均耗时 13.07 秒，峰值分配 18.60 GiB。逐次耗时和梯度检查见 [batch 4 / microbatch 2](docs/validation/belief_horizon_batch4_cuda.json)、[batch 512 / microbatch 512](docs/validation/belief_horizon_batch512_cuda.json) 和 [batch 512 / microbatch 64](docs/validation/belief_horizon_batch512_micro64_cuda.json)。
+
+复现物理训练与数值规模验收：
+
+```bash
+OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
+  .venv/bin/python -m supermimic.scripts.check_belief_training --device cpu
+OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
+  .venv/bin/python -m supermimic.scripts.check_belief_training --device cuda:0
+OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.check_belief_scale --help
+```
+
+JSON 保存当前来源文件的 SHA-256；`source_commit` 是实施前的基线，未提交源码由文件指纹标识。真实采集 smoke 只验证短序列学习流程，尚未证明长时训练收敛或闭环控制效果。
+
+## Git 提交拆分与验收
+
+第一、二步主体已在历史提交中。本轮从 `ac611f1` 起，按以下顺序拆分实现。每项提交前，将暂存内容导出到独立目录验证，避免后续未提交代码掩盖依赖；最后对完整候选树运行回归。
+
+| 顺序 | 提交信息 | 内容与边界 |
+|---|---|---|
+| 1 | `fix: respect caller grad mode in belief providers` | `belief_provider.py`、provider/integration 两份测试的新增回归，以及 README 的 provider 梯度模式说明。 |
+| 2 | `fix: refresh kinematics before estimator rewards` | mjlab kinematics patch、`tasks/env_cfgs.py`、runner 的 `forward_before_rl_signals` 配置校验和奖励测试所需的 `record_episode_stats` 开关、`test_estimator_reward_timing.py`，以及 README 的补丁安装和奖励时序说明。 |
+| 3 | `feat: vectorize Lie dynamics Jacobians with matrix integration` | `representations.py`、`models.py`、`estimator.py`、`check_matrix_jacobian.py`，及 matrix dynamics、belief filter、stochastic dynamics 测试。包括矩阵积分、正交化、Jacobian 分块和 dynamics 权重迁移。 |
+| 4 | `feat: learn stochastic dynamics from replay posterior NLL` | `replay_buffer.py`、`learners/belief_wm_learner.py`、`test_estimator_belief_learner.py`。包含 T+1 窗口、当前模型前缀重放、有效转移加权、两头联合优化和 optimizer 恢复。 |
+| 5 | `feat: add resumable belief model training loop` | `runners/belief_training.py`、runner 剩余改动（含 learner 分派和 bundle 迁移）、`train_belief.py`、`train.py`、`check_belief_training.py`，以及 belief training、runner 测试。依赖第 2–4 个提交。 |
+| 6 | `test: add belief scale benchmarks and validation records` | `check_belief_scale.py`、`benchmark_belief_horizon.py`、七份新增 validation JSON，以及 README 剩余第三步说明和本计划的实施/验收记录。保留历史 JSON 的原始来源指纹。 |
+
+`supermimic_runner.py` 和 README 按功能块暂存，其他文件按表归组。奖励时序测试依赖 `record_episode_stats`，因此将该开关及其配套改动一并放入第 2 项，保证中间版本可独立验证。
+
+第 1–5 项独立候选树分别通过 63、36、54、47、53 项测试；第 3、4 项各跳过 1 项 CUDA 测试。各项 Python 文件的 Ruff lint/format 均通过。第 2 项的 mjlab 补丁在临时副本中反向撤销后重新应用，文件逐字节一致；补丁保留标准 unified diff 空白上下文行。
+
+提交期间再次运行完整工作区回归，结果为 **571 passed、2 skipped**；`check_estimator --device cpu` 和 `check_belief_training --device cpu` 均通过。CUDA 当前不可用，因此七份历史 validation JSON 保留原始内容与来源指纹，不标记为本轮重测。

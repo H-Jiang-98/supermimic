@@ -1,0 +1,474 @@
+{
+  "timestamp_utc": "2026-11-20T08:45:25.429395+00:00",
+  "torch": "2.14.0+cu130",
+  "source_commit": "ac611f1888f3d159177ed5519e02afa6c75be5fd",
+  "source_files_sha256": {
+    "src/supermimic/scripts/check_belief_scale.py": "80cfe308629383ed0bbf21450a54adb00800ea4c9505599f89056cbe77fd368b",
+    "src/supermimic/models.py": "170632710490ffe1de14c7136b37dd43e2c9ca3ab747fdd96bc72bdb7c28b694",
+    "src/supermimic/representations.py": "b3ff833f6a7d2614c8d88abb6b5c0e401bd21b7602383280573f1b7093ee116d",
+    "src/supermimic/estimator.py": "831eccfdfc6beb4d38d6fe483a0602e32994913a63483e0ff27ba001693097fe",
+    "src/supermimic/utils/lie_state.py": "4b6c7a1acce93c01d1eba02ffc3330dc4edcd2a38f7d0c5cbe492904e82344a5"
+  },
+  "threads": 1,
+  "warmup": 1,
+  "repeats": 3,
+  "cuda_synchronized": true,
+  "cuda_device": "NVIDIA GeForce RTX 5090",
+  "numerical_checks": [
+    {
+      "device": "cuda:0",
+      "dtype": "torch.float32",
+      "jacobian_vs_eager_max_abs_error": 1.1920928955078125e-07,
+      "chunked_jacobian_max_abs_error": 2.384185791015625e-07,
+      "mixed_derivative_max_abs_error": 3.0517578125e-05,
+      "two_step_nll_max_abs_error": 2.6702880859375e-05,
+      "nll_gradients": {
+        "mean_first_weight": {
+          "norm": 2190.65869140625,
+          "eager_relative_l2_error": 1.4761307056687656e-06,
+          "eager_max_abs_error": 0.000823974609375
+        },
+        "mean_last_bias": {
+          "norm": 284.8206787109375,
+          "eager_relative_l2_error": 7.574578262392606e-07,
+          "eager_max_abs_error": 8.58306884765625e-05
+        },
+        "noise_first_weight": {
+          "norm": 11.222349166870117,
+          "eager_relative_l2_error": 2.2899944269738626e-06,
+          "eager_max_abs_error": 7.3909759521484375e-06
+        },
+        "noise_last_weight": {
+          "norm": 5395.21044921875,
+          "eager_relative_l2_error": 2.075540123769315e-06,
+          "eager_max_abs_error": 0.0013275146484375
+        },
+        "action": {
+          "norm": 220.718994140625,
+          "eager_relative_l2_error": 1.3926934343544417e-06,
+          "eager_max_abs_error": 0.000133514404296875
+        }
+      },
+      "frozen_model_action_gradient_norm": 220.718994140625
+    }
+  ],
+  "long_yaw_rollouts": [
+    {
+      "device": "cuda:0",
+      "dtype": "torch.float32",
+      "steps": 1000,
+      "yaw_rate_rad_per_second": 2.320472478866577,
+      "max_abs_gram_error": 1.293784457345737e-07,
+      "final_rotation_max_abs_error": 4.179658051994828e-06,
+      "final_position_max_abs_error": 0.0
+    }
+  ],
+  "scale": [
+    {
+      "device": "cuda:0",
+      "dtype": "torch.float32",
+      "mean_hidden": [
+        32,
+        32
+      ],
+      "noise_hidden": [
+        128,
+        64
+      ],
+      "batch": 1,
+      "horizon": 2,
+      "filter_config": {
+        "jitter_initial": 1e-08,
+        "jitter_multiplier": 10.0,
+        "jitter_max": 0.0001,
+        "jitter_attempts": 5,
+        "covariance_atol": 1e-10,
+        "covariance_rtol": 1e-05,
+        "jacobian_backend": "vmap",
+        "jacobian_batch_chunk_size": null,
+        "jacobian_chunk_size": null
+      },
+      "parameters": 188504,
+      "jacobian": {
+        "seconds": 0.008714025064061085,
+        "baseline_allocated_bytes": 67920384,
+        "peak_allocated_bytes": 68055552,
+        "incremental_peak_bytes": 135168
+      },
+      "predict_correct": {
+        "seconds": 0.02520573294411103,
+        "baseline_allocated_bytes": 67920384,
+        "peak_allocated_bytes": 69385728,
+        "incremental_peak_bytes": 1465344
+      },
+      "posterior_nll_forward": {
+        "seconds": 0.059719566721469164,
+        "baseline_allocated_bytes": 67920384,
+        "peak_allocated_bytes": 69433344,
+        "incremental_peak_bytes": 1512960
+      },
+      "posterior_nll_forward_backward": {
+        "seconds": 0.09337430959567428,
+        "baseline_allocated_bytes": 68678656,
+        "peak_allocated_bytes": 70740480,
+        "incremental_peak_bytes": 2061824
+      }
+    },
+    {
+      "device": "cuda:0",
+      "dtype": "torch.float32",
+      "mean_hidden": [
+        32,
+        32
+      ],
+      "noise_hidden": [
+        128,
+        64
+      ],
+      "batch": 4,
+      "horizon": 4,
+      "filter_config": {
+        "jitter_initial": 1e-08,
+        "jitter_multiplier": 10.0,
+        "jitter_max": 0.0001,
+        "jitter_attempts": 5,
+        "covariance_atol": 1e-10,
+        "covariance_rtol": 1e-05,
+        "jacobian_backend": "vmap",
+        "jacobian_batch_chunk_size": null,
+        "jacobian_chunk_size": null
+      },
+      "parameters": 188504,
+      "jacobian": {
+        "seconds": 0.008313618755588928,
+        "baseline_allocated_bytes": 67979776,
+        "peak_allocated_bytes": 68369920,
+        "incremental_peak_bytes": 390144
+      },
+      "predict_correct": {
+        "seconds": 0.022575897630304098,
+        "baseline_allocated_bytes": 67979776,
+        "peak_allocated_bytes": 73632768,
+        "incremental_peak_bytes": 5652992
+      },
+      "posterior_nll_forward": {
+        "seconds": 0.11468792504941423,
+        "baseline_allocated_bytes": 67979776,
+        "peak_allocated_bytes": 73800192,
+        "incremental_peak_bytes": 5820416
+      },
+      "posterior_nll_forward_backward": {
+        "seconds": 0.17994014003003636,
+        "baseline_allocated_bytes": 68738048,
+        "peak_allocated_bytes": 84178944,
+        "incremental_peak_bytes": 15440896
+      }
+    },
+    {
+      "device": "cuda:0",
+      "dtype": "torch.float32",
+      "mean_hidden": [
+        256,
+        256
+      ],
+      "noise_hidden": [
+        128,
+        64
+      ],
+      "batch": 2,
+      "horizon": 2,
+      "filter_config": {
+        "jitter_initial": 1e-08,
+        "jitter_multiplier": 10.0,
+        "jitter_max": 0.0001,
+        "jitter_attempts": 5,
+        "covariance_atol": 1e-10,
+        "covariance_rtol": 1e-05,
+        "jacobian_backend": "vmap",
+        "jacobian_batch_chunk_size": null,
+        "jacobian_chunk_size": null
+      },
+      "parameters": 284376,
+      "jacobian": {
+        "seconds": 0.008200579788535833,
+        "baseline_allocated_bytes": 68320768,
+        "peak_allocated_bytes": 69019136,
+        "incremental_peak_bytes": 698368
+      },
+      "predict_correct": {
+        "seconds": 0.02144637160624067,
+        "baseline_allocated_bytes": 68320768,
+        "peak_allocated_bytes": 71180800,
+        "incremental_peak_bytes": 2860032
+      },
+      "posterior_nll_forward": {
+        "seconds": 0.05182501068338752,
+        "baseline_allocated_bytes": 68320768,
+        "peak_allocated_bytes": 71267328,
+        "incremental_peak_bytes": 2946560
+      },
+      "posterior_nll_forward_backward": {
+        "seconds": 0.08482075467084844,
+        "baseline_allocated_bytes": 69459968,
+        "peak_allocated_bytes": 76339200,
+        "incremental_peak_bytes": 6879232
+      }
+    },
+    {
+      "device": "cuda:0",
+      "dtype": "torch.float32",
+      "mean_hidden": [
+        2048,
+        2048,
+        2048
+      ],
+      "noise_hidden": [
+        128,
+        64
+      ],
+      "batch": 1,
+      "horizon": 2,
+      "filter_config": {
+        "jitter_initial": 1e-08,
+        "jitter_multiplier": 10.0,
+        "jitter_max": 0.0001,
+        "jitter_attempts": 5,
+        "covariance_atol": 1e-10,
+        "covariance_rtol": 1e-05,
+        "jacobian_backend": "vmap",
+        "jacobian_batch_chunk_size": null,
+        "jacobian_chunk_size": null
+      },
+      "parameters": 8864472,
+      "jacobian": {
+        "seconds": 0.00829597469419241,
+        "baseline_allocated_bytes": 102621696,
+        "peak_allocated_bytes": 105047552,
+        "incremental_peak_bytes": 2425856
+      },
+      "predict_correct": {
+        "seconds": 0.021546933334320784,
+        "baseline_allocated_bytes": 102621696,
+        "peak_allocated_bytes": 105067520,
+        "incremental_peak_bytes": 2445824
+      },
+      "posterior_nll_forward": {
+        "seconds": 0.0523882646424075,
+        "baseline_allocated_bytes": 102621696,
+        "peak_allocated_bytes": 105114624,
+        "incremental_peak_bytes": 2492928
+      },
+      "posterior_nll_forward_backward": {
+        "seconds": 0.08857075870037079,
+        "baseline_allocated_bytes": 138081280,
+        "peak_allocated_bytes": 206174208,
+        "incremental_peak_bytes": 68092928
+      }
+    },
+    {
+      "device": "cuda:0",
+      "dtype": "torch.float32",
+      "mean_hidden": [
+        2048,
+        2048,
+        2048
+      ],
+      "noise_hidden": [
+        128,
+        64
+      ],
+      "batch": 2,
+      "horizon": 4,
+      "filter_config": {
+        "jitter_initial": 1e-08,
+        "jitter_multiplier": 10.0,
+        "jitter_max": 0.0001,
+        "jitter_attempts": 5,
+        "covariance_atol": 1e-10,
+        "covariance_rtol": 1e-05,
+        "jacobian_backend": "vmap",
+        "jacobian_batch_chunk_size": null,
+        "jacobian_chunk_size": null
+      },
+      "parameters": 8864472,
+      "jacobian": {
+        "seconds": 0.008345325632641712,
+        "baseline_allocated_bytes": 102641152,
+        "peak_allocated_bytes": 107444736,
+        "incremental_peak_bytes": 4803584
+      },
+      "predict_correct": {
+        "seconds": 0.02273220242932439,
+        "baseline_allocated_bytes": 102641152,
+        "peak_allocated_bytes": 107484160,
+        "incremental_peak_bytes": 4843008
+      },
+      "posterior_nll_forward": {
+        "seconds": 0.11101140594109893,
+        "baseline_allocated_bytes": 102641152,
+        "peak_allocated_bytes": 107571200,
+        "incremental_peak_bytes": 4930048
+      },
+      "posterior_nll_forward_backward": {
+        "seconds": 0.18085627863183618,
+        "baseline_allocated_bytes": 138100736,
+        "peak_allocated_bytes": 245130240,
+        "incremental_peak_bytes": 107029504
+      }
+    },
+    {
+      "device": "cuda:0",
+      "dtype": "torch.float32",
+      "mean_hidden": [
+        2048,
+        2048,
+        2048
+      ],
+      "noise_hidden": [
+        128,
+        64
+      ],
+      "batch": 4,
+      "horizon": 4,
+      "filter_config": {
+        "jitter_initial": 1e-08,
+        "jitter_multiplier": 10.0,
+        "jitter_max": 0.0001,
+        "jitter_attempts": 5,
+        "covariance_atol": 1e-10,
+        "covariance_rtol": 1e-05,
+        "jacobian_backend": "vmap",
+        "jacobian_batch_chunk_size": null,
+        "jacobian_chunk_size": null
+      },
+      "parameters": 8864472,
+      "jacobian": {
+        "seconds": 0.009123118128627539,
+        "baseline_allocated_bytes": 102681088,
+        "peak_allocated_bytes": 112238080,
+        "incremental_peak_bytes": 9556992
+      },
+      "predict_correct": {
+        "seconds": 0.02289256143073241,
+        "baseline_allocated_bytes": 102681088,
+        "peak_allocated_bytes": 112316928,
+        "incremental_peak_bytes": 9635840
+      },
+      "posterior_nll_forward": {
+        "seconds": 0.11498012393712997,
+        "baseline_allocated_bytes": 102681088,
+        "peak_allocated_bytes": 112483328,
+        "incremental_peak_bytes": 9802240
+      },
+      "posterior_nll_forward_backward": {
+        "seconds": 0.19497460468361774,
+        "baseline_allocated_bytes": 138140672,
+        "peak_allocated_bytes": 286152192,
+        "incremental_peak_bytes": 148011520
+      }
+    },
+    {
+      "device": "cuda:0",
+      "dtype": "torch.float32",
+      "mean_hidden": [
+        2048,
+        2048,
+        2048
+      ],
+      "noise_hidden": [
+        128,
+        64
+      ],
+      "batch": 4,
+      "horizon": 4,
+      "filter_config": {
+        "jitter_initial": 1e-08,
+        "jitter_multiplier": 10.0,
+        "jitter_max": 0.0001,
+        "jitter_attempts": 5,
+        "covariance_atol": 1e-10,
+        "covariance_rtol": 1e-05,
+        "jacobian_backend": "vmap",
+        "jacobian_batch_chunk_size": null,
+        "jacobian_chunk_size": 16
+      },
+      "parameters": 8864472,
+      "jacobian": {
+        "seconds": 0.029083892082174618,
+        "baseline_allocated_bytes": 102681088,
+        "peak_allocated_bytes": 105110528,
+        "incremental_peak_bytes": 2429440
+      },
+      "predict_correct": {
+        "seconds": 0.04225772727901737,
+        "baseline_allocated_bytes": 102681088,
+        "peak_allocated_bytes": 108334080,
+        "incremental_peak_bytes": 5652992
+      },
+      "posterior_nll_forward": {
+        "seconds": 0.19312126996616522,
+        "baseline_allocated_bytes": 102681088,
+        "peak_allocated_bytes": 108501504,
+        "incremental_peak_bytes": 5820416
+      },
+      "posterior_nll_forward_backward": {
+        "seconds": 0.41127713955938816,
+        "baseline_allocated_bytes": 138140672,
+        "peak_allocated_bytes": 314685952,
+        "incremental_peak_bytes": 176545280
+      }
+    },
+    {
+      "device": "cuda:0",
+      "dtype": "torch.float32",
+      "mean_hidden": [
+        2048,
+        2048,
+        2048
+      ],
+      "noise_hidden": [
+        128,
+        64
+      ],
+      "batch": 4,
+      "horizon": 4,
+      "filter_config": {
+        "jitter_initial": 1e-08,
+        "jitter_multiplier": 10.0,
+        "jitter_max": 0.0001,
+        "jitter_attempts": 5,
+        "covariance_atol": 1e-10,
+        "covariance_rtol": 1e-05,
+        "jacobian_backend": "vmap",
+        "jacobian_batch_chunk_size": 1,
+        "jacobian_chunk_size": null
+      },
+      "parameters": 8864472,
+      "jacobian": {
+        "seconds": 0.032363002033283315,
+        "baseline_allocated_bytes": 102681088,
+        "peak_allocated_bytes": 105166848,
+        "incremental_peak_bytes": 2485760
+      },
+      "predict_correct": {
+        "seconds": 0.04698801630487045,
+        "baseline_allocated_bytes": 102681088,
+        "peak_allocated_bytes": 108334080,
+        "incremental_peak_bytes": 5652992
+      },
+      "posterior_nll_forward": {
+        "seconds": 0.22030734410509467,
+        "baseline_allocated_bytes": 102681088,
+        "peak_allocated_bytes": 108501504,
+        "incremental_peak_bytes": 5820416
+      },
+      "posterior_nll_forward_backward": {
+        "seconds": 0.4299605229559044,
+        "baseline_allocated_bytes": 138140672,
+        "peak_allocated_bytes": 336321024,
+        "incremental_peak_bytes": 198180352
+      }
+    }
+  ],
+  "status": "passed"
+}
