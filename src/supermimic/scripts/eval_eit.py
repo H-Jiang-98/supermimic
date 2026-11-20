@@ -53,6 +53,8 @@ def evaluate(
     )
     runner.policy_learner.actor.eval().requires_grad_(False)
     runner.configure_belief_filter()
+    # Begin paired resets and measurements at the same seed for every actor architecture.
+    torch.manual_seed(seed)
     runner.reset_collection()
     rewards = torch.zeros(num_envs, device=device)
     lengths = torch.zeros(num_envs, device=device, dtype=torch.long)

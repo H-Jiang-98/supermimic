@@ -268,18 +268,21 @@ class EITTraining(BeliefModelTraining):
     ):
       raise ValueError("Common initialization can only be exported before training")
     runner = self.runner
-    actors = build_ablation_actors(runner.cfg, runner._wm, runner.device)
     source = self.actor
-    for actor in actors.values():
-      actor.to(next(source.parameters()))
-      actor.copy_common_initialization_from(source)
-    critics = {}
-    for group in ("A", "B", "C"):
-      critic = BeliefCritic(
-        group, runner._sim_context.output_dim, runner.cfg.critic_hidden_dims
-      ).to(next(source.parameters()))
-      critic.copy_common_initialization_from(self.policy.critic)
-      critics[group] = critic
+    parameter = next(source.parameters())
+    # Creating the shared file must leave the same collection RNG as loading it.
+    with torch.random.fork_rng(devices=[parameter.device] if parameter.is_cuda else []):
+      actors = build_ablation_actors(runner.cfg, runner._wm, runner.device)
+      for actor in actors.values():
+        actor.to(parameter)
+        actor.copy_common_initialization_from(source)
+      critics = {}
+      for group in ("A", "B", "C"):
+        critic = BeliefCritic(
+          group, runner._sim_context.output_dim, runner.cfg.critic_hidden_dims
+        ).to(parameter)
+        critic.copy_common_initialization_from(self.policy.critic)
+        critics[group] = critic
     # B/C include identical extra belief columns even when the source was A.
     critics["C"].copy_common_initialization_from(critics["B"])
     return deepcopy(
