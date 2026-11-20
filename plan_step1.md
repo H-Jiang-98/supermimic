@@ -11,10 +11,10 @@
 | 组别 | 训练时目标中的 R、p、v | 测试时目标中的 R、p、v | actor 的 FiLM | critic 信息约定 |
 |---|---|---|---|---|
 | A | 仿真或想象中的潜在真值 | 后验均值 | 固定 γ=β=0，直接旁路 | 保留特权真值与参考、ξ，不含 belief |
-| B | 后验均值 | 后验均值 | 固定 γ=β=0，直接旁路 | 保留特权真值，并包含后验均值与 covariance |
+| B | 后验均值 | 后验均值 | 固定 γ=β=0，直接旁路 | 保留特权真值，并包含 R/p/v 后验均值与 9×9 边缘 covariance |
 | C | 后验均值 | 后验均值 | 当前任务误差协方差生成 γ、β | 与 B 相同的输入和结构，各自训练 |
 
-A/B 的 actor 不读取 covariance，不计算或优化 FiLM 分支，也没有可训练的常量 γ、β。这个开关不影响 B critic 的 covariance 输入。actor 只读取 Σ_Rpv 的设计不自动缩减既定 critic 的完整 belief 输入。本次固定这些信息权限，完整 belief critic 与估计器训练的集成留到后续阶段。
+A/B 的 actor 不读取 covariance，不计算或优化 FiLM 分支，也没有可训练的常量 γ、β。这个开关不影响 B critic 的 covariance 输入。按后续 [RPV critic 输入修订](plan_step4.md#rpv-critic-输入修订2026-11-20)，B/C critic 显式读取的 belief 为 R/p/v 均值及 Σ_Rpv，编码为 12+45 维；滤波器内部仍持有完整均值与 70×70 covariance。第一步只实现 actor 输入，critic 与估计器训练的集成由后续阶段完成。
 
 B−A 衡量训练目标采用估计状态、同时向 critic 提供 belief 信息的整体收益。C−B 衡量在相同 critic 设计下，增加任务误差协方差编码和 FiLM 的整体收益。C 的分支包含额外可训练参数，而且 Jⱼ 依赖目标误差，因而会提供绕过目标 latent 的额外目标信息路径。实验结论应限定为这套调制设计的增量收益。第一步不增加第四组实验。
 
@@ -78,7 +78,7 @@ episode 初始化用同一份首帧 (o₀, a₋₁) 填充历史，a₋₁ 使�
 
 真实仿真由 `tasks.env_cfgs.current_body_pose_reward` 在物理步之后、command 推进之前读取当前根位姿重新对齐，避免使用上一帧缓存的相对刚体目标。`configure_estimator_env_cfg` 为新输入路径配置该奖励。
 
-**任务误差 covariance 与 450 维编码。** actor 读取后验中按 [δθ, δρ, δν] 排序的 9×9 边缘块 Σ_Rpv，保留 R、p、v 之间的交叉协方差。滤波器内部的完整状态及 covariance 传播设计保持不变。这里使用边缘块，不使用条件协方差。
+**任务误差 covariance 与 450 维编码。** C 组 actor 读取后验中按 [δθ, δρ, δν] 排序的 9×9 边缘块 Σ_Rpv，保留 R、p、v 之间的交叉协方差。滤波器内部的完整状态及 covariance 传播设计保持不变。这里使用边缘块，不使用条件协方差。
 
 沿用论文右扰动定义，一阶关系为：
 

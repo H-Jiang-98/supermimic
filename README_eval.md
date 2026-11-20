@@ -15,12 +15,12 @@ MPKPE、root-relative MPKPE、关节速度 RMS 和末端位姿误差函数。每
 
 ```bash
 OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.eval_eit \
-  --checkpoint logs/eit-b/training.pt \
+  --checkpoint logs/eit-rpv-v2/B/training.pt \
   --motion-file data/motions/walk1_subject1.npz --device cpu \
-  --num-envs 8 --output logs/eit-b/evaluation.json
+  --num-envs 8 --output logs/eit-rpv-v2/B/evaluation.json
 
 .venv/bin/python -m supermimic.scripts.play SuperMimic-GenCoord-G1 \
-  --eit-checkpoint logs/eit-b/training.pt \
+  --eit-checkpoint logs/eit-rpv-v2/B/training.pt \
   --motion-file data/motions/walk1_subject1.npz --viewer viser
 ```
 
@@ -28,6 +28,10 @@ OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.eval_eit \
 均值，C 额外读取任务 covariance，动作探索关闭，传感噪声和在线滤波保留。
 归一化固定，不创建 replay、critic 或 optimizer。每次真实 reset 按 checkpoint 的带噪
 真值先验初始化；这是仿真的初始化知识假设，不能解释为已经支持无真值的实机初始化。
+
+评估和播放要求 A/B/C 的联合 checkpoint 内嵌当前 `eit_rpv_belief_critic_v2` 契约。
+加载器在创建推理模型前校验契约版本，并将声明的 context 宽度与世界模型的 context 宽度、声明的输入宽度与 critic 首层权重逐一核对。
+三组训练和初始化包的用法见 [训练说明](README.md#estimator-第四步完整策略与模型交替训练)。
 
 `eval_eit` 允许不同于训练数据的兼容 motion，记录训练和评估两份内容指纹；这不改变
 续训的严格 motion 校验。末端名单由 `--ee-body-names` 指定，默认使用 G1 的左右

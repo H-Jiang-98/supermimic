@@ -472,7 +472,8 @@ OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
 `[p_world(3), quat_wxyz(4), q(29), v_world(3), omega_body(3), qdot(29)]`；
 70 维右局部误差为 `[theta, rho, nu, omega_body, q, qdot]`。`BeliefState`
 持有完整均值和 70×70 covariance，`to_actor_input()` 提取前 9 维边缘块供现有
-700 维目标与 450 维 FiLM 分支使用。B/C critic 的完整 belief 约定保持不变。
+700 维目标与 450 维 FiLM 分支使用。B/C critic 也只编码后验的 R/p/v 均值与
+9×9 边缘 covariance；滤波器、replay 起点和 posterior NLL 仍使用完整 belief。
 
 `Dynamics(..., process_noise=ProcessNoiseConfig(...))` 启用 2485 维下三角噪声头。
 `distribution(rep, action, aux, context)` 返回均值及 L；`sample(..., epsilon)`
@@ -654,8 +655,18 @@ batch=4、horizon=4 的 NLL 前向/反向约 0.20 秒，峰值分配显存约 27
 冻结世界模型执行随机想象策略梯度与 critic 回归，然后保存和 reset。
 `train_belief` 继续用于固定 actor 的模型学习，旧确定性训练仍使用原入口。
 
-A 的 critic 不含 belief；B/C 使用相同结构，包含完整后验均值和 70×70 covariance。
-三组 critic 共同读取真值、参考、控制历史、剩余 clip 时间和 context。
+A 的 critic 不含 belief；B/C 使用相同结构，额外读取 12 维 R/p/v 后验均值编码和
+45 维 9×9 边缘 covariance 编码。均值采用
+`[rot6d(R_trueᵀ R_mean), R_trueᵀ(p_mean − p_true), R_trueᵀ(v_mean − v_true)]`；
+旋转占 6 维，位置、线速度各占 3 维。covariance 提取完整后验中按
+`[δθ, δρ, δν]` 排序的前 9×9 块，在后验均值的右局部切空间编码为 9 个 log std
+与 36 个上三角相关系数，保留 R/p/v 的交叉项，不做条件化。
+三组 critic 共同读取真值、参考、控制历史、剩余 clip 时间和 context；A 的总输入为
+`1234 + dim(context)`，B/C 为 `1291 + dim(context)`。后验角速度、关节位置和
+关节速度的均值，以及 9×9 块之外的 covariance，不直接进入 B/C critic。
+滤波器继续传播完整 70×70 covariance，posterior NLL 仍覆盖完整状态；上述压缩只发生在
+critic 特征入口，保留 R/p/v 均值和边缘 covariance 的梯度。它是任务相关的信息压缩，
+长期价值与控制性能需通过实验验证，不能认为与完整 belief critic 等价。
 策略想象的 K 条轨迹共享起点与后验，独立采样过程及测量噪声；冻结参数时保留
 动作穿过滤波、covariance、FiLM、soft survival 和价值 bootstrap 的导数。
 clip 最后一个评分动作后停止回报，普通策略 horizon 截断保留 bootstrap。
@@ -666,16 +677,17 @@ clip 最后一个评分动作后停止回报，普通策略 horizon 截断保留
 按原抽样顺序启动 rollout。起点准备和策略更新期间，参考 motion 张量及其底层存储只读；
 进入该阶段时计算一次内容摘要，随后各 microbatch 共用。
 
-新训练默认在输出目录的父目录创建或读取 `eit_initialization_seed<seed>.pt`，
-可用 `--initialization logs/eit-initial.pt` 显式指定共同初始化包。三组使用同一文件，
-不兼容的结构或配置会报错，不覆盖已有初值。
+A/B/C 的训练、评估和播放均要求联合 checkpoint 内嵌 `eit_rpv_belief_critic_v2` critic 契约。
+加载时校验组别、输入维度和 `rpv9_log_std_corr_v1` 编码。A 组也执行同一版本检查。
+新训练默认在输出目录的父目录创建或读取 `eit_initialization_eit_rpv_belief_critic_v2_seed<seed>.pt`。
+同一 seed 的三组使用同一份初始化包，分别写入各自的训练目录。也可用 `--initialization` 指定当前契约的初始化包。
 各组独立采集与更新。以下是初始工程配置，尚未验证长时控制收敛。
 
 ```bash
 OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
   .venv/bin/python -m supermimic.scripts.train_eit \
   --motion-file data/motions/walk1_subject1.npz --device cuda:0 \
-  --group B --output logs/eit-b --initialization logs/eit-initial.pt \
+  --group B --output logs/eit-rpv-v2/B \
   --num-envs 8 --rounds 10
 ```
 
@@ -689,11 +701,11 @@ OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
 ```bash
 OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.train_eit \
   --motion-file data/motions/walk1_subject1.npz --device cuda:0 \
-  --output logs/eit-b --resume logs/eit-b/training.pt --rounds 10
+  --output logs/eit-rpv-v2/B --resume logs/eit-rpv-v2/B/training.pt --rounds 10
 OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.eval_eit \
-  --checkpoint logs/eit-b/training.pt \
+  --checkpoint logs/eit-rpv-v2/B/training.pt \
   --motion-file data/motions/walk1_subject1.npz --device cuda:0 \
-  --num-envs 8 --output logs/eit-b/evaluation.json
+  --num-envs 8 --output logs/eit-rpv-v2/B/evaluation.json
 ```
 
 `eit_training_v1` 保存模型、actor、critic、三个 optimizer、归一化和 RNG。
@@ -715,11 +727,8 @@ OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
   .venv/bin/python -m supermimic.scripts.check_eit_training --device cuda:0 --full-width
 ```
 
-step4 验收结果与范围见 [实施记录](plan_step4.md#实施记录)：CPU 回归 644 passed、
-3 skipped；A/B/C 在 CPU 和 RTX 5090 上均完成两轮真实训练、固定输入恢复及独立评估。
-默认宽度 GPU 策略基准覆盖 H=2/4/8、K=1/2/4；N=3、K=2、H=4、microbatch=2
-时完整策略更新约 2.15 秒，PyTorch 峰值分配约 318 MiB（不含 Warp/驱动）。
-这些是流程与数值验收，不代表三组控制性能排序。
+A/B/C 两轮 CPU 训练的输入契约、恢复检查和短程评估结果见 [RPV critic 验证报告](docs/validation/eit_rpv_critic_cpu.json)。
+测试配置和评估步数见 [第四步验证说明](plan_step4.md#rpv-critic-输入修订2026-11-20)。
 
 ## Acknowledgements
 

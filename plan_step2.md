@@ -13,14 +13,14 @@
 | 组别 | actor 训练时的目标状态 | actor 测试时的目标状态 | actor 显式 covariance | 后续 critic 输入约定 |
 |---|---|---|---|---|
 | A | 潜在真值 R、p、v | 后验均值 | 无，旁路 FiLM | 真值、参考和 ξ，不含 belief |
-| B | 后验均值 | 后验均值 | 无，旁路 FiLM | 真值、完整后验均值与 covariance、参考和 ξ |
+| B | 后验均值 | 后验均值 | 无，旁路 FiLM | 真值、R/p/v 后验均值与 9×9 边缘 covariance、参考和 ξ |
 | C | 后验均值 | 后验均值 | Σ_Rpv 经任务误差映射和 FiLM | 与 B 相同的信息和结构，权重独立 |
 
 三组共用实现与配置，从相同的共同初始权重和归一化状态建立独立实例，随后独立采集、更新。B−A 表示估计状态训练与 belief critic 的整体变化；C−B 表示相同 critic 设计下任务 covariance 与 FiLM 路径的增量效果，包括其额外参数和目标相关信息路径。在线数据与模型的后续分化属于各组训练机制的整体效果。
 
 均值模型与噪声头从零共同训练，首轮采用 posterior NLL。一步预测误差、预测分布质量和校准指标作为诊断，额外预测损失是否必要由实验结果决定。后续采用采集、模型更新、策略更新交替流程，仅在策略更新窗口固定模型参数与归一化状态。冻结旧 actor 的闭环完成率不作为启动 B/C 训练的前置条件。
 
-第一步的 `eit_rpv_v1`、`log_std_corr_v1`、5×93 历史、700 维目标、450 维 covariance 编码、单次高斯测量及 episode 固定参考对齐继续作为集成契约。actor 的 9×9 边缘 covariance 与滤波器、B/C critic 的完整 belief 分别定义。
+actor 使用第一步的 `eit_rpv_v1`、5×93 历史和 700 维目标，每帧采样一次高斯测量，每个 episode 固定参考对齐。A 训练时用真值构造目标，A 评估及 B/C 训练与评估时使用 R/p/v 后验均值。仅 C actor 将当前 9×9 边缘 covariance 投影到十个参考帧，按 `log_std_corr_v1` 编码为 450 维 FiLM 输入。B/C critic 直接将同一边缘块编码为 45 维，配合 12 维 R/p/v 后验均值编码。滤波与 posterior NLL 使用完整 belief。详见 [第四步输入契约](plan_step4.md#rpv-critic-输入修订2026-11-20)。
 
 **提交一：完整 belief 状态与右扰动几何。**
 
@@ -212,7 +212,7 @@
 | 状态恢复 | 连续滤波结果与 snapshot/restore 后继续滤波一致，当前帧不重复融合 |
 | 参考身份 | 同长度不同内容的 motion 不可恢复；原地修改也被检测，失败不推进 provider 或环境；路径迁移但内容相同可接受 |
 | 失败重试 | provider 或输入验证失败后，重试不重复物理步、不双重推进 belief，并复用该时间点已生成的测量 |
-| 信息权限 | A/B/C 继续满足第一步权限；B critic 的 covariance 配置约定保留，完整 critic 在后续接入 |
+| 信息权限 | A/B/C 继续满足第一步权限；B critic 的 R/p/v covariance 配置约定保留，critic 在后续接入 |
 | 入口一致性 | 真实滤波所得完整后验经直接注入和 provider 两种入口，生成一致的历史、目标和 covariance 特征 |
 | 真实采集 | CPU 小 batch MuJoCo 短序列使用真实滤波器，通过正常推进和 episode reset；检查结果有限且无跨 episode 状态污染 |
 | 随机想象 | 使用独立潜在状态与 belief，至少 H_rollout=2；固定过程及测量噪声，可复现前向与反向结果 |

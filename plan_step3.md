@@ -2,7 +2,7 @@
 
 本步承接 [第一步](plan_step1.md) 和 [第二步](plan_step2.md)，实现从零初始化的均值模型与噪声头通过 posterior NLL 共同学习，完成序列采样、模型更新、后验刷新和保存恢复。沿用审阅后的五批实施安排；第五批先将 GenCoord 动力学改为直接旋转矩阵积分，再接入向量化 Jacobian，最后进行规模、诊断和恢复训练验收。
 
-三组沿用相同的模型与滤波实现、配置和共同初值，随后独立采集与训练。A critic 不含 belief；B/C critic 都包含完整后验均值与 covariance，使用相同输入和结构。5×93 历史、700 维目标、C 的 450 维任务 covariance FiLM，以及完整 70 维滤波误差状态保持既定语义。完整策略优化与 belief critic 接入属于后续阶段。
+三组沿用相同的模型与滤波实现、配置和共同初值，随后独立采集与训练。A critic 不含 belief；B/C critic 都包含 R/p/v 后验均值与 9×9 边缘 covariance，使用相同输入和结构，编码为 12+45 维（见 [第四步修订](plan_step4.md#rpv-critic-输入修订2026-11-20)）。5×93 历史、700 维目标、C 的 450 维任务 covariance FiLM，以及完整 70 维滤波误差状态保持既定语义。本步 posterior NLL 仍训练完整 belief，完整策略优化与 critic 接入属于后续阶段。
 
 **第一批：修复遗留问题，建立模型训练接口。**
 
