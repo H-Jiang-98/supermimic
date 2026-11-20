@@ -30,6 +30,7 @@ from supermimic.critic_inputs import BeliefCritic
 from supermimic.learners.belief_policy_learner import (
   BeliefActorCriticPolicyLearner,
   BeliefPolicyLearnerCfg,
+  policy_metrics_for_json,
 )
 from supermimic.models import ProcessNoiseConfig
 from supermimic.runners.supermimic_runner import SuperMimicRunner, SuperMimicRunnerCfg
@@ -281,7 +282,7 @@ def main():
               if cuda
               else None,
               "retained_allocated_bytes": retained if cuda else None,
-              "metrics": {key: float(value) for key, value in logs.items()},
+              "metrics": policy_metrics_for_json(logs),
             }
           )
           print(

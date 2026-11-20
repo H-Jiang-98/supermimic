@@ -1,5 +1,6 @@
 """Alternating EIT phases, normalization splits and transactional continuation."""
 
+import json
 from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
@@ -268,3 +269,34 @@ def test_common_initialization_rejects_prefit_critic():
     loop.initialization_bundle()
   with pytest.raises(ValueError, match="active training"):
     loop.load_initialization(initial)
+
+
+@pytest.mark.parametrize("legacy_nan", [False, True], ids=["json-null", "legacy-nan"])
+def test_single_target_resumes_in_place_and_checks_metric_history(tmp_path, legacy_nan):
+  loop = training()
+  loop.policy.cfg = replace(loop.policy.cfg, batch_size=1, num_samples=1, horizon=1)
+  loop.run(1, tmp_path)
+  checkpoint = tmp_path / "training.pt"
+  history = tmp_path / "metrics.jsonl"
+  state = torch.load(checkpoint, weights_only=True)
+  row = json.loads(history.read_text())
+  field = "Policy/explained_variance"
+  assert state["last_metrics"]["policy"][field] is None
+  assert row["policy"][field] is None
+  assert "NaN" not in history.read_text()
+  if legacy_nan:
+    state["last_metrics"]["policy"][field] = float("nan")
+    row["policy"][field] = float("nan")
+    torch.save(state, checkpoint)
+
+  changed = deepcopy(row)
+  changed["policy"][field] = 0.25
+  history.write_text(json.dumps(changed, sort_keys=True) + "\n")
+  resumed = training(81)
+  resumed.policy.cfg = loop.policy.cfg
+  with pytest.raises(ValueError, match="Metrics history disagrees"):
+    resumed.run(1, tmp_path, resume=checkpoint)
+  history.write_text(json.dumps(row, sort_keys=True) + "\n")
+  second = resumed.run(1, tmp_path, resume=checkpoint)[0]
+  assert second["round"] == 2
+  assert second["policy"][field] is None

@@ -19,6 +19,7 @@ from supermimic.critic_inputs import BeliefCritic
 from supermimic.learners.belief_policy_learner import (
   BeliefActorCriticPolicyLearner,
   BeliefPolicyLearnerCfg,
+  policy_metrics_for_json,
 )
 from supermimic.runners.belief_training import (
   BeliefModelTraining,
@@ -177,7 +178,7 @@ class EITTraining(BeliefModelTraining):
       "critic_version": parameter_digest(self.policy.critic),
       "train": _round_training_metrics(logs),
       "validation": {key: float(value) for key, value in validation.items()},
-      "policy": {key: float(value) for key, value in policy_logs.items()},
+      "policy": policy_metrics_for_json(policy_logs),
     }
     if checkpoint_path is not None:
       self.save(checkpoint_path, metrics=metrics)

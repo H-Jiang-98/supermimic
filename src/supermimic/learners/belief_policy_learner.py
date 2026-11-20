@@ -74,6 +74,13 @@ def lambda_returns(rewards, continuation, values, gamma: float, lam: float):
   return torch.stack(targets[::-1])
 
 
+def policy_metrics_for_json(metrics):
+  result = {name: float(value) for name, value in metrics.items()}
+  if math.isnan(result["Policy/explained_variance"]):
+    result["Policy/explained_variance"] = None
+  return result
+
+
 @contextmanager
 def _module_modes(modules):
   """Restore even child normalization modes and original gradient permissions."""
@@ -139,7 +146,13 @@ class BeliefActorCriticPolicyLearner:
         generator=self.generators["sampling"],
       )
       logs.append(self.update_from(starts, *self.draw_noises(starts)))
-    return {name: torch.stack([log[name] for log in logs]).mean() for name in logs[0]}
+    means = {}
+    for name in logs[0]:
+      values = torch.stack([log[name] for log in logs])
+      means[name] = (
+        values.nanmean() if name == "Policy/explained_variance" else values.mean()
+      )
+    return means
 
   def _validate_noises(self, starts, process_noise, measurement_noise):
     if len(starts) < 1:

@@ -374,7 +374,12 @@ class BeliefModelTraining:
         last["trained_model_version"] != state["learner"]["model_version"]
         or last["optimizer_steps"] != state["learner"]["steps"]
         or last["collected_frames"] != state["collected_frames"]
-        or (completed is not None and last != completed)
+        # Older EIT rows wrote NaN for undefined explained variance. Compare
+        # their serialized values so a faithfully restored NaN matches itself.
+        or (
+          completed is not None
+          and json.dumps(last, sort_keys=True) != json.dumps(completed, sort_keys=True)
+        )
         or partial
       ):
         raise ValueError("Metrics history disagrees with the current checkpoint")
