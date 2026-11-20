@@ -1,6 +1,6 @@
 """Online belief lifecycle, reset causality, transactions and restoration."""
 
-from dataclasses import replace
+from dataclasses import fields, replace
 
 import pytest
 import torch
@@ -45,6 +45,14 @@ def assert_same_belief(actual, expected):
   torch.testing.assert_close(
     actual.covariance, expected.covariance, atol=1e-12, rtol=1e-10
   )
+
+
+def assert_detached_state(state):
+  values = [getattr(state.belief.mean, f.name) for f in fields(LieState)]
+  for value in (*values, state.belief.covariance, state.context):
+    assert not value.requires_grad
+    assert value.grad_fn is None
+    assert not torch.is_inference(value)
 
 
 def advance(provider, measurement, action, context, reset):
@@ -185,6 +193,81 @@ def test_differentiable_provider_preserves_action_gradient_across_commits():
   gradient = torch.autograd.grad(objective, action)[0]
   assert torch.isfinite(gradient).all()
   assert gradient.abs().sum() > 0
+
+
+@pytest.mark.parametrize("mode", [torch.no_grad, torch.inference_mode])
+def test_differentiable_provider_respects_disabled_grad_modes_and_can_resume(mode):
+  provider, _, measurement, action, context = setup_provider(differentiable=True)
+  measurement.requires_grad_()
+  action.requires_grad_()
+  context.requires_grad_()
+  advance(provider, measurement, action, context, [True] * 3)
+  advance(provider, measurement, action, context, [False] * 3)
+  assert provider.state.belief.covariance.grad_fn is not None
+
+  reference = BeliefProvider(provider.estimator, provider.prior_factory)
+  reference.restore(
+    provider.state.belief,
+    context,
+    model_version=provider.model_version,
+    episode_id=provider.state.episode_id,
+    time_index=provider.state.time_index,
+  )
+  with mode():
+    for reset in ([False] * 3, [False, True, False], [False] * 3):
+      # Inference-mode inputs still need ordinary clones for the local Jacobian.
+      inputs = measurement.clone(), action.clone(), context.clone()
+      advance(provider, *inputs, reset)
+      advance(reference, *inputs, reset)
+      assert_detached_state(provider.state)
+      assert_same_belief(provider.state.belief, reference.state.belief)
+
+  assert torch.is_grad_enabled()
+  assert provider.differentiable
+  assert all(p.requires_grad for p in provider.estimator.dynamics.parameters())
+  resumed_action = action.detach().clone().requires_grad_()
+  advance(provider, measurement.detach(), resumed_action, context.detach(), [False] * 3)
+  objective = (
+    provider.state.belief.mean.position.square().sum()
+    + provider.state.belief.covariance.square().sum()
+  )
+  (gradient,) = torch.autograd.grad(objective, resumed_action)
+  assert torch.isfinite(gradient).all() and gradient.norm() > 0
+
+
+@pytest.mark.parametrize(
+  "mode, tracks_grad",
+  [(torch.enable_grad, True), (torch.no_grad, False), (torch.inference_mode, False)],
+)
+def test_differentiable_restore_respects_caller_grad_mode(mode, tracks_grad):
+  source, _, measurement, action, context = setup_provider(batch=1, differentiable=True)
+  action.requires_grad_()
+  context.requires_grad_()
+  advance(source, measurement, action, context, [True])
+  advance(source, measurement, action, context, [False])
+  saved = source.state
+  restored = BeliefProvider(source.estimator, differentiable=True)
+  with mode():
+    candidate = restored.prepare_restore(
+      saved.belief,
+      saved.context,
+      model_version=saved.model_version,
+      episode_id=saved.episode_id,
+      time_index=saved.time_index,
+    )
+  assert restored.state is None
+  restored.commit(candidate)
+  assert_same_belief(restored.state.belief, saved.belief)
+  if tracks_grad:
+    objective = (
+      restored.state.belief.mean.position.square().sum()
+      + restored.state.belief.covariance.square().sum()
+      + restored.state.context.square().sum()
+    )
+    for gradient in torch.autograd.grad(objective, (action, context)):
+      assert torch.isfinite(gradient).all() and gradient.norm() > 0
+  else:
+    assert_detached_state(restored.state)
 
 
 def test_fused_optimizer_invalidates_posterior_and_checkpoint_roundtrips():

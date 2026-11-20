@@ -1,6 +1,6 @@
 """Transactional adapters and fixed-noise policy gradients through full belief."""
 
-from dataclasses import asdict, replace
+from dataclasses import asdict, fields, replace
 from unittest.mock import Mock
 
 import pytest
@@ -71,6 +71,33 @@ def test_reset_requires_full_versioned_posterior_without_refusing_measurement():
     )
   with pytest.raises(ValueError, match="full restore"):
     env.step(torch.zeros(BATCH, 29), posterior=belief.to_actor_input())
+
+
+def test_no_grad_imagination_does_not_retain_posterior_graphs():
+  env, _, _ = setup_env()
+  # eval() leaves model parameters differentiable, as in ordinary evaluation.
+  assert not env.dynamics.training
+  assert all(p.requires_grad for p in env.dynamics.parameters())
+  with torch.no_grad():
+    env.reset(episode_id=torch.arange(BATCH), segment_time=0)
+    for _ in range(8):
+      obs, reward, termination, _ = env.step(
+        torch.zeros(BATCH, 29),
+        process_noise=torch.zeros(BATCH, 70),
+        measurement_noise=torch.zeros(BATCH, 64),
+      )
+      state = env.posterior_provider.state
+      values = [getattr(state.belief.mean, f.name) for f in fields(LieState)]
+      for value in (
+        *values,
+        state.belief.covariance,
+        state.context,
+        *obs.values(),
+        reward,
+        termination,
+      ):
+        assert not value.requires_grad
+        assert value.grad_fn is None
 
 
 def test_failed_imagined_validation_reuses_latent_transition_and_measurement(

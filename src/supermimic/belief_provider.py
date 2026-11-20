@@ -157,8 +157,11 @@ class BeliefProvider:
 
     Real collection runs in inference mode. Local Jacobians still need AD;
     clones made inside inference_mode(False) are ordinary autograd tensors.
+    Outer gradients are retained only when enabled by both provider and caller.
     """
-    with torch.inference_mode(False), torch.set_grad_enabled(self.differentiable):
+    # Capture the caller's mode before inference_mode(False) can enable gradients.
+    track_grad = self.differentiable and torch.is_grad_enabled()
+    with torch.inference_mode(False), torch.set_grad_enabled(track_grad):
       measurement = self._ordinary(measurement)
       previous_action = self._ordinary(previous_action)
       reset_mask = reset_mask.clone()
@@ -277,7 +280,7 @@ class BeliefProvider:
         covariance = covariance.index_copy(0, ids, piece.covariance)
       belief = BeliefState(LieState(**fields), covariance)
       belief.validate()
-      if not self.differentiable:
+      if not track_grad:
         belief, context = belief.detach(), context.detach()
       summary = {
         "innovation_norm": measurement.new_zeros(batch),
@@ -311,10 +314,12 @@ class BeliefProvider:
 
     To record restored frame-zero rows, also pass their realized priors in
     batch-row order as (episode_ids, prior_before_observation).
+    The restored tensors follow the same caller gradient mode as prepare().
     """
     if not isinstance(belief, BeliefState):
       raise TypeError("Restore requires a complete BeliefState, not an RPV view")
-    with torch.inference_mode(False), torch.set_grad_enabled(self.differentiable):
+    track_grad = self.differentiable and torch.is_grad_enabled()
+    with torch.inference_mode(False), torch.set_grad_enabled(track_grad):
       if model_version != self.model_version:
         raise ValueError(
           "Cannot restore belief from a different model/normalization version"

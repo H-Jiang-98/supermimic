@@ -542,6 +542,11 @@ provider 与环境状态之前。文件路径和设备不参与指纹；数据�
 构建后验或目标失败时，重试可省略噪声以复用同次采样和计算图。再次传入带梯度的动作或噪声时须使用原张量。
 若需放弃想象候选或更换动作，显式 reset。真实首帧候选失败时复用同一先验。物理步完成后若测量或 replay 写入失败，下次 `runner.step()` 继续提交已经执行的动作与结果。
 
+provider 的 `prepare()` 和 `prepare_restore()` 仅在 `differentiable=True` 且调用方开启梯度时保留外层计算图。
+使用 `torch.no_grad()` 评估想象序列时，提交的后验和 context 均不带图；局部 Jacobian 仍正常计算。
+provider 也尊重调用方的 `inference_mode()`，在内部转换为普通张量后求局部导数。
+从评估切回可微调用后，动作与模型梯度继续正常传播。
+
 `Dynamics.model_version` 在 provider 校验时根据当前权重、归一化和过程配置计算内容指纹，
 因此 fused Adam 更新后，恢复、推进及查询旧后验都会触发版本检查。真实 provider 默认使用
 `freeze_estimator_normalization=True` 固定本阶段采集的模型和 actor 归一化
