@@ -455,7 +455,8 @@ provider 自身的状态更新及其调用前的噪声采样不在环境回滚�
 输入阶段可运行采集和短序列计算图验证，`run()` / policy learner `update()` 明确拒绝
 完整策略训练。第二步接入真实滤波器，第三步通过独立 `train_belief` 入口联合训练
 均值模型和噪声头；第四步通过 `train_eit` 接通 belief critic、策略优化和短程闭环评估。
-现有 play、viewer、benchmark 和 ONNX exporter 对新版本明确报错。
+play/viewer 已通过共享 EIT 适配层支持本地 `training.pt`，用法见
+[EIT 评估与播放](README_eval.md#eit-定量评估和播放)；benchmark 和 ONNX exporter 尚未适配。
 
 CPU 验收测试（无需完整 MuJoCo 闭环）：
 
@@ -692,13 +693,18 @@ OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.train_eit \
 OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.eval_eit \
   --checkpoint logs/eit-b/training.pt \
   --motion-file data/motions/walk1_subject1.npz --device cuda:0 \
-  --num-envs 8 --steps 500
+  --num-envs 8 --output logs/eit-b/evaluation.json
 ```
 
 `eit_training_v1` 保存模型、actor、critic、三个 optimizer、归一化和 RNG。
 恢复前在私有副本上校验全部组件。恢复后清空 replay 并重置真实环境；固定相同
 原始输入和噪声可以验证优化器续训一致，但不承诺恢复物理模拟轨迹。
-`eval_eit` 在独立进程中关闭动作探索，保留传感噪声及在线滤波，三组均使用后验均值。
+`eval_eit` 复用 mjlab tracking 的首 episode 评估循环和跟踪指标，从 clip 头开始，
+等待所有环境首个 episode 结束。它关闭动作探索，保留传感噪声及在线滤波，三组均使用
+后验均值。可用 `--steps` 限制 smoke 预算，未结束轨迹标记截断，成功率记为 null。
+兼容的新 motion 可直接用于评估，训练与评估指纹分别记录；续训校验保持严格。
+本地 playback 使用 `play --eit-checkpoint ... --motion-file ...`，详见
+[评估统计口径及 viewer 说明](README_eval.md#eit-定量评估和播放)。
 
 可复现两轮真实训练、固定输入恢复和独立评估验收：
 

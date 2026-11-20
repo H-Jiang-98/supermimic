@@ -1,0 +1,239 @@
+"""Evaluation/playback share the production measurement and posterior semantics."""
+
+from contextlib import contextmanager
+from copy import deepcopy
+from dataclasses import asdict, replace
+
+import pytest
+import torch
+
+from supermimic.models import ProcessNoiseConfig
+from supermimic.runners.eit_inference import (
+  EITPolicyAdapter,
+  evaluation_config,
+  load_evaluation_models,
+)
+from supermimic.runners.supermimic_runner import (
+  SuperMimicRunner,
+  SuperMimicRunnerCfg,
+  actor_checkpoint,
+)
+from supermimic.scripts.check_belief_training import stationary_motion
+from supermimic.scripts.train_utils import create_env
+from supermimic.tasks.env_cfgs import configure_estimator_env_cfg, gencoord_env_cfg
+
+
+@contextmanager
+def physical_runner(tmp_path, group="C"):
+  motion = tmp_path / "motion.npz"
+  stationary_motion(motion)
+  env_cfg = configure_estimator_env_cfg(gencoord_env_cfg())
+  env_cfg.commands["motion"].motion_file = str(motion)
+  env_cfg.commands["motion"].sampling_mode = "start"
+  cfg = SuperMimicRunnerCfg.for_estimator_inputs(
+    group,
+    dynamics_hidden_dims=(12,),
+    actor_hidden_dims=(12,),
+    critic_hidden_dims=(12,),
+    process_noise=ProcessNoiseConfig(hidden_dims=(8,)),
+    buffer_size=4,
+    sampling_mode="start",
+  )
+  cfg.estimator_inputs = replace(cfg.estimator_inputs, mode="eval")
+  cfg.policy.noise = 0.0
+  with torch.compiler.set_stance("force_eager"):
+    env = create_env(env_cfg, 2, "cpu")
+    try:
+      runner = SuperMimicRunner(env, cfg, "SuperMimic-GenCoord-G1", device="cpu")
+      runner.policy_learner.actor.eval()
+      runner.configure_belief_filter()
+      yield runner
+    finally:
+      env.close()
+
+
+def runner_action(runner, obs):
+  representation = runner._representation
+  inputs = runner._build_sim_obs_td(
+    representation.represent(obs["full_state"]),
+    representation.extract_aux_state(obs["full_state"]),
+    obs["actor"],
+    runner.motion_cmd.time_steps,
+    runner._sim_context.read(runner.env.unwrapped),
+  )
+  return inputs, runner.wm_env.limit_actions(runner.policy_learner.actor(inputs))
+
+
+@pytest.mark.parametrize("group", ["A", "B", "C"])
+def test_adapter_matches_collection_features_posterior_and_actions_across_reset(
+  tmp_path, group
+):
+  with physical_runner(tmp_path, group) as runner, torch.inference_mode():
+    actor = runner.policy_learner.actor
+    adapter = EITPolicyAdapter(runner.env, actor, runner._wm, runner.cfg)
+    before = deepcopy(actor.state_dict())
+    obs, _ = runner.env.reset()
+    rng = torch.random.get_rng_state()
+    runner._seed_sim_history()
+    expected_inputs, expected_actions = runner_action(runner, obs)
+    expected_rng = torch.random.get_rng_state()
+    torch.random.set_rng_state(rng)
+    adapter.reset(obs)
+    actions = adapter.act(obs)
+
+    for step in range(3):
+      assert torch.equal(torch.random.get_rng_state(), expected_rng)
+      assert torch.equal(actions, expected_actions)
+      assert adapter.last_inputs.keys() == expected_inputs.keys()
+      for key in expected_inputs.keys():
+        torch.testing.assert_close(
+          adapter.last_inputs[key], expected_inputs[key], atol=0, rtol=0
+        )
+      expected = runner.posterior_provider.state
+      actual = adapter.provider.state
+      torch.testing.assert_close(
+        actual.belief.mean.to_full(), expected.belief.mean.to_full(), atol=0, rtol=0
+      )
+      torch.testing.assert_close(
+        actual.belief.covariance, expected.belief.covariance, atol=0, rtol=0
+      )
+      assert not actual.belief.covariance.requires_grad
+      # Repeated UI requests at the same frame consume neither noise nor updates.
+      generation = adapter.provider.generation
+      assert torch.equal(adapter.act(obs), actions)
+      assert torch.equal(torch.random.get_rng_state(), expected_rng)
+      assert adapter.provider.generation == generation
+      if step == 2:
+        break
+      if step == 0:
+        base = runner.env.unwrapped
+        base.episode_length_buf[0] = base.max_episode_length - 1
+      obs, _, dones, _ = runner.env.step(actions)
+      if step == 0:
+        assert dones[0] and not dones[1]
+      rng = torch.random.get_rng_state()
+      runner._advance_sim_history(obs["actor"], dones)
+      expected_inputs, expected_actions = runner_action(runner, obs)
+      expected_rng = torch.random.get_rng_state()
+      torch.random.set_rng_state(rng)
+      adapter.advance(obs, dones)
+      if step == 0:
+        assert adapter.episode_id.tolist() == [2, 1]
+        assert adapter.time_index.tolist() == [0, 1]
+        assert torch.equal(
+          adapter.history[0], adapter.history[0, :1].expand_as(adapter.history[0])
+        )
+      actions = adapter.act(obs)
+    for key, value in before.items():
+      assert torch.equal(value, actor.state_dict()[key])
+
+
+def test_adapter_reset_does_not_reset_physics_and_rejects_skipped_frames(tmp_path):
+  with physical_runner(tmp_path) as runner, torch.no_grad():
+    adapter = EITPolicyAdapter(
+      runner.env, runner.policy_learner.actor, runner._wm, runner.cfg
+    )
+    obs, _ = runner.env.reset()
+    state = obs["full_state"].clone()
+    adapter.reset(obs)
+    assert torch.equal(runner.env.get_observations()["full_state"], state)
+    with pytest.raises(RuntimeError, match="act"):
+      adapter.advance(obs, torch.zeros(2, dtype=torch.bool))
+    actions = adapter.act()
+    next_obs, _, dones, _ = runner.env.step(actions)
+    with pytest.raises(ValueError, match="advance"):
+      adapter.act(next_obs)
+    adapter.advance(next_obs, dones)
+    with pytest.raises(RuntimeError, match="act"):
+      adapter.advance(next_obs, dones)
+    adapter.act()
+    generation = adapter.provider.generation
+    adapter.reset(next_obs)
+    assert adapter.provider.state is None and adapter.provider.generation > generation
+    assert torch.equal(
+      runner.env.get_observations()["full_state"], next_obs["full_state"]
+    )
+    adapter.act()
+    assert adapter.time_index.tolist() == [0, 0]
+
+
+def test_evaluation_loader_is_private_and_checks_estimator_contract(tmp_path):
+  with physical_runner(tmp_path, "B") as runner:
+    saved = {
+      "version": "eit_training_v1",
+      "runner_config": asdict(runner.cfg),
+      "world_model": deepcopy(runner._wm.bundle()),
+      "actor": deepcopy(actor_checkpoint(runner.policy_learner.actor, runner.cfg)),
+    }
+    saved["runner_config"]["wandb_run_path"] = "unused/source/run"
+    saved["runner_config"]["estimator_inputs"]["mode"] = "train"
+    saved["actor"]["input_config"]["mode"] = "train"
+    cfg = evaluation_config(saved)
+    assert cfg.estimator_inputs.mode == "eval" and cfg.policy.noise == 0
+    assert cfg.wandb_run_path is None
+    assert saved["runner_config"]["estimator_inputs"]["mode"] == "train"
+    wm, actor = load_evaluation_models(runner.env, cfg, saved, "cpu")
+    assert wm.dynamics.model_version == runner._dynamics.model_version
+    for name, tensor in runner.policy_learner.actor.state_dict().items():
+      assert torch.equal(actor.state_dict()[name], tensor)
+      assert actor.state_dict()[name].data_ptr() != tensor.data_ptr()
+    assert all(not p.requires_grad for p in actor.parameters())
+    assert all(not p.requires_grad for p in wm.dynamics.parameters())
+    malformed = deepcopy(saved)
+    prior = malformed["world_model"]["estimator"]["initial_prior"]
+    prior["std"] = tuple(2 * value for value in prior["std"])
+    with pytest.raises(ValueError, match="estimator settings"):
+      load_evaluation_models(runner.env, cfg, malformed, "cpu")
+
+
+def test_evaluation_config_rejects_model_only_resume():
+  with pytest.raises(ValueError, match="eit_training_v1"):
+    evaluation_config({"version": "belief_model_training_v2"})
+
+
+@pytest.mark.parametrize("reference_change", ["time", "alignment"])
+def test_reference_scrub_refreshes_goal_without_refusing_the_measurement(
+  tmp_path, reference_change
+):
+  with physical_runner(tmp_path) as runner, torch.no_grad():
+    adapter = EITPolicyAdapter(
+      runner.env, runner.policy_learner.actor, runner._wm, runner.cfg
+    )
+    obs, _ = runner.env.reset()
+    # Give this synthetic clip a distinct future frame so a time scrub changes
+    # the goal while the robot and its measured frame remain unchanged.
+    runner.motion.joint_pos[1] += 0.2
+    actions = adapter.act(obs)
+    inputs = adapter.last_inputs.clone()
+    belief = adapter.provider.state
+    generation = adapter.provider.generation
+    rng = torch.random.get_rng_state()
+    if reference_change == "time":
+      runner.motion_cmd.time_steps.add_(1)
+    else:
+      runner.motion_cmd.reference_alignment.translation[:, 0] += 0.3
+    changed = adapter.act(obs)
+    assert adapter.provider.state is belief
+    assert adapter.provider.generation == generation
+    assert torch.equal(torch.random.get_rng_state(), rng)
+    assert torch.equal(adapter.last_inputs["history"], inputs["history"])
+    assert not torch.equal(adapter.last_inputs["goal_motion"], inputs["goal_motion"])
+    assert not torch.equal(changed, actions)
+    assert torch.equal(adapter.act(obs), changed)
+    assert torch.equal(torch.random.get_rng_state(), rng)
+
+
+@pytest.mark.parametrize("change", ["model", "context"])
+def test_cached_action_rejects_changed_model_or_context(tmp_path, change, monkeypatch):
+  with physical_runner(tmp_path) as runner, torch.no_grad():
+    adapter = EITPolicyAdapter(
+      runner.env, runner.policy_learner.actor, runner._wm, runner.cfg
+    )
+    adapter.act()
+    if change == "model":
+      next(runner._dynamics.parameters()).add_(0.1)
+    else:
+      context = runner._sim_context.read(runner.env.unwrapped) + 0.1
+      monkeypatch.setattr(runner._sim_context, "read", lambda _: context)
+    with pytest.raises(ValueError, match="version or context"):
+      adapter.act()

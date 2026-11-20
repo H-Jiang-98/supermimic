@@ -21,6 +21,11 @@ from mjlab.tasks.tracking.mdp import MotionCommandCfg
 from mjlab.utils.torch import configure_torch_backends
 
 import supermimic.tasks  # noqa: F401
+from supermimic.runners.eit_inference import (
+  EITPolicyAdapter,
+  evaluation_config,
+  load_evaluation_models,
+)
 from supermimic.runners.run_config import check_representation_matches, load_runner_cfg
 from supermimic.runners.supermimic_runner import build_actor, build_world_model
 from supermimic.scripts.config_utils import config_args
@@ -29,6 +34,7 @@ from supermimic.scripts.viewers import (
   SuperMimicViserViewer,  # 提供网页显示
   create_wm_vis_model,  # 创建用于显示世界模型预测的模型副本
 )
+from supermimic.tasks.env_cfgs import configure_estimator_env_cfg
 from supermimic.utils.wandb_artifacts import (
   download_artifact_cached,
   download_model_dir,
@@ -55,7 +61,9 @@ class PlaySimulationConfig:
 @dataclass
 class PlayConfig:
   wandb_path: str = ""
-  """Required W&B run path: entity/project/run_id."""
+  """W&B run path: entity/project/run_id. Alternative to eit_checkpoint."""
+  eit_checkpoint: Path | None = None
+  """Local EIT training.pt. Requires motion_file; does not contact W&B."""
   config: Path | None = None
   """TOML settings file. Explicit command-line options override its values."""
   checkpoint: str = "latest"
@@ -109,22 +117,36 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   env_cfg.scene.num_envs = 1
   env_cfg.observations["actor"].enable_corruption = True
 
-  import wandb
-
-  print(f"[INFO] Connecting to WandB run: {cfg.wandb_path}")
-  run = wandb.Api().run(cfg.wandb_path)
-  runner_cfg = load_runner_cfg(run.config)  # 从训练记录中恢复配置
-  if getattr(runner_cfg, "estimator_inputs", None) is not None:
-    raise NotImplementedError(
-      "play has no online posterior provider for eit_rpv_v1; use the shared "
-      "input builder with an explicit evaluation posterior"
+  saved = None
+  if cfg.eit_checkpoint is not None:
+    if cfg.wandb_path.strip():
+      raise ValueError("Choose either wandb_path or eit_checkpoint")
+    if cfg.motion_file is None:
+      raise ValueError("eit_checkpoint playback requires motion_file")
+    if cfg.initial_task != "motion":
+      raise ValueError("EIT playback supports the motion task")
+    saved = torch.load(
+      cfg.eit_checkpoint.expanduser(), map_location=device, weights_only=True
     )
+    runner_cfg = evaluation_config(saved)
+    run_config = saved
+    motion_artifacts = []
+    configure_estimator_env_cfg(env_cfg)
+  else:
+    import wandb
+
+    print(f"[INFO] Connecting to WandB run: {cfg.wandb_path}")
+    run = wandb.Api().run(cfg.wandb_path)
+    run_config = run.config
+    runner_cfg = load_runner_cfg(run_config)
+    if getattr(runner_cfg, "estimator_inputs", None) is not None:
+      raise ValueError("Use --eit-checkpoint with an EIT training.pt for playback")
+    motion_artifacts = [a for a in run.used_artifacts() if a.type == "motions"]
   check_representation_matches(
     task_id, runner_cfg.representation
   )  # 检查任务与模型是否匹配
-  configure_play_simulation(env_cfg.sim, cfg.sim, run.config)
+  configure_play_simulation(env_cfg.sim, cfg.sim, run_config)
 
-  motion_artifacts = [a for a in run.used_artifacts() if a.type == "motions"]
   command_term = env_cfg.commands["motion"]
   assert isinstance(command_term, MotionCommandCfg)
   motion_names: list[str] = []
@@ -150,56 +172,52 @@ def play(task_id: str, cfg: PlayConfig) -> None:
     motion_names = [a.name.split(":")[0] for a in motion_artifacts]
     print(f"[INFO] Loaded {len(motion_files)} motion(s)")
 
-  model_dir = download_model_dir(run, checkpoint=cfg.checkpoint)
+  model_dir = (
+    download_model_dir(run, checkpoint=cfg.checkpoint) if saved is None else None
+  )
   env = RslRlVecEnvWrapper(ManagerBasedRlEnv(cfg=env_cfg, device=device))
+  try:
+    adapter = None
+    if saved is not None:
+      wm, actor = load_evaluation_models(env, runner_cfg, saved, device)
+      adapter = EITPolicyAdapter(env, actor, wm, runner_cfg)
+    else:
+      assert model_dir is not None
+      wm = build_world_model(runner_cfg, env, device)
+      wm.load_bundle(torch.load(model_dir / "world_model.pt", map_location=device))
+      wm.dynamics.eval()
+      actor = build_actor(runner_cfg, wm, device)
+      actor.load_state_dict(torch.load(model_dir / "actor.pt", map_location=device))
+      actor.eval()
 
-  wm = build_world_model(runner_cfg, env, device)
-  representation = wm.representation
-  dynamics = wm.dynamics
-  # bundle["dynamics"] 动力学网络参数， bundle["sim_context"] 仿真上下文
-  wm.load_bundle(torch.load(model_dir / "world_model.pt", map_location=device))
-  dynamics.eval()
+    wm_vis_model = create_wm_vis_model(env.unwrapped.sim.mj_model)
+    if cfg.viewer == "auto":
+      has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+      resolved = "native" if has_display else "viser"
+    else:
+      resolved = cfg.viewer
+    print(f"[INFO] Starting viewer: {resolved}")
+    if adapter is not None:
+      print("[INFO] EIT ghost: online posterior mean; num_steps_rollout is unused")
 
-  actor = build_actor(runner_cfg, wm, device)
-  actor.load_state_dict(torch.load(model_dir / "actor.pt", map_location=device))
-  actor.eval()
-
-  wm_vis_model = create_wm_vis_model(env.unwrapped.sim.mj_model)
-
-  if cfg.viewer == "auto":
-    has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
-    resolved = "native" if has_display else "viser"
-  else:
-    resolved = cfg.viewer
-  print(f"[INFO] Starting viewer: {resolved}")
-
-  if resolved == "native":
-    SuperMimicNativeViewer(
+    options = dict(
       env=env,
       actor=actor,
-      dynamics=dynamics,
-      representation=representation,
+      dynamics=wm.dynamics,
+      representation=wm.representation,
       wm_vis_model=wm_vis_model,
       num_steps_rollout=cfg.num_steps_rollout,
       sim_context=wm.sim_context,
       task_specs=actor.task_specs,
       initial_task=cfg.initial_task,
-    ).run()
-  else:
-    SuperMimicViserViewer(
-      env=env,
-      actor=actor,
-      dynamics=dynamics,
-      representation=representation,
-      wm_vis_model=wm_vis_model,
-      num_steps_rollout=cfg.num_steps_rollout,
-      motion_names=motion_names,
-      sim_context=wm.sim_context,
-      task_specs=actor.task_specs,
-      initial_task=cfg.initial_task,
-    ).run()
-
-  env.close()
+      eit_adapter=adapter,
+    )
+    if resolved == "native":
+      SuperMimicNativeViewer(**options).run()
+    else:
+      SuperMimicViserViewer(**options, motion_names=motion_names).run()
+  finally:
+    env.close()
 
 
 def parse_play_args(argv: list[str] | None = None) -> tuple[str, PlayConfig]:
@@ -234,8 +252,17 @@ def parse_play_args(argv: list[str] | None = None) -> tuple[str, PlayConfig]:
   args = tyro.cli(
     PlayConfig, args=remaining_args, default=defaults, config=mjlab.TYRO_FLAGS
   )
-  if not args.wandb_path.strip():
-    config_parser.error("Set wandb_path in the config file or pass --wandb-path")
+  if not args.wandb_path.strip() and args.eit_checkpoint is None:
+    config_parser.error(
+      "Set wandb_path or pass --eit-checkpoint with a local training.pt"
+    )
+  if args.eit_checkpoint is not None:
+    if args.wandb_path.strip():
+      config_parser.error("Choose either wandb_path or eit_checkpoint")
+    if not args.motion_file:
+      config_parser.error("eit_checkpoint playback requires motion_file")
+    if args.initial_task != "motion":
+      config_parser.error("EIT playback supports the motion task")
   if not args.checkpoint.strip():
     config_parser.error("checkpoint must be a version (e.g. v32) or alias (latest)")
   for name, value in (

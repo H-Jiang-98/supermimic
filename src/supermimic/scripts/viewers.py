@@ -7,6 +7,7 @@ predictions as ghost entities on top of the ground-truth simulation.
 from __future__ import annotations
 
 import copy
+from typing import TYPE_CHECKING
 
 import mujoco
 import numpy as np
@@ -28,6 +29,9 @@ from supermimic.tasks.task_spec import (
 )
 from supermimic.utils.ghost_model import set_ghost_body_poses
 
+if TYPE_CHECKING:
+  from supermimic.runners.eit_inference import EITPolicyAdapter
+
 
 def create_wm_vis_model(base_model: mujoco.MjModel) -> mujoco.MjModel:
   model = copy.deepcopy(base_model)
@@ -45,9 +49,21 @@ class SuperMimicViewerMixin:
     sim_context: SimContext,
     task_specs: list[TaskSpec],
     initial_task: str = "motion",
+    eit_adapter: EITPolicyAdapter | None = None,
   ) -> None:
-    if getattr(self.policy, "input_version", "legacy") != "legacy":
+    if (
+      getattr(self.policy, "input_version", "legacy") != "legacy"
+      and eit_adapter is None
+    ):
       raise NotImplementedError("Viewer requires an eit_rpv_v1 posterior adapter")
+    if eit_adapter is not None and (
+      eit_adapter.actor is not self.policy or eit_adapter.env is not self.env
+    ):
+      raise ValueError("EIT viewer adapter must own this actor and environment")
+    self.eit_adapter = eit_adapter
+    self._ghost_label = (
+      "online_posterior" if eit_adapter is not None else "wm_prediction"
+    )
     self.dynamics = dynamics
     self.representation = representation
     self.num_steps_rollout = num_steps_rollout
@@ -192,7 +208,7 @@ class SuperMimicViewerMixin:
             qpos,
             model=self.wm_vis_model,
             alpha=0.8,
-            label="wm_prediction",
+            label=self._ghost_label,
           )
       else:
         if self.wm_vis_qpos is not None:
@@ -202,7 +218,7 @@ class SuperMimicViewerMixin:
             mocap_pos=self.wm_vis_mocap_pos,
             mocap_quat=self.wm_vis_mocap_quat,
             alpha=0.8,
-            label="wm_prediction",
+            label=self._ghost_label,
           )
 
     base_env.update_visualizers = combined_vis_callback
@@ -228,6 +244,8 @@ class SuperMimicViewerMixin:
 
     try:
       with torch.no_grad():
+        if self.eit_adapter is not None:
+          return self._step_eit()
         obs = self.env.get_observations()
         curr_gt_states, curr_goals = obs["full_state"], obs["goal"]
 
@@ -303,33 +321,7 @@ class SuperMimicViewerMixin:
         full_state = self.representation.reconstruct_full_state(
           self.curr_wm_aux, self.curr_pred_rep_state
         )
-        state = full_state[0]  # Take 0-th env
-
-        if isinstance(self.representation, MaxCoordRepresentation):
-          B = self.representation.num_bodies
-          self.wm_vis_xpos = state[: B * 3].reshape(B, 3).cpu().numpy()
-          self.wm_vis_xquat = state[B * 3 : B * 7].reshape(B, 4).cpu().numpy()
-        else:
-          nq = self.env.unwrapped.sim.mj_model.nq
-          qpos = np.zeros(nq)
-          root_pos = state[:3]
-          root_quat = state[3:7]
-          if self.free_joint_q_adr is not None:
-            qpos[self.free_joint_q_adr[0:3]] = root_pos.cpu().numpy()
-            qpos[self.free_joint_q_adr[3:7]] = root_quat.cpu().numpy()
-            self.wm_vis_mocap_pos = None
-            self.wm_vis_mocap_quat = None
-            joint_state_start = 7
-          else:
-            # Fixed-base models may still need mocap pose for ghost visualization.
-            self.wm_vis_mocap_pos = root_pos.cpu().numpy()
-            self.wm_vis_mocap_quat = root_quat.cpu().numpy()
-            joint_state_start = 0
-          joint_state = state[
-            joint_state_start : joint_state_start + len(self.joint_q_adr)
-          ]
-          qpos[self.joint_q_adr] = joint_state.cpu().numpy()
-          self.wm_vis_qpos = qpos
+        self._set_ghost_state(full_state[0])
 
         self.step_in_rollout += 1
         if dones.any() or self.step_in_rollout >= self.num_steps_rollout:
@@ -341,6 +333,50 @@ class SuperMimicViewerMixin:
       self._last_error = f"{type(exc).__name__}: {exc}"
       self.pause()
       return False
+
+  def _step_eit(self) -> bool:
+    """Use the shared online policy; display its current posterior as the ghost.
+
+    This branch does not run a second imagined policy or reset the online filter
+    when the legacy world-model visualization horizon expires.
+    """
+    adapter = self.eit_adapter
+    assert adapter is not None
+    actions = adapter.act(self.env.get_observations())
+    obs, _, dones, _ = self.env.step(actions)
+    self._step_count += 1
+    self._stats_steps += 1
+    adapter.advance(obs, dones)
+    # Correct the post-step (or auto-reset) frame before drawing. act() is keyed
+    # and cached, so the next physical step consumes this same measurement/Q.
+    adapter.act(obs)
+    assert adapter.provider.state is not None
+    self._set_ghost_state(adapter.provider.state.belief.mean.to_full()[0])
+    return True
+
+  def _set_ghost_state(self, state: torch.Tensor) -> None:
+    """Map one full state to the existing native/Viser ghost representation."""
+    if isinstance(self.representation, MaxCoordRepresentation):
+      B = self.representation.num_bodies
+      self.wm_vis_xpos = state[: B * 3].reshape(B, 3).cpu().numpy()
+      self.wm_vis_xquat = state[B * 3 : B * 7].reshape(B, 4).cpu().numpy()
+      return
+    nq = self.env.unwrapped.sim.mj_model.nq
+    qpos = np.zeros(nq)
+    root_pos, root_quat = state[:3], state[3:7]
+    if self.free_joint_q_adr is not None:
+      qpos[self.free_joint_q_adr[0:3]] = root_pos.cpu().numpy()
+      qpos[self.free_joint_q_adr[3:7]] = root_quat.cpu().numpy()
+      self.wm_vis_mocap_pos = None
+      self.wm_vis_mocap_quat = None
+      joint_state_start = 7
+    else:
+      self.wm_vis_mocap_pos = root_pos.cpu().numpy()
+      self.wm_vis_mocap_quat = root_quat.cpu().numpy()
+      joint_state_start = 0
+    joint_state = state[joint_state_start : joint_state_start + len(self.joint_q_adr)]
+    qpos[self.joint_q_adr] = joint_state.cpu().numpy()
+    self.wm_vis_qpos = qpos
 
 
 class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
@@ -355,6 +391,7 @@ class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
     sim_context: SimContext,
     task_specs: list[TaskSpec],
     initial_task: str = "motion",
+    eit_adapter: EITPolicyAdapter | None = None,
     **kwargs,
   ):
     super().__init__(env, actor, **kwargs)
@@ -365,12 +402,15 @@ class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
       sim_context,
       task_specs,
       initial_task,
+      eit_adapter,
     )
     self.setup_wm_visualizer(wm_vis_model)
 
   def reset_environment(self) -> None:
     super().reset_environment()
     self.reset_wm_visualizer()
+    if self.eit_adapter is not None:
+      self.eit_adapter.reset(self.env.get_observations())
 
 
 class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
@@ -386,6 +426,7 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
     sim_context: SimContext,
     task_specs: list[TaskSpec],
     initial_task: str = "motion",
+    eit_adapter: EITPolicyAdapter | None = None,
     **kwargs,
   ):
     super().__init__(env, actor, **kwargs)
@@ -396,6 +437,7 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
       sim_context,
       task_specs,
       initial_task,
+      eit_adapter,
     )
     self.setup_wm_visualizer(wm_vis_model, update_every_n_frames=2)
     self.motion_names = motion_names
@@ -479,6 +521,18 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
     if self._supports_clip_selection():
       with self._sim_lock:
         self._apply_selected_clip()
+    if self.eit_adapter is not None:
+      self.eit_adapter.reset(self.env.get_observations())
+
+  def _handle_gui_reset(self, all_envs: bool) -> None:
+    """Start Here bypasses reset_environment in the base Viser viewer."""
+    super()._handle_gui_reset(all_envs)
+    if self.eit_adapter is not None:
+      with self._sim_lock:
+        self.env.unwrapped.observation_manager.compute(update_history=True)
+        self.reset_wm_visualizer()
+        self.eit_adapter.reset(self.env.get_observations())
+      self._step_count = 0
 
   def _supports_clip_selection(self) -> bool:
     return bool(self.motion_names)
