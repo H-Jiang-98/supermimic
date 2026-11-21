@@ -12,6 +12,7 @@ import json
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -39,6 +40,9 @@ from supermimic.runners.supermimic_runner import (
   load_actor_checkpoint,
 )
 from supermimic.utils.profiling import PhaseTimer
+
+if TYPE_CHECKING:
+  from supermimic.utils.eit_wandb import EITOfflineWandb
 
 
 @dataclass(frozen=True)
@@ -297,7 +301,15 @@ class EITTraining(BeliefModelTraining):
     self.actor.eval().requires_grad_(True)
     self.policy.critic.eval().requires_grad_(True)
 
-  def run(self, rounds: int, output: Path, *, resume: Path | None = None):
+  def run(
+    self,
+    rounds: int,
+    output: Path,
+    *,
+    resume: Path | None = None,
+    snapshot_interval: int | None = None,
+    logger: EITOfflineWandb | None = None,
+  ):
     checkpoint = Path(output).resolve() / "training.pt"
     if resume is None and self._output_checkpoint == checkpoint and checkpoint.exists():
       saved = torch.load(checkpoint, map_location=self.runner.device, weights_only=True)
@@ -305,7 +317,9 @@ class EITTraining(BeliefModelTraining):
         self.policy.critic
       ) != saved.get("critic_version"):
         raise ValueError("Active actor/critic differs from output checkpoint")
-    return super().run(rounds, output, resume=resume)
+    return super().run(
+      rounds, output, resume=resume, snapshot_interval=snapshot_interval, logger=logger
+    )
 
   def initialization_bundle(self) -> dict:
     """Export explicit, independently allocated common A/B/C initial weights."""

@@ -10,6 +10,7 @@ import torch
 
 from supermimic.critic_inputs import CRITIC_INPUT_VERSION, CriticInputConfig
 from supermimic.estimator_inputs import EITInputConfig
+from supermimic.runners.eit_snapshots import checkpoint_snapshot_interval
 from supermimic.runners.supermimic_runner import SuperMimicRunnerCfg
 
 EIT_TRAINING_VERSION = "eit_training_v3"
@@ -20,6 +21,7 @@ def validate_eit_checkpoint_contract(saved: dict, *, stage: str | None = None) -
   """Validate the EIT format and the joint trainer's critic layout before loading."""
   if not isinstance(saved, dict) or saved.get("version") != EIT_TRAINING_VERSION:
     raise ValueError(f"Expected {EIT_TRAINING_VERSION} checkpoint")
+  checkpoint_snapshot_interval(saved)
   kind = saved.get("stage")
   if kind not in ("model", "policy") or (stage is not None and kind != stage):
     raise ValueError(f"Unexpected EIT training stage: {kind!r}")

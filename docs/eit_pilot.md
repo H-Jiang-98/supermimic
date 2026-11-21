@@ -6,6 +6,12 @@ buffer 128、10 × 2048 个 8 帧均值窗口、covariance batch 256/epoch 1，
 以及策略 N=4、K=2、H=4、microbatch=2、每轮一次 actor 更新和两次 critic 更新，
 均写入 `protocol.json`。已有目录的协议不一致时拒绝继续。
 
+pilot 显式传入 `--snapshot-interval 1`，保持第 0 轮及全部训练轮次的快照和逐轮验收。
+同时显式使用 `--wandb-mode disabled`，保持 pilot 耗时验收不包含 W&B 开销。
+直接使用 `train_eit` 新训练时，历史快照间隔默认改为 10，可用同名参数调整；
+最新 `training.pt` 仍每轮更新。历史 pilot 结果和原锁定预算文件保持原样，
+正式训练的新存储安排见 [PRO 6000 训练说明](train_eit_pro6000.md)。
+
 ```bash
 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.run_eit_pilot \
   --motion-file data/motions/walk1_subject1.npz \

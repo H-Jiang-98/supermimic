@@ -41,11 +41,19 @@ def _reference_path(reference: Path, output: Path, *inputs: Path | None) -> Path
     "metrics.jsonl",
     "profiling.jsonl",
     "profiling_recovery.json",
+    "wandb_run.json",
     ".belief-training.lock",
   )
   protected = {item.resolve() for item in inputs if item is not None}
   protected.update((output / name).resolve() for name in reserved)
-  if path in protected or path.is_relative_to(snapshots):
+  if (
+    path in protected
+    or path.is_relative_to(snapshots)
+    or any(
+      path.is_relative_to((output / name).resolve())
+      for name in ("wandb", "wandb-data", "wandb-cache")
+    )
+  ):
     raise ValueError(
       "--resume-reference must be separate from training inputs, logs and snapshots"
     )
@@ -83,6 +91,12 @@ def main():
   parser.add_argument("--seed", type=int, default=2026)
   parser.add_argument("--num-envs", type=int, default=8)
   parser.add_argument("--rounds", type=int, default=10)
+  parser.add_argument(
+    "--snapshot-interval",
+    type=int,
+    help="Publish historical snapshots every N cumulative rounds; 10 for new runs, "
+    "saved interval on resume (legacy: 1). training.pt is saved every round.",
+  )
   parser.add_argument("--collection-steps", type=int, default=64)
   parser.add_argument("--buffer-size", type=int, default=128)
   add_model_fit_args(parser)
@@ -100,9 +114,35 @@ def main():
   parser.add_argument("--critic-hidden-dims", type=int, nargs="+", default=[256, 128])
   parser.add_argument("--jacobian-batch-chunk-size", type=int)
   parser.add_argument("--jacobian-chunk-size", type=int)
+  logging = parser.add_argument_group("offline W&B logging")
+  logging.add_argument(
+    "--wandb-mode",
+    choices=("offline", "disabled"),
+    default=os.environ.get("WANDB_MODE", "offline"),
+    help="Offline logging only; defaults to WANDB_MODE or offline, never uploads",
+  )
+  logging.add_argument(
+    "--wandb-project", help="Default: saved W&B project or runner project"
+  )
+  logging.add_argument("--wandb-entity", help="Optional account/team for later sync")
+  logging.add_argument("--wandb-name", help="Default: eit-<group>-seed<seed>")
+  logging.add_argument(
+    "--wandb-group", help="Experiment group for comparing runs; default: eit"
+  )
+  logging.add_argument(
+    "--wandb-log-models",
+    action="store_true",
+    help="Also stage published snapshots as offline model artifacts (uses extra disk)",
+  )
   args = parser.parse_args()
+  if args.wandb_mode not in ("offline", "disabled"):
+    parser.error(
+      "EIT W&B mode must be offline or disabled; use --wandb-mode explicitly"
+    )
   if args.num_envs < 1 or args.rounds < 1:
     parser.error("num-envs and rounds must be positive")
+  if args.snapshot_interval is not None and args.snapshot_interval < 1:
+    parser.error("snapshot-interval must be positive")
   if args.resume and args.initialization:
     parser.error("resume and initialization are mutually exclusive")
   if args.prepare_initialization and not args.initialization:
@@ -237,7 +277,27 @@ def main():
           )
         print(f"EIT_INITIALIZATION {training.initialization_digest} {initialization}")
         return
-    training.run(args.rounds, args.output, resume=args.resume)
+    interval = args.snapshot_interval
+    if interval is None and args.resume is None:
+      interval = 10
+    logger = None
+    if args.wandb_mode == "offline":
+      from supermimic.utils.eit_wandb import EITOfflineWandb
+
+      logger = EITOfflineWandb(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=args.wandb_name,
+        group=args.wandb_group,
+        log_models=args.wandb_log_models,
+      )
+    training.run(
+      args.rounds,
+      args.output,
+      resume=args.resume,
+      snapshot_interval=interval,
+      logger=logger,
+    )
   finally:
     env.close()
 

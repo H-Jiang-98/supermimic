@@ -63,7 +63,7 @@ EIT viewer 的蓝紫色半透明模型标为 `online_posterior`，显示当前�
 
 ## 共同初始化、快照与批量选模
 
-下面的命令在 CPU 上运行一个 40 个实采帧的小网络验收。先用 B 组和固定配置生成初始化包，然后用相同参数启动各组。每个输出目录的 `snapshots/index.json` 记录候选摘要、实际更新步数和共同初始化指纹。第 0 轮也有独立快照。
+下面的命令在 CPU 上运行一个 40 个实采帧的小网络验收。先用 B 组和固定配置生成初始化包，然后用相同参数启动各组。每个输出目录的 `snapshots/index.json` 记录候选摘要、实际更新步数和共同初始化指纹。第 0 轮也有独立快照。本例显式使用 `--snapshot-interval 1` 保留第 1 轮；新训练默认间隔为 10，最新 `training.pt` 仍每轮更新。
 
 ```bash
 PY=.venv/bin/python
@@ -72,6 +72,7 @@ motion=data/motions/walk1_subject1.npz
 shared=logs/step5/shared_364.pt
 args=(--motion-file "$motion" --device cpu --seed 364 --num-envs 5
       --collection-steps 8 --buffer-size 7 --rounds 1
+      --snapshot-interval 1 --wandb-mode disabled
       --mean-window-frames 3 --mean-updates 1 --mean-batch-size 4 --cov-batch-size 8
       --policy-batch-size 1 --samples 1 --policy-horizon 2 --policy-microbatch-size 1
       --critic-epochs 1 --hidden-dims 24 16 --actor-hidden-dims 16 --critic-hidden-dims 16)

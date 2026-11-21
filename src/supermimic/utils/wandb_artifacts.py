@@ -68,8 +68,14 @@ def _version_index(artifact: Any) -> int:
 
 
 def log_model_artifact(
-  files: list[str], keep_last: int = 5, milestone_every: int = 25
-) -> None:
+  files: list[str],
+  keep_last: int = 5,
+  milestone_every: int = 25,
+  *,
+  run: Any | None = None,
+  metadata: dict | None = None,
+  aliases: list[str] | None = None,
+) -> bool:
   """Log ``files`` as a new version of the run's ``model`` checkpoint artifact.
 
   Named ``model-{run.id}``: artifact names are project-level keys and run names
@@ -78,21 +84,23 @@ def log_model_artifact(
   Disabled runs keep only the caller's local checkpoints. Offline runs queue
   artifacts for later sync, without querying or pruning the online registry.
   """
-  run = wandb.run
+  run = run if run is not None else wandb.run
   assert run is not None, "log_model_artifact needs an active wandb run"
   if run.disabled:
-    return
+    return False
   try:
-    artifact = wandb.Artifact(f"model-{run.id}", type="model")
+    artifact = wandb.Artifact(f"model-{run.id}", type="model", metadata=metadata)
     for path in files:
       artifact.add_file(path)
-    run.log_artifact(artifact)
+    run.log_artifact(artifact, aliases=aliases)
     if run.offline:
-      return
+      return True
     collection = f"{run.entity}/{run.project}/model-{run.id}"
     versions = sorted(wandb.Api().artifacts("model", collection), key=_version_index)
     for stale in versions[:-keep_last]:
       if _version_index(stale) % milestone_every != 0 and not stale.aliases:
         stale.delete()
+    return True
   except Exception as e:  # wandb failures must never kill training
     print(f"[WARN] Checkpoint artifact log/prune failed: {type(e).__name__}: {e}")
+    return False

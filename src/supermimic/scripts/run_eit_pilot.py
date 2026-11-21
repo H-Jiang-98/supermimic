@@ -91,6 +91,8 @@ def resume_result_matches(
 
 def checkpoint_progress(saved, p, group):
   validate_eit_checkpoint_contract(saved, stage="policy")
+  if saved.get("snapshot_interval", 1) != 1:
+    raise ValueError("Pilot requires a snapshot every round")
   if (
     saved["runner_config"]["estimator_inputs"]["group"] != group
     or saved.get("training_seed") != p["training_seed"]
@@ -174,6 +176,10 @@ def training_arguments(p):
     "64",
     "--buffer-size",
     "128",
+    "--snapshot-interval",
+    "1",
+    "--wandb-mode",
+    "disabled",
     "--mean-updates",
     "10",
     "--mean-batch-size",

@@ -11,12 +11,13 @@ import hashlib
 import json
 import os
 from collections.abc import Callable
+from contextlib import ExitStack
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from shutil import copyfileobj
 from tempfile import NamedTemporaryFile
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 from filelock import FileLock
@@ -24,7 +25,11 @@ from filelock import FileLock
 from supermimic.learners.two_stage_wm import TwoStageWorldModelLearner
 from supermimic.models import MultiEncoderAE
 from supermimic.motion_loader import motion_content_digest
-from supermimic.runners.eit_snapshots import file_sha256, publish_snapshot
+from supermimic.runners.eit_snapshots import (
+  checkpoint_snapshot_interval,
+  file_sha256,
+  publish_snapshot,
+)
 from supermimic.runners.run_config import (
   EIT_TRAINING_VERSION,
   validate_eit_checkpoint_contract,
@@ -35,6 +40,9 @@ from supermimic.runners.supermimic_runner import (
   load_actor_checkpoint,
 )
 from supermimic.utils.profiling import PhaseTimer, runtime_metadata
+
+if TYPE_CHECKING:
+  from supermimic.utils.eit_wandb import EITOfflineWandb
 
 
 @dataclass(frozen=True)
@@ -81,6 +89,9 @@ class BeliefModelTraining:
       raise ValueError("Belief training needs at least two retained frames")
     self.runner = runner
     self.cfg = cfg or BeliefTrainingCfg()
+    # Storage policy, separate from learning configuration and initialization.
+    # The joint-training CLI selects 10 for new runs; older callers keep 1.
+    self.snapshot_interval = 1
     self.rounds = 0
     self.collected_frames = 0
     self.training_seed = getattr(getattr(runner.env, "cfg", None), "seed", None)
@@ -281,6 +292,7 @@ class BeliefModelTraining:
         "training_motion_files": self.training_motion_files,
         "training_seed": self.training_seed,
         "loop_config": asdict(self.cfg),
+        "snapshot_interval": self.snapshot_interval,
         "runner_config": asdict(runner.cfg),
         "world_model": runner._wm.bundle(),
         "actor": actor_checkpoint(self.actor, runner.cfg),
@@ -386,6 +398,7 @@ class BeliefModelTraining:
     self.learner.load_state_dict(state["learner"])
     load_actor_checkpoint(self.actor, runner.cfg, state["actor"])
     self.rounds, self.collected_frames = state["rounds"], state["collected_frames"]
+    self.snapshot_interval = checkpoint_snapshot_interval(state)
     # Older v3 checkpoints do not document the original collection seed/files.
     self.training_seed = state.get("training_seed")
     if not state.get("training_motion_files"):
@@ -560,9 +573,21 @@ class BeliefModelTraining:
         **profile,
       }
 
-  def run(self, rounds: int, output: Path, *, resume: Path | None = None) -> list[dict]:
+  def run(
+    self,
+    rounds: int,
+    output: Path,
+    *,
+    resume: Path | None = None,
+    snapshot_interval: int | None = None,
+    logger: EITOfflineWandb | None = None,
+  ) -> list[dict]:
     if type(rounds) is not int or rounds < 1:
       raise ValueError("rounds must be positive")
+    if snapshot_interval is not None and (
+      type(snapshot_interval) is not int or snapshot_interval < 1
+    ):
+      raise ValueError("Snapshot interval must be a positive integer")
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     checkpoint = output / "training.pt"
@@ -588,7 +613,7 @@ class BeliefModelTraining:
       return occupied
 
     check_destination()
-    with FileLock(lock_path, timeout=0):
+    with FileLock(lock_path, timeout=0), ExitStack() as observers:
       occupied = check_destination()
       if resume is not None or occupied:
         source = resume if resume is not None else checkpoint
@@ -617,9 +642,19 @@ class BeliefModelTraining:
             stream.write(missing)
         del state
       elif self.rounds == 0:
+        if snapshot_interval is not None:
+          self.snapshot_interval = snapshot_interval
         self.save(checkpoint)
         publish_snapshot(checkpoint)
+      # Reconcile the old checkpoint under its recorded policy first. Overrides
+      # apply only to newly committed rounds and never rewrite published bytes.
+      if snapshot_interval is not None:
+        self.snapshot_interval = snapshot_interval
       self._output_checkpoint = checkpoint
+      # Initialize observers only after committing/reconciling the checkpoint;
+      # their files must not make a fresh output directory appear occupied.
+      if logger is not None:
+        observers.enter_context(logger.track(self, output))
       logs = []
       for _ in range(rounds):
         metrics = self.run_round(checkpoint)
@@ -643,6 +678,8 @@ class BeliefModelTraining:
         with profile_path.open("a") as stream:
           stream.write(json.dumps(self.last_profile, sort_keys=True, allow_nan=False))
           stream.write("\n")
+        if logger is not None:
+          logger.log_round(metrics, self.last_profile)
         print("BELIEF_TRAINING " + row)
         logs.append(metrics)
       return logs

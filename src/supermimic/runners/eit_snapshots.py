@@ -17,10 +17,19 @@ def file_sha256(path: Path) -> str:
     return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def checkpoint_snapshot_interval(state: dict) -> int:
+  """Older checkpoints published every round; retain that policy on recovery."""
+  interval = state.get("snapshot_interval", 1)
+  if type(interval) is not int or interval < 1:
+    raise ValueError("Snapshot interval must be a positive integer")
+  return interval
+
+
 def publish_snapshot(checkpoint: Path, state: dict | None = None) -> None:
-  """Register bytes already committed to training.pt. Safe to repeat after a crash."""
+  """Publish scheduled rounds and repair existing publications after a crash."""
   if state is None:
     state = torch.load(checkpoint, map_location="cpu", mmap=True, weights_only=True)
+  interval = checkpoint_snapshot_interval(state)
   frames = state["collected_frames"]
   directory = checkpoint.parent / "snapshots"
   snapshot = directory / f"frames_{frames}.pt"
@@ -30,6 +39,18 @@ def publish_snapshot(checkpoint: Path, state: dict | None = None) -> None:
       "Snapshot publication requires local files in the training directory"
     )
   directory.mkdir(exist_ok=True)
+  registry = {"version": "eit_snapshots_v1", "snapshots": []}
+  if index.exists():
+    registry = json.loads(index.read_text())
+    if registry.get("version") != "eit_snapshots_v1":
+      raise ValueError("Unexpected snapshot index version")
+    if any(r["collected_frames"] > frames for r in registry["snapshots"]):
+      raise ValueError("Snapshot index is ahead of the current training checkpoint")
+  existing = [r for r in registry["snapshots"] if r["collected_frames"] == frames]
+  # Always check rollback/symlink guards, even when this round is not scheduled.
+  # An existing file or index entry still needs identity checks and repair.
+  if state["rounds"] % interval and not existing and not snapshot.exists():
+    return
   digest = file_sha256(checkpoint)
   learner = state["learner"]
   policy = state.get("policy", {})
@@ -50,14 +71,6 @@ def publish_snapshot(checkpoint: Path, state: dict | None = None) -> None:
     "group": state["runner_config"]["estimator_inputs"]["group"],
     "training_seed": state.get("training_seed"),
   }
-  registry = {"version": "eit_snapshots_v1", "snapshots": []}
-  if index.exists():
-    registry = json.loads(index.read_text())
-    if registry.get("version") != "eit_snapshots_v1":
-      raise ValueError("Unexpected snapshot index version")
-    if any(r["collected_frames"] > frames for r in registry["snapshots"]):
-      raise ValueError("Snapshot index is ahead of the current training checkpoint")
-  existing = [r for r in registry["snapshots"] if r["collected_frames"] == frames]
   if existing and existing != [row]:
     raise ValueError(f"Snapshot index conflict for {frames} collected frames")
   if snapshot.exists():

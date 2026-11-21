@@ -641,13 +641,28 @@ OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
   .venv/bin/python -m supermimic.scripts.train_eit \
   --motion-file data/motions/walk1_subject1.npz --device cuda:0 \
   --group B --output logs/eit-v3/B \
-  --num-envs 8 --rounds 10
+  --num-envs 8 --rounds 10 --wandb-mode offline
 ```
 
 默认 N=4、K=2、H=4、microbatch=2，每轮一次 actor 更新及两轮 critic 回归；
 两个训练入口接受相同的 `--mean-*` 和 `--cov-*` 参数，默认配置见第三步。
 `--policy-horizon`、`--samples`、`--policy-batch-size`、`--policy-microbatch-size`
 分别控制想象长度、噪声轨迹数、起点数与分块。更大规模应先测量完整训练显存。
+
+`train_eit` 每轮原子更新完整的 `training.pt`，用于断点续训；历史快照默认只保留
+第 0 轮及累计轮数为 10 的倍数的状态。用 `--snapshot-interval N` 调整历史快照间隔，
+单位为轮，N 必须为正整数；设为 1 恢复逐轮保存。结束轮数不是间隔倍数时，最新状态
+仍保存在 `training.pt`，不额外发布历史快照。此参数不使用原 `runner.save_interval`。
+恢复时省略该参数会沿用 checkpoint 中的间隔，旧 checkpoint 没有该字段时沿用 1；
+显式传入可改变后续保存间隔，已发布快照不删除。评估清单中的候选轮次必须有相应快照。
+三卡 A/B/C 的完整命令见 [PRO 6000 训练说明](docs/train_eit_pro6000.md)。
+
+EIT 默认启用离线 W&B；`WANDB_MODE=disabled` 或 `--wandb-mode disabled` 可关闭。
+每轮记录模型损失、策略/critic 指标、累计实采帧数、预算、耗时与显存，同时保存超参数。
+训练期间不登录或上传。续训沿用输出目录内的 run ID，生成新的离线片段；之后按训练
+顺序用 `wandb sync --append` 同步。默认只记录指标和配置；加 `--wandb-log-models`
+可将按间隔保存的快照作为模型附件暂存，复用原有 artifact 实现。
+参数、文件位置及同步命令见 [EIT 离线 W&B 说明](docs/eit_wandb.md)。
 
 恢复时配置和组别从 checkpoint 读取，`--rounds` 表示新增轮数：
 

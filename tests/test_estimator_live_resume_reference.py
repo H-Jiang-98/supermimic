@@ -149,7 +149,16 @@ def test_fixed_execution_restores_determinism_flags_after_failure():
 
 
 @pytest.mark.parametrize(
-  "relative", ["metrics.jsonl", ".belief-training.lock", "snapshots/frames_0.pt"]
+  "relative",
+  [
+    "metrics.jsonl",
+    ".belief-training.lock",
+    "snapshots/frames_0.pt",
+    "wandb_run.json",
+    "wandb/offline-run-example/run-example.wandb",
+    "wandb-data/artifacts/staging/model.pt",
+    "wandb-cache/model.pt",
+  ],
 )
 def test_reference_output_cannot_replace_training_artifacts(tmp_path, relative):
   from supermimic.scripts.train_eit import _reference_path

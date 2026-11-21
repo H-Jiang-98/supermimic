@@ -144,6 +144,7 @@ def _curve(frames, value):
 def _check_checkpoint_configuration(audit, state, p, label):
   runner = state.get("runner_config", {})
   expected = {
+    "snapshot_interval": (state.get("snapshot_interval", 1), 1),
     "num_envs": (state.get("num_envs"), p["num_envs"]),
     "buffer_size": (runner.get("buffer_size"), p["buffer_size"]),
     "sampling_mode": (runner.get("sampling_mode"), p["sampling_mode"]),
