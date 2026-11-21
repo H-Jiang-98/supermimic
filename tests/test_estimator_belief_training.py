@@ -10,9 +10,10 @@ import pytest
 import torch
 from tensordict import TensorDict
 
-from supermimic.learners.belief_wm_learner import (
-  BeliefWorldModelLearner,
-  BeliefWorldModelLearnerCfg,
+from supermimic.learners.two_stage_wm import (
+  CovarianceFitCfg,
+  MeanFitCfg,
+  TwoStageWorldModelLearner,
 )
 from supermimic.learners.wm_learner import WorldModelLearner
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
@@ -27,7 +28,7 @@ from supermimic.runners.supermimic_runner import (
 )
 from supermimic.utils.lie_state import LieState
 from tests.conftest import make_mock_motion
-from tests.test_estimator_belief_learner import fixture
+from tests.test_estimator_two_stage_wm import fixture
 
 
 class _RoundRunner(SuperMimicRunner):
@@ -47,12 +48,11 @@ class _RoundRunner(SuperMimicRunner):
     self.cfg = SuperMimicRunnerCfg.for_estimator_inputs(
       "B",
       process_noise=self._dynamics.process_noise_config,
-      dynamics_hidden_dims=(12,),
+      dynamics_hidden_dims=(12, 12),
       actor_hidden_dims=(12,),
       buffer_size=8,
-      belief_wm=BeliefWorldModelLearnerCfg(
-        batch_size=2, microbatch_size=2, num_batches=1, horizon=2
-      ),
+      mean=MeanFitCfg(batch_size=2, num_batches=1, window_frames=3),
+      cov=CovarianceFitCfg(batch_size=2),
     )
     self.device = "cpu"
     self.env = SimpleNamespace(num_envs=2)
@@ -62,7 +62,9 @@ class _RoundRunner(SuperMimicRunner):
     self._wm = WorldModel(
       self._representation, self._dynamics, torch.nn.Identity(), 700, 29
     )
-    self.world_model_learner = BeliefWorldModelLearner(estimator, self.cfg.belief_wm)
+    self.world_model_learner = TwoStageWorldModelLearner(
+      self._dynamics, self._representation, self.cfg.mean, self.cfg.cov, self.device
+    )
     self.policy_learner = InputStagePolicy(
       build_actor(self.cfg, self._wm, "cpu").double(), self.cfg.policy
     )
@@ -72,7 +74,7 @@ class _RoundRunner(SuperMimicRunner):
     self.wm_env = SimpleNamespace(replay_buffer=self.replay_buffer)
     self._pending_collection = None
     self._pending_norm_updates = []
-    self._episode_id = torch.tensor([-2, -1])
+    self._episode_id = None
     self.reset_count = 0
     self.collected = []
 
@@ -81,7 +83,11 @@ class _RoundRunner(SuperMimicRunner):
 
   def reset_collection(self):
     self.replay_buffer.truncate_open_episodes()
-    self._episode_id += 2
+    self._episode_id = (
+      torch.arange(self.env.num_envs)
+      if self._episode_id is None
+      else self._episode_id + self.env.num_envs
+    )
     self.index = 0
     self.previous = torch.zeros(2, 29, dtype=torch.float64)
     self.reset_count += 1
@@ -167,28 +173,8 @@ def test_round_with_only_new_validation_frames_still_optimizes_retained_training
   metrics = loop.run_round()
   assert metrics["training_episodes"] == [1]
   assert metrics["validation_episodes"] == [0, 5, 10]
-  assert metrics["optimizer_steps"] == 2
+  assert metrics["mean_steps"] == 2
   assert torch.equal(loop.learner.dynamics.state_normalizer.count, previous_count)
-
-
-def test_round_metrics_weight_ragged_updates_by_valid_transitions():
-  loop = training()
-  loop.learner.cfg = replace(loop.learner.cfg, num_batches=2)
-  updates = [
-    {
-      "valid_transitions": torch.tensor(count),
-      "Loss/posterior_nll": torch.tensor(nll),
-      "Grad/total_norm": torch.tensor(norm),
-    }
-    for count, nll, norm in ((2, 4.0, 1.0), (6, 8.0, 3.0))
-  ]
-  with patch.object(loop.learner, "update", side_effect=updates):
-    metrics = loop.run_round()["train"]
-  assert metrics == {
-    "valid_transitions": 8,
-    "Loss/posterior_nll": 7.0,
-    "Grad/total_norm": 2.0,
-  }
 
 
 def test_two_rounds_freeze_actor_exclude_validation_and_refresh_current_model():
@@ -196,17 +182,23 @@ def test_two_rounds_freeze_actor_exclude_validation_and_refresh_current_model():
   runner = loop.runner
   actor = deepcopy(runner.policy_learner.actor.state_dict())
   normalizer_inputs = []
-  original = loop.learner.update_normalization
+  original = loop.learner.stage_normalization
 
-  def normalize(states, actions):
+  def normalize(states, actions, staged=None):
     normalizer_inputs.append((states.clone(), actions.clone()))
-    original(states, actions)
+    return original(states, actions, staged)
 
-  with patch.object(loop.learner, "update_normalization", side_effect=normalize):
+  with patch.object(loop.learner, "stage_normalization", side_effect=normalize):
     first = loop.run_round()
     old = runner.collected[-1][2]
+    first_mean = deepcopy(runner._dynamics.mlp.state_dict())
     second = loop.run_round()
-  assert loop.rounds == loop.learner.steps == 2
+  assert any(
+    not torch.equal(v, first_mean[k])
+    for k, v in runner._dynamics.mlp.state_dict().items()
+  )
+  assert loop.rounds == loop.learner.mean_steps == 2
+  assert loop.learner.cov_steps == 5
   assert runner.reset_count == 3
   assert loop.collected_frames == 16
   assert first["collection_model_version"] != first["trained_model_version"]
@@ -249,7 +241,16 @@ def test_two_rounds_freeze_actor_exclude_validation_and_refresh_current_model():
 
 
 @pytest.mark.parametrize(
-  "component", ["dynamics", "actor", "optimizer", "filter", "prior", "measurement"]
+  "component",
+  [
+    "dynamics",
+    "actor",
+    "mean_optimizer",
+    "cov_optimizer",
+    "filter",
+    "prior",
+    "measurement",
+  ],
 )
 def test_malformed_checkpoint_does_not_partially_restore_any_live_component(component):
   source, target = training(31), training(91)
@@ -262,8 +263,12 @@ def test_malformed_checkpoint_does_not_partially_restore_any_live_component(comp
     )
   elif component == "actor":
     checkpoint["actor"]["actor"]["decoder.0.weight"][0, 0] = float("nan")
-  elif component == "optimizer":
-    checkpoint["learner"]["optimizer"]["state"][0]["exp_avg"] = torch.zeros(1)
+  elif component == "mean_optimizer":
+    checkpoint["learner"]["mean"]["optimizers"][0]["state"][0]["exp_avg"] = torch.zeros(
+      1
+    )
+  elif component == "cov_optimizer":
+    checkpoint["learner"]["cov"]["optimizer"]["state"][0]["exp_avg"] = torch.zeros(1)
   elif component == "filter":
     checkpoint["world_model"]["estimator"]["filter_config"]["jitter_initial"] *= 2
   elif component == "prior":
@@ -279,6 +284,17 @@ def test_malformed_checkpoint_does_not_partially_restore_any_live_component(comp
   assert target.runner.replay_buffer is replay
 
 
+def test_checkpoint_before_first_collection_restores_environment_count_and_episode_ids():
+  source, target = training(31), training(91)
+  state = source.state_dict()
+  assert state["num_envs"] == 2 and state["episode_id"] is None
+  target.run_round()
+  target.load_state_dict(state)
+  assert target.rounds == 0
+  assert target.runner._episode_id.tolist() == [0, 1]
+  assert target.run_round()["mean_steps"] == 1
+
+
 def test_saved_round_restores_optimizer_for_identical_next_input_and_fresh_collection(
   tmp_path,
 ):
@@ -290,10 +306,15 @@ def test_saved_round_restores_optimizer_for_identical_next_input_and_fresh_colle
   assert target.rounds == source.rounds == 1
   assert target.runner.replay_buffer.num_transitions == 0
   assert target.runner.posterior_provider.state is None
-  fixed = source.runner.replay_buffer.sample_belief_sequences(2, 2, episode_ids=[1])
-  expected = source.learner.update(fixed)
-  actual = target.learner.update(fixed)
-  assert_tree(actual, expected)
+  replay = source.runner.replay_buffer
+  windows = replay.model_windows(replay.model_window_starts([1], 3), 3)
+  pairs = replay.model_windows(replay.model_window_starts([1], 2), 2)
+  assert_tree(target.learner.update_mean(windows), source.learner.update_mean(windows))
+
+  def covariance_step(loop):
+    return loop.learner.update_covariance(loop.learner.residual_data(pairs))
+
+  assert_tree(covariance_step(target), covariance_step(source))
   assert_tree(
     target.runner._dynamics.state_dict(), source.runner._dynamics.state_dict()
   )
@@ -301,7 +322,7 @@ def test_saved_round_restores_optimizer_for_identical_next_input_and_fresh_colle
   assert not path.with_suffix(".pt.tmp").exists()
 
 
-def test_restore_rejects_changed_motion_and_legacy_without_modifying_runner():
+def test_restore_rejects_changed_motion_without_modifying_runner():
   source, target = training(31), training(91)
   source.run_round()
   state = source.state_dict()
@@ -310,10 +331,6 @@ def test_restore_rejects_changed_motion_and_legacy_without_modifying_runner():
   with pytest.raises(ValueError, match="motion content mismatch"):
     target.load_state_dict(state)
   assert target.runner._dynamics.model_version == before
-  state.pop("motion_digest")
-  state["version"] = "belief_model_training_v1"
-  with pytest.raises(ValueError, match="no verified motion identity"):
-    target.load_state_dict(state)
 
 
 def test_cpu_checkpoint_never_touches_cuda_generators():
@@ -328,7 +345,8 @@ def test_cpu_checkpoint_never_touches_cuda_generators():
     state = source.state_dict()
     assert state["rng_cuda"] is None
     target.load_state_dict(state)
-  assert target.learner.steps == source.learner.steps
+  assert target.learner.mean_steps == source.learner.mean_steps
+  assert target.learner.cov_steps == source.learner.cov_steps
 
 
 def test_resume_preserves_unrelated_output_and_rejects_stale_checkpoint(tmp_path):
@@ -391,59 +409,80 @@ def test_runner_dispatches_distinct_learner_data_contracts(stochastic):
   )
   with patch("supermimic.runners.supermimic_runner.build_world_model", return_value=wm):
     BaseRunner._init_common(runner)
-  expected = BeliefWorldModelLearner if stochastic else WorldModelLearner
+  expected = TwoStageWorldModelLearner if stochastic else WorldModelLearner
   assert isinstance(runner.world_model_learner, expected)
   if not stochastic:
     with pytest.raises(ValueError, match="estimator_inputs and process_noise"):
       BeliefModelTraining(runner)
 
 
-def test_explicit_bundle_migration_preserves_source_and_adopts_target_jacobian_config():
-  wm = _RoundRunner()._wm
-  current = deepcopy(wm.bundle())
-  legacy = deepcopy(current)
-  metadata = legacy["dynamics"]["metadata"]
-  metadata["format_version"] = "stochastic_dynamics_v1"
-  metadata["integration"].pop("version")
-  legacy["dynamics"]["model_version"] = wm.dynamics._content_digest(
-    metadata, legacy["dynamics"]["state_dict"]
+@pytest.mark.parametrize("steps", [9, 10])
+def test_model_normalization_streams_overwritten_frames_before_mean_fit(steps):
+  loop = training()
+  runner = loop.runner
+  loop.cfg = replace(loop.cfg, collection_steps=steps)
+  runner.template = torch.cat([runner.template] * 3)
+  runner.replay_buffer = ReplayBuffer(runner._schema, 3, 2)
+  runner.wm_env.replay_buffer = runner.replay_buffer
+  reference = deepcopy(runner._dynamics.normalizers())
+  with patch.object(
+    loop.learner, "stage_normalization", wraps=loop.learner.stage_normalization
+  ) as stage:
+    log = loop.run_round()
+  assert [len(call.args[0]) for call in stage.call_args_list] == [
+    min(3, steps - offset) for offset in range(0, steps, 3)
+  ]
+  assert all(
+    version == log["collection_model_version"] for version, _, _ in runner.collected
   )
-  legacy["estimator"]["filter_config"] = {
-    key: value
-    for key, value in legacy["estimator"]["filter_config"].items()
-    if not key.startswith("jacobian_")
-  }
-  untouched = deepcopy(legacy)
-  version_before = wm.dynamics.model_version
-  wm.filter_config = replace(
-    wm.filter_config, jacobian_chunk_size=7, jacobian_batch_chunk_size=1
+  # Only row 1 belongs to the training split; this reference sees every fresh
+  # frame at once, including those overwritten more than one ring cycle ago.
+  training_frames = torch.stack([frame[1] for _, frame, _ in runner.collected])
+  loop.learner.mean.update_normalization(
+    training_frames["state"], training_frames["action"], normalizers=reference
   )
-  with pytest.raises(ValueError, match="Incomplete"):
-    wm.load_bundle(legacy)
-  migrated = wm.migrate_bundle(legacy)
-  assert_tree(legacy, untouched)
-  assert wm.dynamics.model_version == version_before
-  assert migrated["dynamics"]["model_version"] != legacy["dynamics"]["model_version"]
-  wm.load_bundle(migrated)
-  assert wm.filter_config.jacobian_chunk_size == 7
-  assert wm.filter_config.jacobian_batch_chunk_size == 1
-  assert wm.dynamics.model_version == migrated["dynamics"]["model_version"]
-  assert_tree(wm.dynamics.state_dict(), current["dynamics"]["state_dict"])
+  for actual, expected in zip(runner._dynamics.normalizers(), reference, strict=True):
+    assert int(actual.count) == steps
+    torch.testing.assert_close(actual.state_dict(), expected.state_dict())
+  assert log["train"]["cov_pairs"] == log["validation"]["cov_pairs"] == 2
 
 
-def test_matrix_v1_weights_migrate_but_old_posterior_version_expires():
-  wm = _RoundRunner()._wm
-  previous = deepcopy(wm.bundle())
-  previous["estimator"]["filter_config"]["jacobian_chunk_size"] = 7
-  dynamics = previous["dynamics"]
-  dynamics["metadata"]["integration"]["version"] = "right_matrix_v1"
-  dynamics["model_version"] = wm.dynamics._content_digest(
-    dynamics["metadata"], dynamics["state_dict"]
-  )
-  with pytest.raises(ValueError, match="configuration or state layout mismatch"):
-    wm.load_bundle(previous)
-  migrated = wm.migrate_bundle(previous)
-  wm.load_bundle(migrated)
-  assert wm.filter_config.jacobian_chunk_size == 7
-  assert wm.dynamics.model_version != dynamics["model_version"]
-  assert_tree(wm.dynamics.state_dict(), dynamics["state_dict"])
+def test_invalid_heldout_frame_preserves_published_round_and_can_resume(tmp_path):
+  loop = training()
+  [first] = loop.run(1, tmp_path)
+  path, history = tmp_path / "training.pt", tmp_path / "metrics.jsonl"
+  checkpoint, rows = path.read_bytes(), history.read_bytes()
+  seal = loop.runner.finish_collection_round
+
+  def corrupt_then_seal():
+    replay = loop.runner.replay_buffer
+    slot = (replay._step - 2) % replay.buffer_size
+    assert replay._storage["episode_id"][0, slot] % 2 == 0
+    replay._storage["state"][0, slot, 7] = float("nan")
+    seal()
+
+  with (
+    patch.object(loop.runner, "finish_collection_round", side_effect=corrupt_then_seal),
+    pytest.raises(ValueError, match="Non-finite replay state"),
+  ):
+    loop.run(1, tmp_path)
+  assert loop.rounds == 1 and loop.learner.mean_steps == first["mean_steps"]
+  assert loop.runner._dynamics.model_version == first["trained_model_version"]
+  with pytest.raises(ValueError):
+    loop.save(path, metrics={"validation": {"Loss/state": float("nan")}})
+  assert path.read_bytes() == checkpoint and history.read_bytes() == rows
+  [second] = loop.run(1, tmp_path, resume=path)
+  assert second["round"] == 2
+
+
+def test_resume_recognizes_a_matching_preexisting_nan_metric(tmp_path):
+  loop = training()
+  loop.run(1, tmp_path)
+  path = tmp_path / "training.pt"
+  state = torch.load(path, weights_only=True)
+  state["last_metrics"]["validation"]["Loss/process_nll"] = float("nan")
+  torch.save(state, path)
+  (tmp_path / "metrics.jsonl").write_text(json.dumps(state["last_metrics"]) + "\n")
+  [second] = training().run(1, tmp_path, resume=path)
+  assert second["round"] == 2
+  json.dumps(second, allow_nan=False)

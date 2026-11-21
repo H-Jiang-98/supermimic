@@ -1,4 +1,4 @@
-"""Round-based posterior-NLL learning with a fixed collection policy.
+"""Round-based mean and covariance fitting with a fixed collection policy.
 
 Checkpoints resume model optimization at a round boundary. Physical simulator
 state is deliberately reset; replay and online posteriors are rebuilt from new
@@ -7,6 +7,7 @@ measurements. They are never restored under a changed model.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from copy import deepcopy
 from dataclasses import asdict, dataclass
@@ -17,10 +18,13 @@ from typing import cast
 import torch
 from filelock import FileLock
 
-from supermimic.estimator import LieBeliefFilter
-from supermimic.learners.belief_wm_learner import BeliefWorldModelLearner
+from supermimic.learners.two_stage_wm import TwoStageWorldModelLearner
 from supermimic.models import MultiEncoderAE
 from supermimic.motion_loader import motion_content_digest
+from supermimic.runners.run_config import (
+  EIT_TRAINING_VERSION,
+  validate_eit_checkpoint_contract,
+)
 from supermimic.runners.supermimic_runner import (
   SuperMimicRunner,
   actor_checkpoint,
@@ -43,21 +47,12 @@ class BeliefTrainingCfg:
         raise ValueError(f"Invalid {name}: {value}")
 
 
-def _round_training_metrics(updates: list[dict[str, torch.Tensor]]) -> dict:
-  counts = torch.stack([log["valid_transitions"] for log in updates]).long()
-  total = counts.sum()
-  metrics: dict[str, float | int] = {"valid_transitions": int(total)}
-  for name in updates[0]:
-    if name == "valid_transitions":
-      continue
-    values = torch.stack([log[name] for log in updates]).double()
-    # Each optimizer update contributes one gradient norm, while its loss and
-    # diagnostics are means over the transitions actually present in its windows.
-    mean = (
-      values.mean() if name.startswith("Grad/") else (values * counts).sum() / total
-    )
-    metrics[name] = float(mean)
-  return metrics
+def parameter_digest(module: torch.nn.Module) -> str:
+  digest = hashlib.sha256()
+  for name, value in module.state_dict().items():
+    digest.update(name.encode())
+    digest.update(value.detach().cpu().contiguous().numpy().tobytes())
+  return digest.hexdigest()
 
 
 class BeliefModelTraining:
@@ -69,7 +64,7 @@ class BeliefModelTraining:
   """
 
   def __init__(self, runner: SuperMimicRunner, cfg: BeliefTrainingCfg | None = None):
-    if not isinstance(runner.world_model_learner, BeliefWorldModelLearner):
+    if not isinstance(runner.world_model_learner, TwoStageWorldModelLearner):
       raise ValueError("Belief training requires estimator_inputs and process_noise")
     if (
       runner.cfg.estimator_inputs is None or runner.cfg.estimator_inputs.mode != "train"
@@ -88,8 +83,8 @@ class BeliefModelTraining:
     runner.policy_learner.actor.eval().requires_grad_(False)
 
   @property
-  def learner(self) -> BeliefWorldModelLearner:
-    return cast(BeliefWorldModelLearner, self.runner.world_model_learner)
+  def learner(self) -> TwoStageWorldModelLearner:
+    return cast(TwoStageWorldModelLearner, self.runner.world_model_learner)
 
   @property
   def actor(self) -> MultiEncoderAE:
@@ -113,51 +108,75 @@ class BeliefModelTraining:
       )
     return train, valid
 
+  def _fresh_training_frames(self, count: int, fields: tuple[str, ...]):
+    frames = self.runner.replay_buffer.retained_frames(
+      newest_count=count, fields=("episode_id", *fields)
+    )
+    return frames[frames["episode_id"] % self.cfg.validation_stride != 0]
+
+  def _update_policy(self) -> dict:
+    return {}
+
   def run_round(self, checkpoint_path: Path | None = None) -> dict:
     runner, learner = self.runner, self.learner
     if not self._ready:
       self.refresh_collection()
     version_before = runner._dynamics.model_version
-    for _ in range(self.cfg.collection_steps):
+    actor_before = parameter_digest(self.actor)
+    replay = runner.replay_buffer
+    # Fold each chunk into private statistics before the next ring overwrite.
+    staged = None
+    steps = self.cfg.collection_steps
+    for step in range(1, steps + 1):
       runner.step(record_episode_stats=False)
-    if runner._dynamics.model_version != version_before:
-      raise RuntimeError("The collection model changed within a round")
+      if step % replay.buffer_size == 0 and step < steps:
+        frames = self._fresh_training_frames(replay.buffer_size, ("state", "action"))
+        if len(frames):
+          staged = learner.stage_normalization(
+            frames["state"], frames["action"], staged
+          )
+        del frames
+    if (
+      runner._dynamics.model_version != version_before
+      or parameter_digest(self.actor) != actor_before
+    ):
+      raise RuntimeError("Collection model or actor changed within a round")
     runner.finish_collection_round()
     self._ready = False
     train_ids, valid_ids = self.episode_split()
-    fresh = runner.replay_buffer.retained_frames(newest_count=self.cfg.collection_steps)
-    train_rows = fresh["episode_id"] % self.cfg.validation_stride != 0
-    # A singleton still supplies a state/action for normalization. A round with
-    # only fresh validation frames can train from earlier retained transitions.
-    if train_rows.any():
-      learner.update_normalization(
-        fresh["state"][train_rows], fresh["action"][train_rows]
-      )
-    # No cached posterior is reused after normalizers or parameters change.
-    # The learner rebuilds each prefix with current weights and the same prior.
-    train_logs = []
-    for _ in range(learner.cfg.num_batches):
-      sequences = runner.replay_buffer.sample_belief_sequences(
-        learner.cfg.horizon, learner.cfg.batch_size, episode_ids=train_ids
-      )
-      train_logs.append(learner.update(sequences))
-    held_out = runner.replay_buffer.sample_belief_sequences(
-      learner.cfg.horizon, self.cfg.validation_batch_size, episode_ids=valid_ids
+    remaining = (steps - 1) % replay.buffer_size + 1
+    train, validation = learner.fit(
+      replay,
+      train_ids,
+      valid_ids,
+      self._fresh_training_frames(remaining, ("state", "action")),
+      self.cfg.validation_batch_size,
+      staged_normalizers=staged,
     )
-    validation = learner.evaluate(held_out)
-    self.rounds += 1
-    self.collected_frames += self.cfg.collection_steps * runner.env.num_envs
+    trained_version = runner._dynamics.model_version
+    policy = self._update_policy()
+    if runner._dynamics.model_version != trained_version:
+      raise RuntimeError("Policy update modified the frozen world model")
     metrics = {
-      "round": self.rounds,
-      "optimizer_steps": learner.steps,
-      "collected_frames": self.collected_frames,
+      "round": self.rounds + 1,
+      "mean_steps": learner.mean_steps,
+      "cov_steps": learner.cov_steps,
+      "collected_frames": self.collected_frames
+      + self.cfg.collection_steps * runner.env.num_envs,
       "training_episodes": train_ids,
       "validation_episodes": valid_ids,
       "collection_model_version": version_before,
-      "trained_model_version": runner._dynamics.model_version,
-      "train": _round_training_metrics(train_logs),
-      "validation": {key: float(value) for key, value in validation.items()},
+      "trained_model_version": trained_version,
+      "collection_actor_version": actor_before,
+      "trained_actor_version": parameter_digest(self.actor),
+      "train": train,
+      "validation": validation,
+      **policy,
     }
+    # Verify the entire row before advancing the round or replacing its checkpoint.
+    json.dumps(metrics, allow_nan=False)
+    self.rounds = metrics["round"]
+    self.collected_frames = metrics["collected_frames"]
     if checkpoint_path is not None:
       self.save(checkpoint_path, metrics=metrics)
     self.refresh_collection()
@@ -169,7 +188,8 @@ class BeliefModelTraining:
       raise RuntimeError("Finish the pending collection transaction before saving")
     return deepcopy(
       {
-        "version": "belief_model_training_v2",
+        "version": EIT_TRAINING_VERSION,
+        "stage": "model",
         "motion_digest": motion_content_digest(runner.motion),
         "loop_config": asdict(self.cfg),
         "runner_config": asdict(runner.cfg),
@@ -178,6 +198,7 @@ class BeliefModelTraining:
         "learner": self.learner.state_dict(),
         "rounds": self.rounds,
         "collected_frames": self.collected_frames,
+        "num_envs": runner.env.num_envs,
         "episode_id": getattr(runner, "_episode_id", None),
         "rng_cpu": torch.random.get_rng_state(),
         "rng_cuda": (
@@ -190,12 +211,7 @@ class BeliefModelTraining:
 
   @staticmethod
   def _check_checkpoint_version(state: dict) -> None:
-    if state.get("version") == "belief_model_training_v1":
-      raise ValueError(
-        "Legacy belief training checkpoint has no verified motion identity"
-      )
-    if state.get("version") != "belief_model_training_v2":
-      raise ValueError("Unsupported belief training checkpoint")
+    validate_eit_checkpoint_contract(state, stage="model")
 
   def load_state_dict(self, state: dict) -> None:
     """Preflight every component on private copies, then refresh the live stream."""
@@ -212,7 +228,13 @@ class BeliefModelTraining:
     for key in ("rounds", "collected_frames"):
       if type(state.get(key)) is not int or state[key] < 0:
         raise ValueError(f"Invalid checkpoint {key}")
-    ids = state.get("episode_id")
+    if (
+      type(state.get("num_envs")) is not int or state["num_envs"] != runner.env.num_envs
+    ):
+      raise ValueError("Checkpoint environment count mismatch")
+    ids = state["episode_id"]
+    if ids is None and state["rounds"]:
+      raise ValueError("Completed rounds require checkpoint episode IDs")
     if ids is not None and (
       not isinstance(ids, torch.Tensor)
       or ids.shape != (runner.env.num_envs,)
@@ -247,13 +269,13 @@ class BeliefModelTraining:
       raise ValueError(
         "World model settings disagree with the saved runner configuration"
       )
-    candidate_estimator = LieBeliefFilter(
+    candidate_learner = TwoStageWorldModelLearner(
       candidate_wm.dynamics,
-      candidate_wm.representation.measurement_config,
-      cast(torch.Tensor, candidate_wm.representation._default_joint_pos),
-      candidate_wm.filter_config,
+      candidate_wm.representation,
+      runner.cfg.mean,
+      runner.cfg.cov,
+      runner.device,
     )
-    candidate_learner = BeliefWorldModelLearner(candidate_estimator, self.learner.cfg)
     candidate_learner.load_state_dict(state["learner"])
     candidate_actor = deepcopy(self.actor)
     load_actor_checkpoint(candidate_actor, runner.cfg, state["actor"])
@@ -277,8 +299,7 @@ class BeliefModelTraining:
       initial_prior=runner._wm.initial_prior,
     )
     runner.wm_env.replay_buffer = runner.replay_buffer
-    if ids is not None:
-      runner._episode_id = ids.to(runner.device).clone()
+    runner._episode_id = ids.to(runner.device).clone() if ids is not None else None
     runner._pending_norm_updates.clear()
     torch.random.set_rng_state(cpu_rng)
     if torch.device(runner.device).type == "cuda" and cuda_rng is not None:
@@ -288,6 +309,8 @@ class BeliefModelTraining:
 
   def save(self, path: Path, *, metrics: dict | None = None) -> None:
     """Atomic replacement prevents interruption from truncating the last snapshot."""
+    if metrics is not None:
+      json.dumps(metrics, allow_nan=False)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     state = self.state_dict()
@@ -349,7 +372,7 @@ class BeliefModelTraining:
       logs = []
       for _ in range(rounds):
         metrics = self.run_round(checkpoint)
-        row = json.dumps(metrics, sort_keys=True)
+        row = json.dumps(metrics, sort_keys=True, allow_nan=False)
         with metrics_path.open("ab") as stream:
           stream.write((row + "\n").encode())
         print("BELIEF_TRAINING " + row)
@@ -372,10 +395,11 @@ class BeliefModelTraining:
     if last is not None and last["round"] == state["rounds"]:
       if (
         last["trained_model_version"] != state["learner"]["model_version"]
-        or last["optimizer_steps"] != state["learner"]["steps"]
+        or last["mean_steps"] != state["learner"]["mean"]["steps"]
+        or last["cov_steps"] != state["learner"]["cov"]["steps"]
         or last["collected_frames"] != state["collected_frames"]
-        # Older EIT rows wrote NaN for undefined explained variance. Compare
-        # their serialized values so a faithfully restored NaN matches itself.
+        # Earlier snapshots of this format could publish NaN metrics. Compare
+        # their serialized values so an intact model can resume its own history.
         or (
           completed is not None
           and json.dumps(last, sort_keys=True) != json.dumps(completed, sort_keys=True)

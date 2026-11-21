@@ -346,6 +346,16 @@ def test_serialized_input_config_cannot_silently_fill_semantic_defaults(key):
     load_runner_cfg({"runner_cfg": raw})
 
 
+@pytest.mark.parametrize(
+  ("section", "key"), [("mean", "window_frames"), ("cov", "epochs")]
+)
+def test_eit_fit_config_requires_both_complete_stage_configs(section, key):
+  raw = asdict(_config("B"))
+  del raw[section][key]
+  with pytest.raises(ValueError, match="configuration fields"):
+    load_runner_cfg({"runner_cfg": raw})
+
+
 def test_ablation_factory_copies_common_weights_without_shared_storage():
   runner = _runner()
   actors = build_ablation_actors(runner.cfg, runner._wm, "cpu")

@@ -27,6 +27,21 @@ from supermimic.scripts.train_utils import create_env
 from supermimic.tasks.env_cfgs import configure_estimator_env_cfg
 
 
+def stationary_motion(path: Path, frames: int = 8):
+  model = mujoco.MjModel.from_xml_path(str(G1_XML))
+  joints = np.flatnonzero(model.jnt_type == int(mujoco.mjtJoint.mjJNT_HINGE))
+  np.savez(
+    path,
+    joint_pos=np.tile(model.qpos0[model.jnt_qposadr[joints]], (frames, 1)),
+    joint_vel=np.zeros((frames, len(joints))),
+    root_pos_w=np.tile(model.qpos0[:3], (frames, 1)),
+    root_quat_w=np.tile(model.qpos0[3:7], (frames, 1)),
+    root_lin_vel_w=np.zeros((frames, 3)),
+    root_ang_vel_w=np.zeros((frames, 3)),
+    fps=50.0,
+  )
+
+
 def main():
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--device", default="cpu")
@@ -40,19 +55,7 @@ def main():
   start = time.perf_counter()
   with tempfile.TemporaryDirectory(prefix="supermimic-step2-") as directory:
     path = Path(directory) / "motion.npz"
-    model = mujoco.MjModel.from_xml_path(str(G1_XML))
-    joints = np.flatnonzero(model.jnt_type == int(mujoco.mjtJoint.mjJNT_HINGE))
-    frames = 4
-    np.savez(
-      path,
-      joint_pos=np.tile(model.qpos0[model.jnt_qposadr[joints]], (frames, 1)),
-      joint_vel=np.zeros((frames, len(joints))),
-      root_pos_w=np.tile(model.qpos0[:3], (frames, 1)),
-      root_quat_w=np.tile(model.qpos0[3:7], (frames, 1)),
-      root_lin_vel_w=np.zeros((frames, 3)),
-      root_ang_vel_w=np.zeros((frames, 3)),
-      fps=50.0,
-    )
+    stationary_motion(path, frames=4)
     cfg = load_env_cfg("SuperMimic-GenCoord-G1")
     cfg.commands["motion"].motion_file = str(path)
     cfg.commands["motion"].sampling_mode = "start"

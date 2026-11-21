@@ -34,7 +34,7 @@ from supermimic.learners.belief_policy_learner import (
 )
 from supermimic.models import ProcessNoiseConfig
 from supermimic.runners.supermimic_runner import SuperMimicRunner, SuperMimicRunnerCfg
-from supermimic.scripts.check_belief_training import stationary_motion
+from supermimic.scripts.check_estimator import stationary_motion
 from supermimic.scripts.train_utils import create_env
 from supermimic.tasks.env_cfgs import configure_estimator_env_cfg
 

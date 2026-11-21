@@ -1,4 +1,4 @@
-"""Alternating posterior-NLL and stochastic value-gradient training.
+"""Two-stage world model fitting and stochastic value-gradient policy training.
 
 Round checkpoints reuse the model-only loop's atomic file and output-directory
 protocol. Optimizer continuation is exact for fixed raw inputs/noises; simulator
@@ -25,9 +25,12 @@ from supermimic.learners.belief_policy_learner import (
 from supermimic.runners.belief_training import (
   BeliefModelTraining,
   BeliefTrainingCfg,
-  _round_training_metrics,
+  parameter_digest,
 )
-from supermimic.runners.run_config import validate_eit_checkpoint_contract
+from supermimic.runners.run_config import (
+  EIT_INITIALIZATION_VERSION,
+  validate_eit_checkpoint_contract,
+)
 from supermimic.runners.supermimic_runner import (
   SuperMimicRunner,
   actor_checkpoint,
@@ -48,14 +51,6 @@ class EITTrainingCfg(BeliefTrainingCfg):
       or self.normalization_batch_size < 1
     ):
       raise ValueError("normalization_batch_size must be positive")
-
-
-def parameter_digest(module: torch.nn.Module) -> str:
-  digest = hashlib.sha256()
-  for name, value in module.state_dict().items():
-    digest.update(name.encode())
-    digest.update(value.detach().cpu().contiguous().numpy().tobytes())
-  return digest.hexdigest()
 
 
 class EITTraining(BeliefModelTraining):
@@ -159,42 +154,9 @@ class EITTraining(BeliefModelTraining):
       self.actor.eval()
       self.policy.critic.eval()
 
-  def run_round(self, checkpoint_path: Path | None = None) -> dict:
-    runner, learner = self.runner, self.learner
-    if not self._ready:
-      self.refresh_collection()
-    self.actor.eval()
-    self.policy.critic.eval()
-    version_before = runner._dynamics.model_version
-    actor_before = parameter_digest(self.actor)
-    for _ in range(self.cfg.collection_steps):
-      runner.step(record_episode_stats=False)
-    if (
-      runner._dynamics.model_version != version_before
-      or parameter_digest(self.actor) != actor_before
-    ):
-      raise RuntimeError("Collection model or actor changed within a round")
-    runner.finish_collection_round()
-    self._ready = False
-    train_ids, valid_ids = self.episode_split()
-    fresh = runner.replay_buffer.retained_frames(newest_count=self.cfg.collection_steps)
-    train_rows = fresh["episode_id"] % self.cfg.validation_stride != 0
-    train_frames = fresh[train_rows]
-    if len(train_frames):
-      learner.update_normalization(train_frames["state"], train_frames["action"])
-    logs = []
-    for _ in range(learner.cfg.num_batches):
-      sequences = runner.replay_buffer.sample_belief_sequences(
-        learner.cfg.horizon, learner.cfg.batch_size, episode_ids=train_ids
-      )
-      logs.append(learner.update(sequences))
-    validation = learner.evaluate(
-      runner.replay_buffer.sample_belief_sequences(
-        learner.cfg.horizon, self.cfg.validation_batch_size, episode_ids=valid_ids
-      )
-    )
-    model_before_policy = runner._dynamics.model_version
-    # A singleton fragment still has a valid policy start. Only NLL needs a successor.
+  def _update_policy(self) -> dict:
+    runner = self.runner
+    # A singleton fragment still supplies a policy start.
     policy_ids = [
       episode
       for episode in runner.replay_buffer.training_episode_lengths()
@@ -202,38 +164,22 @@ class EITTraining(BeliefModelTraining):
     ]
     with runner.wm_env.readonly_policy_motion():
       policy_keys = self.policy.sample_start_keys(policy_ids)
-      starts = self.update_input_normalization(train_frames, policy_keys)
+      fresh_train = self._fresh_training_frames(
+        self.cfg.collection_steps, ("time_index",)
+      )
+      starts = self.update_input_normalization(fresh_train, policy_keys)
       assert starts is not None
       policy_logs = self.policy.update_prepared(starts)
-    if runner._dynamics.model_version != model_before_policy:
-      raise RuntimeError("Policy update modified the frozen world model")
-    self.rounds += 1
-    self.collected_frames += self.cfg.collection_steps * runner.env.num_envs
-    metrics = {
-      "round": self.rounds,
-      "optimizer_steps": learner.steps,
-      "collected_frames": self.collected_frames,
-      "training_episodes": train_ids,
-      "validation_episodes": valid_ids,
-      "collection_model_version": version_before,
-      "trained_model_version": runner._dynamics.model_version,
-      "collection_actor_version": actor_before,
-      "trained_actor_version": parameter_digest(self.actor),
+    runner.wm_env.clear_rollout()
+    return {
       "critic_version": parameter_digest(self.policy.critic),
-      "train": _round_training_metrics(logs),
-      "validation": {key: float(value) for key, value in validation.items()},
       "policy": policy_metrics_for_json(policy_logs),
     }
-    if checkpoint_path is not None:
-      self.save(checkpoint_path, metrics=metrics)
-    runner.wm_env.clear_rollout()
-    self.refresh_collection()
-    return metrics
 
   def state_dict(self) -> dict:
     state = super().state_dict()
     state.update(
-      version="eit_training_v1",
+      stage="policy",
       critic=deepcopy(self.policy.critic.checkpoint()),
       policy=deepcopy(self.policy.state_dict()),
       policy_config=asdict(self.policy.cfg),
@@ -245,7 +191,7 @@ class EITTraining(BeliefModelTraining):
 
   @staticmethod
   def _check_checkpoint_version(state: dict) -> None:
-    validate_eit_checkpoint_contract(state)
+    validate_eit_checkpoint_contract(state, stage="policy")
 
   def load_state_dict(self, state: dict) -> None:
     self._check_checkpoint_version(state)
@@ -303,7 +249,8 @@ class EITTraining(BeliefModelTraining):
     """Export explicit, independently allocated common A/B/C initial weights."""
     if (
       self.rounds
-      or self.learner.steps
+      or self.learner.mean_steps
+      or self.learner.cov_steps
       or self.policy.actor_steps
       or self.policy.critic_steps
     ):
@@ -328,7 +275,7 @@ class EITTraining(BeliefModelTraining):
     critics["C"].copy_common_initialization_from(critics["B"])
     return deepcopy(
       {
-        "version": "eit_initialization_v1",
+        "version": EIT_INITIALIZATION_VERSION,
         "world_model": runner._wm.bundle(),
         "actors": {
           group: actor_checkpoint(
@@ -347,12 +294,13 @@ class EITTraining(BeliefModelTraining):
   def load_initialization(self, bundle: dict) -> None:
     if (
       self.rounds
-      or self.learner.steps
+      or self.learner.mean_steps
+      or self.learner.cov_steps
       or self.policy.actor_steps
       or self.policy.critic_steps
     ):
       raise ValueError("Initialization cannot replace an active training run")
-    if bundle.get("version") != "eit_initialization_v1":
+    if bundle.get("version") != EIT_INITIALIZATION_VERSION:
       raise ValueError("Unsupported EIT initialization")
     runner = self.runner
     group = runner.cfg.estimator_inputs.group

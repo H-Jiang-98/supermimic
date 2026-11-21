@@ -53,18 +53,12 @@ def test_restore_real_heads_before_collection_and_after_partial_reset():
     source(**frame)
     snapshot = source.state_dict()
     if step == 0:
-      # A v2 snapshot can restore the corrected belief, but cannot supply its
-      # realized prior. Even the same keys can belong to a different prior draw.
       other = BeliefProvider(real.estimator, draw_prior)
       other(**frame)
       real.load_state_dict(other.state_dict())
       assert not torch.equal(
         real.state.belief.mean.position, source.state.belief.mean.position
       )
-      old = dict(snapshot, version="right_local_provider_v2")
-      old.pop("head_priors")
-      real.load_state_dict(old)
-      assert real.state.head_priors is None
     else:
       bad_heads = dict(
         snapshot["head_priors"], episode_id=snapshot["episode_id"][:1] + BATCH
@@ -73,17 +67,13 @@ def test_restore_real_heads_before_collection_and_after_partial_reset():
       with pytest.raises(ValueError, match="frame-zero episodes"):
         real.load_state_dict(dict(snapshot, head_priors=bad_heads))
       assert real.state is before
-      real.load_state_dict(snapshot)
+    real.load_state_dict(snapshot)
     # The actor looks up this already corrected frame; no new candidate is made.
     runner.step()
     rows = torch.tensor(expected_head_rows)
     episodes, times = snapshot["episode_id"], snapshot["time_index"]
     assert torch.equal(snapshot["head_priors"]["episode_id"], episodes[rows])
     for i, row in enumerate(expected_head_rows):
-      if step == 0:
-        with pytest.raises(ValueError, match="head or initial prior unavailable"):
-          runner.replay_buffer.episode_prefix(episodes[row].item(), 0)
-        continue
       recorded, _ = runner.replay_buffer.episode_prefix(episodes[row].item(), 0)
       torch.testing.assert_close(
         recorded.mean.to_full(), snapshot["head_priors"]["mean"][i]
@@ -120,3 +110,62 @@ def test_invalid_head_metadata_leaves_replay_unchanged():
   assert buffer.num_transitions == 2
   with pytest.raises(ValueError, match="head or initial prior unavailable"):
     buffer.episode_prefix(BATCH, 0)
+
+
+@pytest.mark.parametrize(
+  ("fault", "message"),
+  [
+    ("prev_action", "Executed action"),
+    ("actor_obs", "Recorded sensor action"),
+    ("sim_ctx", "simulation context"),
+  ],
+)
+def test_model_window_selection_rejects_inconsistent_replay_across_wrap(fault, message):
+  env, _, _ = setup_env("B")
+  replay = env.replay_buffer
+  frame = replay._storage[:, 0].clone()
+  for t in (1, 2, 3):
+    frame["time_index"].fill_(t)
+    replay.insert(frame)
+  replay.finish_collection_round()
+  heads = replay._training_heads
+
+  # Frame four overwrites physical slot zero, directly after slot three.
+  frame["time_index"].fill_(4)
+  if fault == "prev_action":
+    frame["prev_action"][1, 0] += 0.5
+    frame["actor_obs"][1, 64:] = frame["prev_action"][1]
+  elif fault == "actor_obs":
+    frame["actor_obs"][1, 64] += 0.5
+  else:
+    frame["sim_ctx"][1, 0] += 0.5
+  replay.insert(frame)
+  rng = torch.random.get_rng_state()
+  with pytest.raises(ValueError, match=message):
+    replay.model_window_starts([0], 2)
+  assert replay._training_heads is heads
+  assert torch.equal(torch.random.get_rng_state(), rng)
+
+
+@pytest.mark.parametrize("boundary", ["new_episode", "gap", "terminated", "truncated"])
+def test_sealing_compares_actions_and_context_only_across_recorded_successors(boundary):
+  env, _, _ = setup_env("B")
+  replay = env.replay_buffer
+  frame = replay._storage[:, 0].clone()
+  frame["time_index"].fill_(1)
+  if boundary in ("terminated", "truncated"):
+    frame[boundary][0] = True
+  replay.insert(frame)
+
+  frame["time_index"].fill_(2)
+  if boundary == "new_episode":
+    frame["episode_id"][0] += BATCH
+    frame["time_index"][0] = 0
+  elif boundary == "gap":
+    frame["time_index"][0] += 1
+  frame["prev_action"][0, 0] += 0.5
+  frame["actor_obs"][0, 64:] = frame["prev_action"][0]
+  frame["sim_ctx"][0, 0] += 0.5
+  replay.insert(frame)
+  starts = replay.model_window_starts([0, BATCH], 2)
+  assert starts.tolist() == [[0, 0]]

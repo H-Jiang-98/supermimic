@@ -99,7 +99,7 @@ def main() -> None:
   if args.runner.estimator_inputs is not None:
     raise NotImplementedError(
       "Use python -m supermimic.scripts.train_eit for joint EIT training, or "
-      "python -m supermimic.scripts.train_belief for posterior-NLL model learning"
+      "python -m supermimic.scripts.train_belief for fixed-actor model fitting"
     )
   if args.config is not None:
     print(f"[INFO] Loaded training config: {args.config}")

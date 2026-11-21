@@ -1,10 +1,10 @@
 **第二步实施计划：随机动力学、可微李群滤波与接口集成**
 
-本计划承接已完成的 [plan_step1.md](plan_step1.md)，将第一步使用的合成或外部注入后验替换为可传播、可更新、可微分的完整 belief。分为三个可独立验收的实现阶段：完整 belief 与几何工具 → 随机动力学与滤波核心 → provider 集成与短序列梯度验证。下文保留“提交一至三”的阶段名称，实际 Git 提交拆分及验收记录见文末。
+本计划承接已完成的 [plan_step1.md](plan_step1.md)，将第一步使用的合成或外部注入后验替换为可传播、可更新、可微分的完整 belief。分为三个可独立验收的实现阶段：完整 belief 与几何工具 → 随机动力学与滤波核心 → provider 集成与短序列梯度验证。文末列有几何、滤波和真实采集的验收命令。
 
 **当前实现状态。** 三个阶段的实现已接通：可用真实滤波器运行短序列采集，按保留片段以当前模型重建 replay 后验，并在小规模随机想象序列中验证模型、滤波和 actor 的计算图。第一步主体提交为 `c22a8af`；此后的奖励修正、几何和滤波核心分别独立提交，本记录与 provider 集成同批提交。完整模型训练调度、belief critic 和策略优化循环仍由后续阶段完成。
 
-**第一步审阅结论与实施起点。** 第一阶段的输入布局、任务误差 covariance、FiLM 和采集接口作为本步基础。第一步验收时记录为 377 passed（历史结果，并非当前测试总数）；另以 CPU MuJoCo、2 个环境、8 个采集步完成接口烟雾验证，覆盖 replay 采样、想象入口和一次反向传播，确认历史、目标及不确定性输入形状分别为 (2, 5, 93)、(2, 700)、(2, 450)。最新第二步结果见文末；联合训练效果、GPU 执行及控制性能仍需后续验证。
+**第一步审阅结论与实施起点。** 第一阶段的输入布局、任务误差 covariance、FiLM 和采集接口作为本步基础。相关接口检查覆盖 replay 采样、想象入口和动作梯度。
 
 第一步 legacy 外部 provider 的内部更新及调用前的测量噪声采样位于环境回滚边界之外，该接口仍保留此限制。第二步的 `BeliefProvider` 采用纯函数滤波核心及候选状态提交机制，使失败重试具有明确时序。
 
@@ -18,9 +18,9 @@
 
 三组共用实现与配置，从相同的共同初始权重和归一化状态建立独立实例，随后独立采集、更新。B−A 表示估计状态训练与 belief critic 的整体变化；C−B 表示相同 critic 设计下任务 covariance 与 FiLM 路径的增量效果，包括其额外参数和目标相关信息路径。在线数据与模型的后续分化属于各组训练机制的整体效果。
 
-均值模型与噪声头从零共同训练，首轮采用 posterior NLL。一步预测误差、预测分布质量和校准指标作为诊断，额外预测损失是否必要由实验结果决定。后续采用采集、模型更新、策略更新交替流程，仅在策略更新窗口固定模型参数与归一化状态。冻结旧 actor 的闭环完成率不作为启动 B/C 训练的前置条件。
+每轮采集后先按原版 rollout 拟合均值，再冻结均值与归一化统计，用全部有效的一步转移拟合过程 covariance。策略更新阶段冻结完整模型，保留预测对动作的导数。[模型训练](plan_step3.md)
 
-actor 使用第一步的 `eit_rpv_v1`、5×93 历史和 700 维目标，每帧采样一次高斯测量，每个 episode 固定参考对齐。A 训练时用真值构造目标，A 评估及 B/C 训练与评估时使用 R/p/v 后验均值。仅 C actor 将当前 9×9 边缘 covariance 投影到十个参考帧，按 `log_std_corr_v1` 编码为 450 维 FiLM 输入。B/C critic 直接将同一边缘块编码为 45 维，配合 12 维 R/p/v 后验均值编码。滤波与 posterior NLL 使用完整 belief。详见 [第四步输入契约](plan_step4.md#rpv-critic-输入修订2026-11-20)。
+actor 使用第一步的 `eit_rpv_v1`、5×93 历史和 700 维目标，每帧采样一次高斯测量，每个 episode 固定参考对齐。A 训练时用真值构造目标，A 评估及 B/C 训练与评估时使用 R/p/v 后验均值。仅 C actor 将当前 9×9 边缘 covariance 投影到十个参考帧，按 `log_std_corr_v1` 编码为 450 维 FiLM 输入。B/C critic 直接将同一边缘块编码为 45 维，配合 12 维 R/p/v 后验均值编码。滤波与策略起点使用完整 belief。详见 [第四步输入契约](plan_step4.md#rpv-critic-输入修订2026-11-20)。
 
 **提交一：完整 belief 状态与右扰动几何。**
 
@@ -95,7 +95,7 @@ actor 使用第一步的 `eit_rpv_v1`、5×93 历史和 700 维目标，每帧�
 
    完整下三角输出为 70×71/2=2485 维。对角线采用正值参数化及显式数值下界；初始标准差按切空间各物理量配置并保存，初始交叉项设为零或明确的小值。ΔΣ 表示一个控制步的过程 covariance，避免调用方重复乘 dt。
 
-   噪声头与均值模型一起注册、保存和暴露给后续 optimizer，支持从零共同训练。已有确定性 `forward` 调用保持可用；随机功能通过明确配置与接口启用，旧 checkpoint 的加载按配置检查兼容性，缺少噪声头时不能静默宣称已恢复随机模型。
+   每行的非对角系数乘以该行对角尺度，得到物理切空间中的 L。均值和噪声头共同保存在模型中。均值的 Muon/Adam 只持有均值网络参数，噪声头由独立的 Adam 更新。
 
 2. 新增 `src/supermimic/estimator.py`，实现无内部状态突变的滤波核心。
 
@@ -110,9 +110,9 @@ actor 使用第一步的 `eit_rpv_v1`、5×93 历史和 700 维目标，每帧�
    Σ_pred = A Σ Aᵀ + L Lᵀ
    ```
 
-   A 为 70×70，噪声 covariance 位于预测均值的右局部坐标。计算局部 ε 导数时，名义预测、动作和 ξ 对 ε 固定；外层模型训练及策略梯度仍需要它们对参数、输入状态和动作的依赖，不能用全局 `detach` 破坏这些路径。先实现 eager 正确性，记录 batch 与 Jacobian 的实际开销，再决定后续性能优化。
+   A 为 70×70，噪声 covariance 位于预测均值的右局部坐标。计算局部 ε 导数时，名义预测、动作和 ξ 对 ε 固定；策略梯度仍需要它们对输入状态和动作的依赖，不能用全局 `detach` 破坏这些路径。先实现 eager 正确性，记录 batch 与 Jacobian 的实际开销，再决定后续性能优化。
 
-   当前采用非向量化 `torch.autograd.functional.jacobian`，按外层梯度模式选择 `create_graph`。现有 TorchScript 四元数运算的嵌套 `jacrev` 在预热后可能产生错误混合导数，故本阶段保留普通 autograd 参考路径，并用真实 Dynamics 的方向导数测试约束。
+   矩阵积分直接使用 LieState。默认通过 `vmap(jacrev)` 逐样本计算 Jacobian，保留 eager 参考实现、分块选项和预热后的混合导数测试。
 
 4. 实现与第一步完全一致的 64 维观测更新。
 
@@ -139,15 +139,6 @@ actor 使用第一步的 `eit_rpv_v1`、5×93 历史和 700 维目标，每帧�
 
    第一阶段允许零测量标准差；三维无噪重力观测的局部秩为 2，按上述可观测子空间求解。精确标量测量允许得到半正定后验，不能为了保持正定而无条件注入噪声。
 
-5. 提供 posterior NLL 的测试入口和诊断所需残差。
-
-   ```text
-   e = local_error(mean_post, state_true)
-   NLL = 0.5 × (eᵀ Σ_post⁻¹ e + logdet(Σ_post))
-   ```
-
-   使用 Cholesky 求解与 log determinant，省略与参数无关的常数。NLL 在边缘标准差单位下检测有效秩，只对需要正则化的 batch 行应用有界 jitter 并报告诊断；良态行的 jitter 为零。此处验证联合训练所需梯度与接口；完整序列采样、optimizer 调度和训练日志在下一阶段接入。一步均值预测误差、预测分布 NLL、innovation 和 covariance 统计用于诊断。
-
 | 提交二验收项目 | 通过标准 |
 |---|---|
 | 均值兼容性 | 同权重、输入与归一化状态下，新分布接口的均值与原确定性预测一致 |
@@ -157,7 +148,6 @@ actor 使用第一步的 `eit_rpv_v1`、5×93 历史和 700 维目标，每帧�
 | 观测更新 | H、innovation、K 和均值修正与独立参考一致；零 innovation 时均值不变；线性欧氏子问题与标准 Kalman 更新一致 |
 | covariance reset | 非零修正时 G 与局部误差映射数值 Jacobian 相符，更新后 covariance 处于新均值的切空间 |
 | 数值稳定性 | 默认噪声、较小方差、强相关合法 covariance、部分零测量噪声均有明确且可测试的结果；无静默 NaN/Inf |
-| 联合训练梯度 | 短序列 posterior NLL 对均值参数、噪声头参数有有限且在非退化样本下非零的梯度，并通过选定方向的数值检查 |
 | 独立性 | 随机模型和滤波核心可在合成数据上验收，无需完整策略训练或 MuJoCo 闭环成功 |
 
 **提交三：有状态 provider、采集/想象集成与梯度烟雾验证。**
@@ -186,7 +176,7 @@ actor 使用第一步的 `eit_rpv_v1`、5×93 历史和 700 维目标，每帧�
 
    每轮采集结束后，各环境在最早保留的帧和其后真实 reset 处分段。每个片段在其首帧真实状态上按配置采样完整 70 维右局部扰动，保存实际先验均值和 covariance，以首帧记录的测量与上一动作填充 actor 历史，并融合首帧测量一次。重建时，从该先验出发，以当前模型按记录的动作和测量推进到所选帧。保留物理 episode 帧号用于定位，训练片段单独从 0 计时。已在想象中推进的帧也可通过完整环境快照恢复。
 
-   当前入口为 `finish_collection_round()` 与 `training_prefix(episode, t, relative=...)`。想象环境 `reset(episode_id=..., time_index=...)` 或 `reset(episode_id=..., segment_time=...)` 从该前缀重建；同一起点保留已抽样先验，模型变化只重新传播。此重建不保留历史模型学习图，后验作为想象初始条件。训练用可微序列重放与后验缓存另行实现。
+   当前入口为 `finish_collection_round()` 与 `training_prefix(episode, t, relative=...)`。想象环境 `reset(episode_id=..., time_index=...)` 或 `reset(episode_id=..., segment_time=...)` 从该前缀重建；同一起点保留已抽样先验，模型变化只重新传播。此重建不保留历史模型学习图，后验作为想象初始条件。模型拟合独立读取真实状态、动作和 context。
 
 4. 明确自动微分与归一化边界。
 
@@ -194,13 +184,13 @@ actor 使用第一步的 `eit_rpv_v1`、5×93 历史和 700 维目标，每帧�
 
    想象路径保留从动作、模型预测、A、L、covariance 更新、目标构造到 actor 输出的计算图。A、G 对模型、动作或状态的外层导数涉及混合二阶导数，应使用支持这些导数的实现，并分别验证模型学习与模型参数固定时的策略梯度。参数固定不能通过整个预测调用的 `no_grad` 实现，否则会阻断动作梯度。
 
-   原 runner 会在采集后更新归一化状态；真实 provider 默认通过 `freeze_estimator_normalization=True` 冻结模型及 actor 的归一化更新，第二步短序列不更新模型参数。`Dynamics.model_version` 对当前权重、buffer、过程噪声与积分配置计算内容指纹，包含归一化变化和 fused optimizer 写入。provider 的查询、restore、连续推进与 commit 检查版本；新 episode 可用当前版本重新初始化。下一阶段的交替更新需在模型变更后重建或刷新活动采集器 posterior；同样的规则适用于未来 replay 后验缓存。
+   原 runner 会在采集后更新归一化状态；真实 provider 默认通过 `freeze_estimator_normalization=True` 冻结模型及 actor 的归一化更新，第二步短序列不更新模型参数。`Dynamics.model_version` 对当前权重、buffer、过程噪声与积分配置计算内容指纹，包含归一化变化和 fused optimizer 写入。provider 的查询、restore、连续推进与 commit 检查版本；新 episode 可用当前版本重新初始化。每轮拟合后，策略起点和下一轮采集器按当前模型版本重建。
 
 5. 保存完整配置与完成运行记录。
 
    checkpoint 包含均值模型、噪声头、模型归一化、噪声参数化与数值配置、完整状态及切空间版本；需要恢复在线轨迹时另行保存完整 belief、context、时序标识及模型版本。普通模型权重恢复与在线 provider 状态恢复应各有明确接口。
 
-   `Dynamics.checkpoint/load_checkpoint` 校验模型内容与配置；runner 的 `WorldModel.bundle/load_bundle` 另外保存测量、滤波、初始先验配置及关节标定。provider 的 `right_local_provider_v3` 快照记录完整后验与实际采样的在线首帧先验；兼容 v2 后验，但缺少首帧先验时无法恢复完整物理前缀。
+   `Dynamics.checkpoint/load_checkpoint` 校验模型内容与配置；runner 的 `WorldModel.bundle/load_bundle` 另外保存测量、滤波、初始先验配置及关节标定。provider 的 `right_local_provider_v3` 快照记录完整后验与实际采样的在线首帧先验。
 
    `WorldModelEnv.snapshot/restore` 的想象快照使用独立的 `version=2`，额外保存参考数据的 `motion_digest`。SHA-256 覆盖 clip 边界、关节/根状态及 FK 刚体位姿与速度的 shape、dtype 和实际值，不依赖文件路径或设备。保存/恢复时分块重新计算；同长度不同内容、clip 重排及原地修改均拒绝恢复，且不提交 provider 或环境状态。旧 v1 或缺少指纹的快照明确报错，需要从保留 replay 重建，不能通过手改版本号迁移。
 
@@ -216,13 +206,12 @@ actor 使用第一步的 `eit_rpv_v1`、5×93 历史和 700 维目标，每帧�
 | 入口一致性 | 真实滤波所得完整后验经直接注入和 provider 两种入口，生成一致的历史、目标和 covariance 特征 |
 | 真实采集 | CPU 小 batch MuJoCo 短序列使用真实滤波器，通过正常推进和 episode reset；检查结果有限且无跨 episode 状态污染 |
 | 随机想象 | 使用独立潜在状态与 belief，至少 H_rollout=2；固定过程及测量噪声，可复现前向与反向结果 |
-| 模型梯度 | 短序列 posterior NLL 同时到达均值模型和噪声头，并通过方向导数检查 |
 | 策略梯度 | 固定模型参数后，想象回报对动作及 actor 参数的梯度通过选定方向检查；有限差分使用相同噪声且避开裁剪拐点 |
 | FiLM 梯度 | 零初始化时先验证输出层梯度；输出层更新后再验证 covariance 和上游分支梯度 |
 | 图与版本生命周期 | 真实采集的已提交 belief 不保留历史计算图，想象序列保留所需梯度；模型或归一化版本不匹配时明确处理 |
 | 保存恢复 | 模型、配置与完整 belief 恢复后，在相同输入和噪声下输出一致；错误版本明确报错 |
 
-**实际模块与阶段归属。** 下列对应当前实现；Git 提交拆分另见文末。
+**实际模块与阶段归属。** 下列对应当前实现。
 
 | 文件或模块 | 提交 | 职责 |
 |---|---|---|
@@ -231,7 +220,7 @@ actor 使用第一步的 `eit_rpv_v1`、5×93 历史和 700 维目标，每帧�
 | `src/supermimic/utils/validation.py`、`src/supermimic/estimator_inputs.py` | 一 | 共享 SO(3)/covariance 校验与第一步 RPV 边界 |
 | `src/supermimic/representations.py` | 复用第一步 | GenCoord 均值积分、64 维合成测量与共享参考窗口，无新增改动 |
 | `src/supermimic/models.py` | 二 | 可选噪声头、分布/采样接口、配置与 checkpoint 兼容性 |
-| `src/supermimic/estimator.py` | 二 | 纯函数 predict/correct、观测更新和 NLL 诊断 |
+| `src/supermimic/estimator.py` | 二 | 纯函数 predict/correct、观测更新、innovation 与 jitter 诊断 |
 | `src/supermimic/belief_provider.py` | 三 | 完整后验的 prepare/commit、时序、版本与恢复 |
 | `src/supermimic/replay_buffer.py` | 三 | 在线首帧先验、保留片段训练先验、按键前缀与幂等插入 |
 | `src/supermimic/runners/supermimic_runner.py` | 三 | 采集模式、独立 provider、reset/restore、版本及保存恢复 |
@@ -246,77 +235,14 @@ actor 使用第一步的 `eit_rpv_v1`、5×93 历史和 700 维目标，每帧�
 **执行与验收顺序。**
 
 1. 提交一完成后，独立验收几何、完整状态布局和 actor 投影，同时运行受影响的第一步几何与输入测试。
-2. 提交二完成后，在合成数据上验收随机分布、传播、观测更新、covariance reset 和 posterior NLL 梯度；通过后进入 provider 集成。
+2. 提交二完成后，在合成数据上验收随机分布、传播、观测更新、covariance reset 和冻结模型后的动作梯度；通过后进入 provider 集成。
 3. 提交三完成后，验收时序、失败重试、版本边界、CPU 真实采集与至少两步随机想象的梯度，再运行完整仓库回归测试。GPU 可用时补充实际设备 smoke，并分别记录已验证与未验证的设备。
 
 几何和数值导数检查优先使用 float64；实际运行 dtype 另设合理容差。Monte Carlo 使用固定种子和统计容差，梯度有限差分固定所有随机样本。每个提交均应有可单独执行的验收命令和结果记录；单元测试通过后再进入依赖环境的烟雾验证。
 
-**第二步完成条件及后续接口。** 三个提交的验收全部通过，完整 belief 能用统一的右局部几何传播和更新，真实 provider 可接入既有 actor 输入，均值与噪声头具备 posterior NLL 联合训练所需梯度，短序列策略梯度能够穿过滤波与随机动力学。
-
-接下来的模型训练阶段按 [第三步计划](plan_step3.md) 使用本步的完整后验、NLL 残差、随机分布接口及模型版本机制，实现从零联合训练，并在第五批接入直接旋转矩阵积分与向量化 Jacobian。保留片段后验重建和短序列随机想象已经可用；后续需要带模型学习图的序列重放、后验缓存及模型更新后的活动采集器刷新、规模化随机想象、B/C belief critic 与策略更新、runner 交替调度以及独立评估。当前仍保持完整 EIT learner 的阶段性入口保护，待这些依赖接通后再开放端到端训练。
-
-**Git 提交与分阶段验收。** 基于 `c22a8af`，依次拆分为下列四组。第一组修正第一步已承诺的奖励时序，其后三组对应本计划的三个实现阶段。想象快照 v2 的内容校验与 provider 集成一起提交。
-
-| 顺序 | Commit | Commit message | 范围 |
-|---|---|---|---|
-| 1 | `8369f9b` | `fix: align estimator body rewards with the current root pose` | 真实奖励在物理步之后读取当前根位姿，及真实/想象一致性回归 |
-| 2 | `75e4098` | `feat: add full belief state and right-local Lie geometry` | 完整状态/先验、李群几何、共享输入校验、actor 投影与几何测试 |
-| 3 | `4a803d2` | `feat: add stochastic dynamics and differentiable belief filtering` | 噪声头、Dynamics checkpoint/版本、纯函数滤波、NLL 及模型/动作导数测试 |
-| 4 | 本记录所在提交 | `feat: integrate belief providers and validate short rollout gradients` | provider、采集/重放/想象事务、参考内容校验、runner bundle、烟雾脚本与文档 |
-
-各组按以下完整文件暂存，运行产物不进入提交：
-
-1. `src/supermimic/tasks/env_cfgs.py`、`tests/test_estimator_motion_alignment.py`。
-2. `src/supermimic/belief.py`、`src/supermimic/utils/lie_state.py`、`src/supermimic/utils/validation.py`、`src/supermimic/estimator_inputs.py`、`tests/test_estimator_lie_state.py`、`tests/test_estimator_inputs.py`。
-3. `src/supermimic/models.py`、`src/supermimic/estimator.py`、`tests/test_estimator_stochastic_dynamics.py`、`tests/test_estimator_belief_filter.py`。
-4. `src/supermimic/belief_provider.py`、`src/supermimic/replay_buffer.py`、`src/supermimic/runners/supermimic_runner.py`、`src/supermimic/envs/world_model_env.py`、`src/supermimic/envs/multi_task_world_model_env.py`、`src/supermimic/motion_loader.py`、`src/supermimic/scripts/train.py`、`src/supermimic/scripts/check_estimator.py`；`tests/conftest.py`、`tests/public_mjlab/test_motion_loader.py`、`tests/test_estimator_runner.py`、`tests/test_estimator_belief_provider.py`、`tests/test_estimator_belief_integration.py`、`tests/test_estimator_replay_restore.py`；`README.md`、`README_eval.md`、`plan_step1.md`、`plan_step2.md`。
-
-runner 的两项 `WorldModel.bundle/load_bundle` 测试已放入 `test_estimator_belief_integration.py`，使第三个 Git commit 的核心模型测试无需依赖后续 runner 集成。每批验收从提交前的 HEAD 导出临时目录，仅叠加本批文件，再用项目虚拟环境运行下面的测试集。通过显式 `PYTHONPATH` 与导入路径断言确认源码及测试来自候选目录，提交前核对文件内容与验收副本一致。
+**后续接口。** 策略起点按当前模型从保留片段的先验重建完整后验。两个模型拟合阶段直接使用真实 replay 帧，在线采集和策略想象共用更新后的动力学模型。[训练与验收](plan_step3.md)
 
 ```bash
-# Commit 1
-OMP_NUM_THREADS=1 .venv/bin/python -m pytest -q tests/test_estimator_motion_alignment.py
-# Commit 2
-OMP_NUM_THREADS=1 .venv/bin/python -m pytest -q tests/test_estimator_lie_state.py tests/test_estimator_inputs.py
-# Commit 3
-OMP_NUM_THREADS=1 .venv/bin/python -m pytest -q tests/test_estimator_stochastic_dynamics.py tests/test_estimator_belief_filter.py
-# Commit 4：完整仓库回归与真实采集/随机想象
-OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-step2-mpl .venv/bin/python -m pytest -q
-OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-step2-mpl .venv/bin/python -m supermimic.scripts.check_estimator
+OMP_NUM_THREADS=1 .venv/bin/python -m pytest -q tests/test_estimator_lie_state.py tests/test_estimator_matrix_dynamics.py tests/test_estimator_belief_filter.py
+OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.check_estimator --device cpu
 ```
-
-每组 Python 文件均执行 Ruff lint/format 检查，暂存后检查 `git diff --cached --check` 与 `git diff --cached --stat`，最后创建对应 commit。最后一批仅在测试通过后补写验收记录，不再修改已测试的 Python 内容。
-
-**分阶段验收记录（2026-11-20）。** 每批在只包含前序提交和本批变更的独立候选目录中验收，未借用后续代码。前三个 commit 的完整文件树已与各自通过测试的候选副本逐文件核对；第四批验收后仅补写 Markdown 记录，Python 内容保持一致。
-
-| Git 批次 | 验证范围 | 结果 | pytest 用时 |
-|---|---|---|---|
-| 1：`8369f9b` | 真实/想象奖励对齐 | 10 passed | 0.06 秒 |
-| 2：`75e4098` | 完整 belief、李群几何、RPV 输入与任务 covariance | 31 passed | 1.06 秒 |
-| 3：`4a803d2` | 随机动力学、纯函数滤波、NLL 与方向导数 | 32 passed | 51.84 秒 |
-| 4：本记录所在提交 | Git 候选树完整回归 | 433 passed，14 warnings | 297.69 秒 |
-| 本地补充回归 | 4 份被忽略的测试，单独在第四批候选代码上运行 | 47 passed | 6.48 秒 |
-
-第二批首次命令包含多余的几何测试路径，pytest 未启动；已修正为上方两份现有测试文件并通过验收。各批 Ruff lint/format 与差异检查均通过，四组文件清单覆盖本次全部 30 个变更文件。
-
-此前“480 passed”是整个本地工作区的结果，包含 `.gitignore` 排除的 `tests/test_play_config.py`、`tests/test_relocate_wandb.py`、`tests/test_runner_log_dir.py`、`tests/test_train_config.py`。本次将其与实际 Git 候选树分开验收：433 + 47 = 480。补充测试还使用原有被忽略的 `download_training.sh`，这些本地文件均保持原有忽略状态，未加入本次提交。全新 checkout 的完整回归预期为 433 项；参考身份修复新增的 13 个回归用例全部位于 Git 提交树内。
-
-| 其他检查 | 结果 |
-|---|---|
-| 修改/新增的 26 个 Python 文件 | 分批 Ruff lint 与 format 检查通过 |
-| 文档 | 4 份说明/计划的本地链接与源码/测试路径已核对，阶段命令已修正 |
-| CPU MuJoCo smoke | 第四批候选代码，float32、batch=2、8 步采集、2 步随机想象；首帧/重置槽位计数 4（含初始 2 槽） |
-| Replay 与快照 | 保留片段起点为物理帧 `[2, 2]`；重建后验与独立前缀计算一致；v2 想象快照恢复通过 |
-| Actor 输入 | history `(2,5,93)`，goal `(2,700)`，uncertainty `(2,450)` |
-| 数值与梯度 | 最小 covariance 特征值约 1.91349e-5，最大方差约 0.0135412；采集 jitter 槽位数 0；末次采集最大 innovation norm 约 11.1209；actor 梯度有限且存在非零项 |
-| Smoke 耗时 | 采集 1.49 秒；想象前向/反向及快照验证 13.73 秒；总计 16.42 秒 |
-
-完整回归覆盖参考位置、朝向、关节和各速度字段的原地变化、等长 clip 内容变化与重排、缺失指纹/旧 v1 快照拒绝，以及相同参考下的恢复与梯度一致性。警告来自 TorchScript/ONNX 弃用提示与 NVML 初始化；本机无可用 CUDA，未验证 GPU。上述结果只证明 CPU 小规模接口、数值与计算图可用，尚未验证完整 EIT 学习或闭环控制性能。
-
-**审阅修正及验收（2026-11-20，基于 `46882f4`）。**
-
-直接调用滤波核心时，`transition_jacobian` 现在拒绝 `torch.inference_mode()`，避免返回全零传播矩阵而丢失先验 covariance。无外层梯度的评估使用 `torch.no_grad()`；真实 provider 继续通过已有的局部 inference-mode 退出和普通 tensor 克隆计算 Jacobian。
-
-世界模型加载先校验 dynamics、sim context 和 estimator 配置，再写入参数与配置；actor 加载也在复制前校验全部参数和 buffer。校验覆盖键集合、形状、dtype、tensor layout、有限值及 sim context 的正尺度。新增失败恢复测试使用不同的来源/目标权重，检查目标模型指纹、归一化和配置在失败后保持原值。
-
-本批新增 25 项回归，已跟踪根目录测试 **428 passed**（304.06 秒），`tests/public_mjlab` **30 passed**（1.50 秒），合计 **458 passed**。七个修改的 Python 文件通过 Ruff lint/format；CPU float32 MuJoCo smoke 通过，batch=2、8 步采集、2 步随机想象，actor 梯度有限、快照恢复成功，总计 15.32 秒。GPU 与完整联合训练仍未验证。

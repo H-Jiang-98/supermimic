@@ -2,13 +2,74 @@
 
 from __future__ import annotations
 
+import argparse
+
 import torch
 import wandb
 from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.utils.torch import configure_torch_backends
 
+from supermimic.learners.two_stage_wm import CovarianceFitCfg, MeanFitCfg
 from supermimic.utils.wandb_artifacts import download_artifact_cached
+
+
+def add_model_fit_args(parser: argparse.ArgumentParser) -> None:
+  mean = parser.add_argument_group("autoregressive mean fit")
+  mean.add_argument(
+    "--mean-lr", type=float, default=MeanFitCfg.lr, help="Muon/Adam learning rate"
+  )
+  mean.add_argument(
+    "--mean-updates",
+    type=int,
+    default=MeanFitCfg.num_batches,
+    help="Mean optimizer updates per round",
+  )
+  mean.add_argument(
+    "--mean-batch-size",
+    type=int,
+    default=MeanFitCfg.batch_size,
+    help="Windows per mean update",
+  )
+  mean.add_argument(
+    "--mean-window-frames",
+    type=int,
+    default=MeanFitCfg.window_frames,
+    help="Recorded frames per window, including the real initial state",
+  )
+  cov = parser.add_argument_group("one-step process covariance fit")
+  cov.add_argument(
+    "--cov-lr",
+    type=float,
+    default=CovarianceFitCfg.lr,
+    help="Noise-head Adam learning rate",
+  )
+  cov.add_argument(
+    "--cov-batch-size",
+    type=int,
+    default=CovarianceFitCfg.batch_size,
+    help="Residuals per covariance update, including a partial final batch",
+  )
+  cov.add_argument(
+    "--cov-epochs",
+    type=int,
+    default=CovarianceFitCfg.epochs,
+    help="Shuffled passes over all retained training pairs per round",
+  )
+
+
+def model_fit_configs(args) -> tuple[MeanFitCfg, CovarianceFitCfg]:
+  return (
+    MeanFitCfg(
+      lr=args.mean_lr,
+      num_batches=args.mean_updates,
+      batch_size=args.mean_batch_size,
+      window_frames=args.mean_window_frames,
+    ),
+    CovarianceFitCfg(
+      lr=args.cov_lr, batch_size=args.cov_batch_size, epochs=args.cov_epochs
+    ),
+  )
 
 
 def download_registry_motions(registry_name: str | None) -> str | list[str] | None:

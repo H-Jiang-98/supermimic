@@ -7,11 +7,18 @@ import torch
 from supermimic.models import ProcessNoiseConfig
 from supermimic.runners.eit_training import EITTraining
 from supermimic.runners.supermimic_runner import SuperMimicRunner, SuperMimicRunnerCfg
-from supermimic.scripts.check_belief_training import stationary_motion
+from supermimic.scripts.check_eit_training import parse_args
+from supermimic.scripts.check_estimator import stationary_motion
 from supermimic.scripts.eval_eit import evaluate
 from supermimic.scripts.train_utils import create_env
 from supermimic.tasks.env_cfgs import configure_estimator_env_cfg, gencoord_env_cfg
 from tests.test_estimator_eit_training import training
+
+
+def test_acceptance_policy_horizon_flags_select_the_same_option():
+  assert parse_args(["--horizon", "2"]).policy_horizon == 2
+  assert parse_args(["--policy-horizon", "2"]).policy_horizon == 2
+  assert parse_args([]).policy_horizon == 4
 
 
 def test_creating_and_reusing_shared_initialization_leave_same_training_rng():

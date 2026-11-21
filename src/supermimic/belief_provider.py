@@ -438,7 +438,7 @@ class BeliefProvider:
     }
 
   def prepare_load_state_dict(self, data: dict) -> PreparedBelief:
-    if data.get("version") not in ("right_local_provider_v2", PROVIDER_VERSION):
+    if data.get("version") != PROVIDER_VERSION:
       raise ValueError("Unsupported provider state version")
     if (
       data.get("state_layout_version") != STATE_LAYOUT_VERSION
@@ -452,19 +452,18 @@ class BeliefProvider:
     ):
       raise ValueError("Provider/filter configuration mismatch")
     mean = LieState.from_full(data["mean"])
-    if "rotation" in data:
-      rotation = data["rotation"]
-      tol = 128 * torch.finfo(mean.rotation.dtype).eps
-      if (
-        rotation.shape != mean.rotation.shape
-        or rotation.dtype != mean.rotation.dtype
-        or rotation.device != mean.rotation.device
-        or not torch.allclose(mean.rotation, rotation, atol=tol, rtol=tol)
-      ):
-        raise ValueError("Snapshot rotation disagrees with the packed mean")
-      mean = replace(mean, rotation=rotation)
+    rotation = data["rotation"]
+    tol = 128 * torch.finfo(mean.rotation.dtype).eps
+    if (
+      rotation.shape != mean.rotation.shape
+      or rotation.dtype != mean.rotation.dtype
+      or rotation.device != mean.rotation.device
+      or not torch.allclose(mean.rotation, rotation, atol=tol, rtol=tol)
+    ):
+      raise ValueError("Snapshot rotation disagrees with the packed mean")
+    mean = replace(mean, rotation=rotation)
     belief = BeliefState(mean, data["covariance"])
-    heads = data.get("head_priors")
+    heads = data["head_priors"]
     head_priors = (
       None
       if heads is None

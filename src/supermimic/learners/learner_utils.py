@@ -36,21 +36,85 @@ def build_optimizers(
   return [adam, torch.optim.Muon(hidden, lr=lr, adjust_lr_fn="match_rms_adamw")]
 
 
+def validate_optimizer_state(
+  optimizer: torch.optim.Optimizer, saved: dict, steps: int
+) -> None:
+  """Preflight the Adam or Muon parameter groups and moments before a restore."""
+  if type(steps) is not int or steps < 0:
+    raise ValueError("Invalid optimizer step count")
+  groups = optimizer.state_dict()["param_groups"]
+  if (
+    not isinstance(saved, dict)
+    or saved.keys() != {"param_groups", "state"}
+    or saved["param_groups"] != groups
+  ):
+    raise ValueError("Optimizer parameter groups mismatch")
+  params = [
+    (index, parameter)
+    for saved_group, live_group in zip(groups, optimizer.param_groups, strict=True)
+    for index, parameter in zip(
+      saved_group["params"], live_group["params"], strict=True
+    )
+  ]
+  moments = saved.get("state")
+  if not isinstance(moments, dict) or set(moments) != (
+    {index for index, _ in params} if steps else set()
+  ):
+    raise ValueError("Optimizer state does not match its step count")
+  if not steps:
+    return
+  fields = (
+    {"momentum_buffer"}
+    if isinstance(optimizer, torch.optim.Muon)
+    else {"exp_avg", "exp_avg_sq", "step"}
+  )
+  for key, parameter in params:
+    values = moments[key]
+    if not isinstance(values, dict) or set(values) != fields:
+      raise ValueError("Invalid optimizer moment fields")
+    for name, value in values.items():
+      if (
+        not isinstance(value, torch.Tensor)
+        or value.layout != torch.strided
+        or value.is_meta
+        or not torch.isfinite(value).all()
+      ):
+        raise ValueError("Invalid optimizer state tensor")
+      if name == "step":
+        if (
+          value.ndim != 0
+          or value.dtype not in (torch.float32, torch.float64)
+          or float(value) != steps
+        ):
+          raise ValueError("Adam step count mismatch")
+      elif value.shape != parameter.shape or value.dtype != parameter.dtype:
+        raise ValueError("Optimizer moment shape or dtype mismatch")
+      elif name == "exp_avg_sq" and (value < 0).any():
+        raise ValueError("Negative Adam second moment")
+
+
 def _optimize_step(
   optimizers: Sequence[torch.optim.Optimizer],
   loss: torch.Tensor,
   params: Iterable[torch.Tensor] | None = None,
   max_norm: float | None = None,
   clip_value: float = 0.0,
+  *,
+  check_finite: bool = False,
 ) -> torch.Tensor | None:
   """Run one optimizer step: zero_grad -> backward -> optional clip -> step."""
   for optimizer in optimizers:
     optimizer.zero_grad(set_to_none=True)
+  if check_finite and not torch.isfinite(loss):
+    raise FloatingPointError("Non-finite optimizer loss")
   loss.backward()
   grad_norm = None
   if params is not None and max_norm is not None:
-    # Don't set error_if_nonfinite=True: it forces a per-step CPU<->GPU sync.
-    grad_norm = torch.nn.utils.clip_grad_norm_(params, max_norm=max_norm)
+    # Captured updates cannot synchronize with the host. The eager model fit
+    # checks the pre-clipping norm before either Adam or Muon can mutate state.
+    grad_norm = torch.nn.utils.clip_grad_norm_(
+      params, max_norm=max_norm, error_if_nonfinite=check_finite
+    )
     if clip_value > 0:
       torch.nn.utils.clip_grad_value_(params, clip_value)
   for optimizer in optimizers:

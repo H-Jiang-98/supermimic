@@ -212,7 +212,7 @@ def test_eit_critic_snapshot_contract_rejects_encoding_changes(change):
   if change == "scale":
     env.critic_input_config = CriticInputConfig(group="C", remaining_time_scale=2.0)
   else:
-    snapshot["critic_config"]["version"] = "eit_full_belief_critic_v1"
+    snapshot["critic_config"]["version"] = "unknown_critic_version"
   with pytest.raises(ValueError, match="critic configuration"):
     env.restore(snapshot)
   assert env.posterior_provider.state is state

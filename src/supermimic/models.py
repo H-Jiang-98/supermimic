@@ -142,7 +142,6 @@ class Dynamics(nn.Module):
       )
       rows, cols = torch.tril_indices(70, 70)
       self.register_buffer("_noise_indices", rows * 70 + cols, persistent=False)
-      self.register_buffer("_noise_diagonal", rows == cols, persistent=False)
       output = self.noise_head[-1]
       nn.init.zeros_(output.weight)
       nn.init.zeros_(output.bias)
@@ -151,7 +150,7 @@ class Dynamics(nn.Module):
       # Numerically stable inverse softplus, giving the requested initial std.
       inverse = target + torch.log(-torch.expm1(-target))
       with torch.no_grad():
-        output.bias[self._noise_diagonal] = inverse.to(output.bias)
+        output.bias[rows == cols] = inverse.to(output.bias)
 
   def proc(self, action: torch.Tensor) -> torch.Tensor:
     """Map raw policy output to proc joint commands: ``action * scale + offset``."""
@@ -168,6 +167,16 @@ class Dynamics(nn.Module):
       return self.mean_lie(
         LieState.from_rep(aux_state, rep_state), action, sim_ctx
       ).to_rep()
+    return self.mean_rep(rep_state, action, aux_state, sim_ctx)
+
+  def mean_rep(
+    self,
+    rep_state: torch.Tensor,
+    action: torch.Tensor,
+    aux_state: torch.Tensor,
+    sim_ctx: torch.Tensor,
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    """SuperMimic mean transition in rollout coordinates."""
     prediction = self.mlp(self._normalized_inputs(rep_state, action, sim_ctx))
     return self._apply_prediction(aux_state, rep_state, prediction, self.dt)
 
@@ -177,21 +186,30 @@ class Dynamics(nn.Module):
     """Matrix mean transition; validation belongs outside jacrev/vmap."""
     if self._represent_lie is None or self._apply_prediction_lie is None:
       raise ValueError("Lie dynamics requires GenCoord representation")
-    inputs = self._normalized_inputs(self._represent_lie(state), action, sim_ctx)
+    inputs = self.lie_inputs(state, action, sim_ctx)
     return self._apply_prediction_lie(state, self.mlp(inputs), self.dt)
 
-  def _noise_factor(self, inputs: torch.Tensor) -> torch.Tensor:
+  def lie_inputs(
+    self, state: LieState, action: torch.Tensor, sim_ctx: torch.Tensor
+  ) -> torch.Tensor:
+    if self._represent_lie is None:
+      raise ValueError("Lie dynamics requires GenCoord representation")
+    return self._normalized_inputs(self._represent_lie(state), action, sim_ctx)
+
+  def noise_factor(self, inputs: torch.Tensor) -> torch.Tensor:
     if self.noise_head is None or self.process_noise_config is None:
       raise ValueError("distribution() requires an explicit ProcessNoiseConfig")
     values = self.noise_head(inputs)
-    values = torch.where(
-      self._noise_diagonal,
-      F.softplus(values) + self.process_noise_config.diagonal_floor,
-      values,
-    )
     indices = self._noise_indices.expand_as(values)
-    lower = values.new_zeros(*values.shape[:-1], 4900).scatter(-1, indices, values)
-    return lower.reshape(*values.shape[:-1], 70, 70)
+    raw = values.new_zeros(*values.shape[:-1], 4900).scatter(-1, indices, values)
+    raw = raw.reshape(*values.shape[:-1], 70, 70)
+    scale = (
+      F.softplus(raw.diagonal(dim1=-2, dim2=-1))
+      + self.process_noise_config.diagonal_floor
+    )
+    # Each row has a different physical unit. Learn unrestricted off-diagonals
+    # in units of its diagonal so an Adam step has a comparable relative size.
+    return raw.tril(-1) * scale.unsqueeze(-1) + torch.diag_embed(scale)
 
   def distribution_lie(
     self, state: LieState, action: torch.Tensor, sim_ctx: torch.Tensor
@@ -199,10 +217,10 @@ class Dynamics(nn.Module):
     """Matrix mean and full right-local process factor, sharing model inputs."""
     if self._represent_lie is None or self._apply_prediction_lie is None:
       raise ValueError("Lie dynamics requires GenCoord representation")
-    inputs = self._normalized_inputs(self._represent_lie(state), action, sim_ctx)
+    inputs = self.lie_inputs(state, action, sim_ctx)
     return (
       self._apply_prediction_lie(state, self.mlp(inputs), self.dt),
-      self._noise_factor(inputs),
+      self.noise_factor(inputs),
     )
 
   def sample_lie(
@@ -258,7 +276,12 @@ class Dynamics(nn.Module):
     from supermimic.utils.lie_state import STATE_LAYOUT_VERSION, TANGENT_VERSION
 
     return {
-      "format_version": "stochastic_dynamics_v2",
+      # The row-scaled process factor changes the stochastic snapshot format.
+      "format_version": (
+        "stochastic_dynamics_v3"
+        if self.process_noise_config
+        else "stochastic_dynamics_v2"
+      ),
       "state_layout": STATE_LAYOUT_VERSION,
       "tangent_version": TANGENT_VERSION,
       "process_noise": (
@@ -273,9 +296,6 @@ class Dynamics(nn.Module):
         ),
       },
     }
-
-  def mark_updated(self) -> None:
-    """Compatibility hook. Version queries now inspect the actual weights."""
 
   @property
   def model_version(self) -> str:
@@ -317,41 +337,6 @@ class Dynamics(nn.Module):
     digest = self._content_digest(checkpoint["metadata"], supplied)
     if digest != checkpoint.get("model_version"):
       raise ValueError("Dynamics checkpoint content does not match its model version")
-
-  def migrate_checkpoint(self, checkpoint: dict[str, Any]) -> dict[str, Any]:
-    """Migrate verified weights from either earlier stochastic integrator.
-
-    This returns a new snapshot, without loading it. Active posterior caches
-    must be discarded because its model version changes. Optimizer migration
-    and online state are intentionally not inferred from a weights snapshot.
-    """
-    if self.process_noise_config is None:
-      raise ValueError("Checkpoint migration requires stochastic dynamics")
-    metadata = self._checkpoint_metadata()
-    old_quaternion = {
-      **metadata,
-      "format_version": "stochastic_dynamics_v1",
-      "integration": {
-        key: value for key, value in metadata["integration"].items() if key != "version"
-      },
-    }
-    old_matrix = {
-      **metadata,
-      "integration": {**metadata["integration"], "version": "right_matrix_v1"},
-    }
-    source = checkpoint.get("metadata")
-    if source not in (old_quaternion, old_matrix):
-      raise ValueError("Unknown or incompatible stochastic dynamics checkpoint")
-    supplied = checkpoint.get("state_dict")
-    validate_state_dict(self, supplied, "Dynamics")
-    if self._content_digest(source, supplied) != checkpoint.get("model_version"):
-      raise ValueError("Dynamics checkpoint content does not match its model version")
-    state = {key: value.detach().clone() for key, value in supplied.items()}
-    return {
-      "metadata": metadata,
-      "state_dict": state,
-      "model_version": self._content_digest(metadata, state),
-    }
 
   def load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
     """Validate the complete snapshot before mutating the live model."""

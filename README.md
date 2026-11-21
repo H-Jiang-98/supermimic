@@ -453,8 +453,7 @@ provider 自身的状态更新及其调用前的噪声采样不在环境回滚�
 仍严格匹配。世界模型和估计器后续也须从相同初始权重建立独立实例。
 
 输入阶段可运行采集和短序列计算图验证，`run()` / policy learner `update()` 明确拒绝
-完整策略训练。第二步接入真实滤波器，第三步通过独立 `train_belief` 入口联合训练
-均值模型和噪声头；第四步通过 `train_eit` 接通 belief critic、策略优化和短程闭环评估。
+完整策略训练。第二步接入真实滤波器，第三步通过 `train_belief` 先拟合预测均值，再拟合过程 covariance。第四步通过 `train_eit` 接通 belief critic、策略优化和短程闭环评估。
 play/viewer 已通过共享 EIT 适配层支持本地 `training.pt`，用法见
 [EIT 评估与播放](README_eval.md#eit-定量评估和播放)；benchmark 和 ONNX exporter 尚未适配。
 
@@ -473,14 +472,14 @@ OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
 70 维右局部误差为 `[theta, rho, nu, omega_body, q, qdot]`。`BeliefState`
 持有完整均值和 70×70 covariance，`to_actor_input()` 提取前 9 维边缘块供现有
 700 维目标与 450 维 FiLM 分支使用。B/C critic 也只编码后验的 R/p/v 均值与
-9×9 边缘 covariance；滤波器、replay 起点和 posterior NLL 仍使用完整 belief。
+9×9 边缘 covariance；滤波器和 replay 策略起点使用完整 belief。
 
 `Dynamics(..., process_noise=ProcessNoiseConfig(...))` 启用 2485 维下三角噪声头。
 `distribution(rep, action, aux, context)` 返回均值及 L；`sample(..., epsilon)`
-在预测均值右侧注入 Lε。L 的对角使用 softplus 加显式下界。默认初始标准差
+在预测均值右侧注入 Lε。L 的对角使用 softplus 加显式下界，每行的非对角系数乘以该行的对角尺度。默认初始标准差
 按上述六个误差块依次为 `(0.01, 0.001, 0.05, 0.05, 0.005, 0.05)`，单位与
 对应物理量一致，表示一个控制步的过程噪声。均值和噪声头共同注册为模型参数，
-第三步从零以 posterior NLL 联合训练。`forward` 返回确定性均值；随机模型使用下述矩阵积分核心。
+每轮分别用多步均值误差和一步过程残差更新。`forward` 返回确定性均值；随机模型使用下述矩阵积分核心。
 
 `LieBeliefFilter` 是纯函数核心，提供 `initialize`、`predict`、`correct`、
 `observation` 及 `to_actor_input`。64 维观测使用第一步的高斯配置。
@@ -489,10 +488,7 @@ OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
 随后执行 Joseph covariance 更新与右局部坐标 reset。调用
 `predict/correct(..., return_diagnostics=True)` 可读取 A、innovation、增益、
 reset Jacobian、effective_rank 和 jitter。增益求解使用的 jitter 同时进入 Joseph 更新的测量 covariance。
-`posterior_nll` 使用完整 70 维高斯密度。某行后验数值秩亏时，对该行应用
-`FilterConfig` 规定的有界 jitter，并在诊断中报告实际值。良态样本的 jitter 为零。
-默认 jitter 从 `1e-8` 开始、每次乘 10、上限 `1e-4`，最多重试 5 次；
-非有限或显著非半正定输入直接报错。秩亏观测更新允许 PSD 后验，NLL 单独处理其退化。
+满秩 innovation 求解默认从 `1e-8` 开始尝试 jitter，每次乘 10，最多 5 次，上限 `1e-4`。
 
 真实采集可通过 runner 绑定同一个模型及独立的两个 provider：
 
@@ -523,7 +519,7 @@ provider 持有当前完整后验及其 `episode_id`、`time_index`、`model_ver
 `time_index` 从 0 开始，与参考片段的 `motion_time` 分别计数。runner 每次构建
 actor 输入都以当前帧标识向 provider 查询，同帧 restore 后立即使用恢复的后验。
 
-真实 provider 的 v3 快照额外记录实际使用的在线首帧先验，可通过 `episode_prefix` 核对完整物理前缀。v2 快照也可继续采集，但缺少首帧先验时不能用它恢复完整物理前缀；训练片段仍使用自己的先验。
+真实 provider 的 v3 快照额外记录实际使用的在线首帧先验，可通过 `episode_prefix` 核对完整物理前缀。策略训练使用保留片段自己的先验。
 `finish_collection_round()` 对每个保留片段建立训练先验。重复读取或更新模型时复用同一份抽样，覆盖片段首帧后才为新的起点抽样。首次按键重放也会自动完成本轮分段。在线滤波和历史连续推进。
 想象 reset 接收标量或每个槽位各自的索引。`time_index` 定位物理 episode 中的帧，`segment_time` 定位保留片段中的帧。
 
@@ -536,7 +532,7 @@ saved = runner.wm_env.snapshot()
 obs = runner.wm_env.restore(saved)
 ```
 
-reset 在当前模型版本上重建从片段起点到目标帧的完整后验，以及同一目标帧的 actor 历史、潜在状态、参考和 ξ。该重建不保留历史模型学习图，返回的后验作为想象初始条件；第三步 learner 只对选定训练窗口保留计算图，并在每次更新后重新重建前缀。所选物理帧已被覆盖或片段内部断开时，reset 报错并保留原 rollout。
+reset 在当前模型版本上重建从片段起点到目标帧的完整后验，以及同一目标帧的 actor 历史、潜在状态、参考和 ξ。该重建不保留历史模型学习图，返回的后验作为策略想象的初始条件。均值拟合直接从窗口首帧真值开始。所选物理帧已被覆盖或片段内部断开时，reset 报错并保留原 rollout。
 想象环境的 `snapshot()/restore()` 保存和恢复已提交帧的潜在状态、历史、动作、参考时间与对齐、ξ 及完整后验。可在相同模型和参考运动上直接从纯想象帧继续，恢复时不抽样、不重复融合测量。后续两个噪声参数均为标准正态样本，省略时各采样一次。奖励使用潜在真值。
 
 想象环境快照使用 `version=2`，与 provider 的 v3 是不同的版本标识。
@@ -584,74 +580,29 @@ OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-step2-mpl \
 
 MuJoCo smoke 自动生成四帧静止参考，使用 2 个环境、容量为 2 的环形 buffer、8 步真实采集和两步随机想象。脚本独立核对从保留片段重建的完整均值和 covariance，再检查想象回报对 actor 的梯度和纯想象帧快照恢复，输出 JSON 诊断。使用 `--device cuda:0` 可运行 GPU 验收。策略/模型联合调度和 belief critic 见第四步。
 
-第二步历史验收（2026-11-20）：Git 提交候选树完整回归 **433 passed**，另有 4 份
-被忽略的本地测试在同一候选代码上 **47 passed**；两部分对应此前工作区的 480 项。
-CPU MuJoCo smoke 及各批 Python 文件的 Ruff lint/format 均通过，GPU 尚未验证。
-具体范围、数值、耗时及基于 `c22a8af` 的四组提交记录见 [plan_step2.md](plan_step2.md)。
+## Estimator 第三步：拟合预测均值和过程 covariance
 
-## Estimator 第三步：均值与噪声头联合学习
+`train_belief` 固定 actor。每轮采集结束后，用新训练帧更新模型归一化，然后完成两次拟合。验证 episode 默认满足 `episode_id % 5 == 0`。采样只使用同一 episode 中时间连续的真实后继帧。
 
-[plan_step3.md](plan_step3.md) 已实现独立 `BeliefWorldModelLearner` 和轮次训练入口。
-均值网络和过程噪声头共同从初始化参数学习，目标为完整 70 维 posterior NLL。
-每个窗口保留 T+1 帧；窗口前缀按当前模型重放，到边界 detach 后进行可微展开。
-没有记录 successor 的终止动作不计分。microbatch 按有效转移总数累积梯度。
-
-启动模型训练（本地 motion，固定 actor）：
+| 阶段 | 数据与目标 | 默认配置 |
+|---|---|---|
+| 预测均值 | 从真实首帧开始回喂预测，优化根位置、根朝向、关节位置和关节速度的加权 MSE | 8 帧窗口、7 步预测，每批 2048 窗，每轮 10 次 Muon/Adam 更新 |
+| 过程 covariance | 按本轮更新后的均值计算全部一步右局部残差，以零均值高斯 NLL 拟合完整下三角因子 | 独立 Adam，每批 256 对，每轮打乱遍历一次，含末批 |
 
 ```bash
-OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
-  .venv/bin/python -m supermimic.scripts.train_belief \
-  --motion-file data/motions/walk1_subject1.npz \
-  --device cuda:0 --group B --output logs/belief-b \
-  --num-envs 8 --rounds 10 --collection-steps 64 \
-  --updates 10 --batch-size 4 --microbatch-size 2 --horizon 2
+OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.train_belief \
+  --motion-file data/motions/walk1_subject1.npz --device cuda:0 \
+  --output logs/belief-b --group B --rounds 10 \
+  --mean-window-frames 8 --mean-batch-size 2048 --mean-updates 10 --mean-lr 2e-4 \
+  --cov-batch-size 256 --cov-epochs 1 --cov-lr 2e-4
 ```
 
-将 motion 路径替换为已有文件。默认均值网络为 `(2048, 2048, 2048)`，噪声头为
-`(128, 64)`。每轮固定模型采集，再封存片段、仅用新采集的训练 episode 更新归一化、
-训练、验证和保存，最后 reset 环境、历史和 provider。actor 权重和归一化保持固定。
-验证 episode 按 `episode_id % 5 == 0` 划分，所有窗口与统计共享该划分；buffer 中
-必须同时保留两组有效转移。首次验收建议短窗口，随后依据实际 NLL 和 covariance
-诊断扩大训练，而不是将运行成功视为已经收敛。
-
-本轮只有新验证帧时，训练沿用现有归一化统计，并从保留的训练 episode 取样。
-输出目录包含 `metrics.jsonl` 和 `training.pt`。日志含 posterior/prediction NLL、
-Mahalanobis、log determinant、分块误差及方差、边缘 95% 覆盖率、jitter 和两头梯度范数。
-训练日志中的 `valid_transitions` 为轮次总数，损失和诊断按有效转移数加权，梯度范数按更新次数平均。
-checkpoint 包含完整模型、归一化、固定 actor、optimizer、步数、配置、motion 内容指纹和训练使用的 PyTorch RNG。
-重复同一命令并加入 `--resume logs/belief-b/training.pt` 可继续训练，`--rounds` 指新增轮数。
-恢复时核对 motion 的内容指纹。已有实验目录只接受本目录当前的 `training.pt`，
-也可以指定空目录从某个 checkpoint 另起一次记录。CPU 实验只需 CPU RNG，
-CUDA 实验另存训练设备的 RNG。旧版 `belief_model_training_v1` 缺少 motion 指纹，
-需要使用下述权重迁移接口重新开始训练。
-恢复会清空 replay 并 reset 物理轨迹，固定下一批输入时模型/optimizer 更新一致；
-它不恢复 MuJoCo/Warp 的历史物理轨迹。
-
-矩阵核心接口为 `Dynamics.mean_lie`、`distribution_lie`、`sample_lie`。
-随机模型 checkpoint 使用 `stochastic_dynamics_v2`，积分版本为 `right_matrix_v2`。
-第二步旧 bundle 或正交化之前的 `right_matrix_v1` 权重需显式使用
-`wm.migrate_bundle(old_bundle)`，再 `wm.load_bundle(...)`；
-仅有 dynamics checkpoint 时使用 `dynamics.migrate_checkpoint(...)`。
-迁移后必须重新配置 provider 并 reset，旧后验版本不能继续使用。
-
-可复现验收：
-
-```bash
-OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
-  .venv/bin/python -m supermimic.scripts.check_belief_training --device cuda:0
-OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.check_belief_scale --help
-```
-
-两轮真实 MuJoCo 采集与联合更新、固定输入恢复及随机想象均通过 CPU/GPU float32 验收。
-生产矩阵路径通过 CPU float64 有限差分与混合导数检查。RTX 5090 上，默认均值网络、
-batch=4、horizon=4 的 NLL 前向/反向约 0.20 秒，峰值分配显存约 273 MiB；该测量
-不包含采集、前缀重建、optimizer 或整轮 replay 内存。
-完整范围和可复现 JSON 记录见 [第三步实施记录](plan_step3.md#实施记录2026-11-20)。
+`metrics.jsonl` 记录两个阶段各自的步数、分组 MSE、每对转移的过程 NLL，以及训练和验证样本量。恢复时传入 `--resume logs/belief-b/training.pt` 和原 motion，`--rounds` 指新增轮数。两个阶段的优化器、配置、归一化和 RNG 均从轮次边界恢复，物理环境和 replay 重新开始。实现与实测结果见[第三步说明](plan_step3.md)。
 
 ## Estimator 第四步：完整策略与模型交替训练
 
 [plan_step4.md](plan_step4.md) 的完整训练入口是 `train_eit`。每轮依次采集、
-更新模型归一化、联合学习均值和噪声头、重建后验并更新 actor/critic 归一化、
+更新模型归一化、拟合均值、拟合过程 covariance、重建后验并更新 actor/critic 归一化、
 冻结世界模型执行随机想象策略梯度与 critic 回归，然后保存和 reset。
 `train_belief` 继续用于固定 actor 的模型学习，旧确定性训练仍使用原入口。
 
@@ -664,7 +615,7 @@ A 的 critic 不含 belief；B/C 使用相同结构，额外读取 12 维 R/p/v 
 三组 critic 共同读取真值、参考、控制历史、剩余 clip 时间和 context；A 的总输入为
 `1234 + dim(context)`，B/C 为 `1291 + dim(context)`。后验角速度、关节位置和
 关节速度的均值，以及 9×9 块之外的 covariance，不直接进入 B/C critic。
-滤波器继续传播完整 70×70 covariance，posterior NLL 仍覆盖完整状态；上述压缩只发生在
+滤波器传播完整 70×70 covariance。上述压缩只发生在
 critic 特征入口，保留 R/p/v 均值和边缘 covariance 的梯度。它是任务相关的信息压缩，
 长期价值与控制性能需通过实验验证，不能认为与完整 belief critic 等价。
 策略想象的 K 条轨迹共享起点与后验，独立采样过程及测量噪声；冻结参数时保留
@@ -679,7 +630,7 @@ clip 最后一个评分动作后停止回报，普通策略 horizon 截断保留
 
 A/B/C 的训练、评估和播放均要求联合 checkpoint 内嵌 `eit_rpv_belief_critic_v2` critic 契约。
 加载时校验组别、输入维度和 `rpv9_log_std_corr_v1` 编码。A 组也执行同一版本检查。
-新训练默认在输出目录的父目录创建或读取 `eit_initialization_eit_rpv_belief_critic_v2_seed<seed>.pt`。
+新训练默认在输出目录的父目录创建或读取 `eit_initialization_v2_eit_rpv_belief_critic_v2_seed<seed>.pt`。
 同一 seed 的三组使用同一份初始化包，分别写入各自的训练目录。也可用 `--initialization` 指定当前契约的初始化包。
 各组独立采集与更新。以下是初始工程配置，尚未验证长时控制收敛。
 
@@ -692,7 +643,7 @@ OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
 ```
 
 默认 N=4、K=2、H=4、microbatch=2，每轮一次 actor 更新及两轮 critic 回归；
-模型使用 step3 的 batch=4、microbatch=2、T=2、每轮十次更新。
+两个训练入口接受相同的 `--mean-*` 和 `--cov-*` 参数，默认配置见第三步。
 `--policy-horizon`、`--samples`、`--policy-batch-size`、`--policy-microbatch-size`
 分别控制想象长度、噪声轨迹数、起点数与分块。更大规模应先测量完整训练显存。
 
@@ -708,7 +659,7 @@ OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.eval_eit \
   --num-envs 8 --output logs/eit-rpv-v2/B/evaluation.json
 ```
 
-`eit_training_v1` 保存模型、actor、critic、三个 optimizer、归一化和 RNG。
+`eit_training_v2` 分别记录均值 Muon/Adam 和 covariance Adam 的状态。策略训练另存 actor、critic 及其优化器、归一化和随机数流。
 恢复前在私有副本上校验全部组件。恢复后清空 replay 并重置真实环境；固定相同
 原始输入和噪声可以验证优化器续训一致，但不承诺恢复物理模拟轨迹。
 `eval_eit` 复用 mjlab tracking 的首 episode 评估循环和跟踪指标，从 clip 头开始，
@@ -727,8 +678,7 @@ OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
   .venv/bin/python -m supermimic.scripts.check_eit_training --device cuda:0 --full-width
 ```
 
-A/B/C 两轮 CPU 训练的输入契约、恢复检查和短程评估结果见 [RPV critic 验证报告](docs/validation/eit_rpv_critic_cpu.json)。
-测试配置和评估步数见 [第四步验证说明](plan_step4.md#rpv-critic-输入修订2026-11-20)。
+实测的训练规模、恢复检查和推理验证见[第三步验收记录](plan_step3.md#实测验收)。
 
 ## Acknowledgements
 

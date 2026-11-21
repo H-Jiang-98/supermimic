@@ -1,4 +1,4 @@
-"""Real two-round EIT acceptance and fixed-input policy continuation.
+"""Real two-round EIT acceptance and fixed-input model and policy continuation.
 
 Use --device cuda:0 --full-width for the production network benchmark.
 """
@@ -21,11 +21,11 @@ from mjlab.tasks.registry import load_env_cfg
 
 import supermimic.tasks  # noqa: F401
 from supermimic.learners.belief_policy_learner import BeliefPolicyLearnerCfg
-from supermimic.learners.belief_wm_learner import BeliefWorldModelLearnerCfg
+from supermimic.learners.two_stage_wm import CovarianceFitCfg, MeanFitCfg
 from supermimic.models import ProcessNoiseConfig
 from supermimic.runners.eit_training import EITTraining, EITTrainingCfg
 from supermimic.runners.supermimic_runner import SuperMimicRunner, SuperMimicRunnerCfg
-from supermimic.scripts.check_belief_training import stationary_motion
+from supermimic.scripts.check_estimator import stationary_motion
 from supermimic.scripts.train_utils import create_env
 from supermimic.tasks.env_cfgs import configure_estimator_env_cfg
 
@@ -45,17 +45,27 @@ def equal_tree(left, right):
     assert left == right
 
 
-def main():
+def next_model_update(learner, windows, pairs):
+  mean_loss = learner.update_mean(windows)
+  cov_loss = learner.update_covariance(learner.residual_data(pairs))
+  return mean_loss, cov_loss, learner.state_dict()
+
+
+def parse_args(argv=None):
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--device", default="cpu")
   parser.add_argument(
     "--groups", nargs="+", choices=("A", "B", "C"), default=["A", "B", "C"]
   )
   parser.add_argument("--full-width", action="store_true")
-  parser.add_argument("--horizon", type=int, default=4)
+  parser.add_argument("--policy-horizon", "--horizon", type=int, default=4)
   parser.add_argument("--samples", type=int, default=2)
   parser.add_argument("--output", type=Path)
-  args = parser.parse_args()
+  return parser.parse_args(argv)
+
+
+def main():
+  args = parse_args()
   torch.set_num_threads(1)
   torch.compiler.set_stance("force_eager")
   wp.config.kernel_cache_dir = str(
@@ -86,9 +96,8 @@ def main():
           dynamics_hidden_dims=(2048, 2048, 2048) if args.full_width else (32, 32),
           actor_hidden_dims=(2048, 1024, 512, 256) if args.full_width else (32, 16),
           critic_hidden_dims=(256, 128) if args.full_width else (32, 16),
-          belief_wm=BeliefWorldModelLearnerCfg(
-            batch_size=4, microbatch_size=2, horizon=2, num_batches=2
-          ),
+          mean=MeanFitCfg(batch_size=4, window_frames=3, num_batches=2),
+          cov=CovarianceFitCfg(batch_size=4),
           buffer_size=12,
           sampling_mode="start",
         )
@@ -104,7 +113,7 @@ def main():
           BeliefPolicyLearnerCfg(
             batch_size=4,
             num_samples=args.samples,
-            horizon=args.horizon,
+            horizon=args.policy_horizon,
             microbatch_size=2,
             noise=0.0,
           ),
@@ -143,8 +152,15 @@ def main():
         train_ids, _ = training.episode_split()
         starts = runner.wm_env.sample_policy_starts(2, train_ids)
         noises = training.policy.draw_noises(starts)
-        saved = training.state_dict()
+        saved = torch.load(
+          directory / group / "training.pt", map_location=args.device, weights_only=True
+        )
         replay = runner.replay_buffer
+        length = training.learner.mean_cfg.window_frames
+        windows = replay.model_windows(
+          replay.model_window_starts(train_ids, length)[:4], length
+        )
+        pairs = replay.model_windows(replay.model_window_starts(train_ids, 2)[:4], 2)
         keys = (starts.batch["episode_id"].clone(), starts.batch["time_index"].clone())
         expected_logs = training.policy.update_from(starts, *noises)
         expected = (
@@ -152,11 +168,14 @@ def main():
           deepcopy(training.policy.critic.state_dict()),
           training.policy.state_dict(),
         )
+        expected_model = next_model_update(training.learner, windows, pairs)
         # Supply exactly the same raw replay fixture after normal restore clears it.
         training.load_state_dict(saved)
         runner.replay_buffer = runner.wm_env.replay_buffer = replay
         restored_starts = runner.wm_env.prepare_policy_starts(*keys)
-        actual_logs = training.policy.update_from(restored_starts, *noises)
+        restored_noises = training.policy.draw_noises(restored_starts)
+        equal_tree(noises, restored_noises)
+        actual_logs = training.policy.update_from(restored_starts, *restored_noises)
         equal_tree(expected_logs, actual_logs)
         equal_tree(
           expected,
@@ -166,13 +185,15 @@ def main():
             training.policy.state_dict(),
           ),
         )
+        equal_tree(expected_model, next_model_update(training.learner, windows, pairs))
         reports.append(
           {
             "group": group,
             "critic_contract": training.policy.critic.contract(),
             "rounds": 2,
             "round_seconds": elapsed,
-            "fixed_input_resume_exact": True,
+            "fixed_input_policy_resume_exact": True,
+            "fixed_input_model_resume_exact": True,
             "metrics": logs,
             "peak_allocated_bytes": torch.cuda.max_memory_allocated(args.device)
             if cuda
@@ -208,6 +229,11 @@ def main():
     "src/supermimic/scripts/check_eit_training.py",
     "src/supermimic/critic_inputs.py",
     "src/supermimic/learners/belief_policy_learner.py",
+    "src/supermimic/learners/two_stage_wm.py",
+    "src/supermimic/learners/wm_learner.py",
+    "src/supermimic/models.py",
+    "src/supermimic/replay_buffer.py",
+    "src/supermimic/runners/belief_training.py",
     "src/supermimic/runners/eit_training.py",
     "src/supermimic/runners/run_config.py",
     "src/supermimic/runners/eit_inference.py",
@@ -227,7 +253,7 @@ def main():
     "timing_scope": "two full training rounds including any first-use compilation; separate evaluation excluded",
     "memory_scope": "cumulative peak including initialization, training and restore validation",
     "full_width": args.full_width,
-    "horizon": args.horizon,
+    "policy_horizon": args.policy_horizon,
     "samples": args.samples,
     "source_commit": subprocess.check_output(
       ["git", "rev-parse", "HEAD"], text=True, cwd=root

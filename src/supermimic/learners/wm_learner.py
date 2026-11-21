@@ -54,14 +54,21 @@ class WorldModelLearner:
     device: str = "cpu",
     *,
     cuda_graphs: bool = True,
+    compile_kernels: bool = True,
+    check_finite: bool = False,
   ) -> None:
     self.dynamics = dynamics
     self.representation = representation
     self.cfg = cfg
     self.device = device
+    self._check_finite = check_finite
 
-    self._all_params = list(dynamics.parameters())
-    self.optimizers = build_optimizers([dynamics], self.cfg.lr, device=self.device)
+    mean_model = dynamics.mlp if dynamics.noise_head is not None else dynamics
+    self._transition = (
+      dynamics.mean_rep if dynamics.noise_head is not None else dynamics
+    )
+    self._all_params = list(mean_model.parameters())
+    self.optimizers = build_optimizers([mean_model], self.cfg.lr, device=self.device)
 
     # Bryson's rule: each named channel group is weighted 1 / nominal_error^2.
     self.loss_group_weights = {
@@ -69,16 +76,22 @@ class WorldModelLearner:
       for name, attr in representation.LOSS_WEIGHT_CONFIG.items()
     }
 
-    self._compiled_rollout = torch.compile(self._rollout)
-    self._compiled_compute_losses = torch.compile(self._compute_losses)
-    self._compiled_represent = torch.compile(self.representation.represent)
+    self._compiled_rollout = torch.compile(self._rollout, disable=not compile_kernels)
+    self._compiled_compute_losses = torch.compile(
+      self._compute_losses, disable=not compile_kernels
+    )
+    self._compiled_represent = torch.compile(
+      self.representation.represent, disable=not compile_kernels
+    )
     self._captured_update = CapturedUpdate(
       self._update_from,
       lambda: graph_state([dynamics, representation], self.optimizers),
       enabled=cuda_graphs,
     )
 
-  def update_normalization(self, states: torch.Tensor, actions: torch.Tensor) -> None:
+  def update_normalization(
+    self, states: torch.Tensor, actions: torch.Tensor, *, normalizers=None
+  ) -> None:
     """Update the dynamics state/action normalizers from fresh collected data.
 
     ``actions`` are raw policy outputs (what the replay buffer stores); the
@@ -91,18 +104,22 @@ class WorldModelLearner:
 
     # EmpiricalNormalization.update is a no-op in eval mode; toggle to train
     # for the updates and restore afterward.
-    normalizers = self.dynamics.normalizers()
+    if normalizers is None:
+      normalizers = self.dynamics.normalizers()
     for n in normalizers:
       n.train()
-
-    self.dynamics.state_normalizer.update(rep_states_flat)
-    self.dynamics.action_normalizer.update(self.dynamics.proc(actions_flat))
-
-    for n in normalizers:
-      n.eval()
+    state_normalizer, action_normalizer = normalizers
+    try:
+      state_normalizer.update(rep_states_flat)
+      action_normalizer.update(self.dynamics.proc(actions_flat))
+    finally:
+      for n in normalizers:
+        n.eval()
 
   def update(self, data: Iterable[TensorDict]) -> dict[str, torch.Tensor]:
     self.dynamics.train()
+    for normalizer in self.dynamics.normalizers():
+      normalizer.eval()
     for p in self._all_params:
       p.requires_grad_(True)
     batches = torch.stack([td.select("state", "action", "sim_ctx") for td in data])
@@ -112,38 +129,30 @@ class WorldModelLearner:
     stats = []
 
     for td in batches.unbind(0):
-      full_states = td["state"]
-      actions = td["action"]
+      loss_state, group_mse = self.batch_loss(td)
 
-      all_rep_states = self._compiled_represent(full_states)
-
-      all_aux_states = self.representation.extract_aux_state(full_states)
-      init_rep_state = all_rep_states[:, 0, :]
-      init_aux = all_aux_states[:, 0, :]
-
-      sim_ctx = td["sim_ctx"][:, 0]
-
-      pred_rep_states, pred_aux_states = self._compiled_rollout(
-        init_rep_state, actions, init_aux, sim_ctx
+      _optimize_step(
+        self.optimizers,
+        loss_state,
+        self._all_params,
+        max_norm=1.0,
+        check_finite=self._check_finite,
       )
 
-      # 2. Vectorized Loss Calculation (always FP32, compiled for kernel fusion)
-      loss_state, group_mse = self._compiled_compute_losses(
-        pred_rep_states,
-        pred_aux_states,
-        all_rep_states[:, 1:],
-        all_aux_states[:, 1:],
-      )
-
-      # 3. Backprop
-      _optimize_step(self.optimizers, loss_state, self._all_params, max_norm=1.0)
-
-      # 4. Logging
       stats.append(torch.cat([loss_state.unsqueeze(0), group_mse]).detach())
 
     names = ["state", *self.loss_group_weights]
     means = torch.stack(stats).mean(0)
     return {f"Loss/{name}": m for name, m in zip(names, means, strict=True)}
+
+  def batch_loss(self, td: TensorDict) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score predictions after the real first frame against the recorded successors."""
+    states = self._compiled_represent(td["state"])
+    aux = self.representation.extract_aux_state(td["state"])
+    pred, pred_aux = self._compiled_rollout(
+      states[:, 0], td["action"], aux[:, 0], td["sim_ctx"][:, 0]
+    )
+    return self._compiled_compute_losses(pred, pred_aux, states[:, 1:], aux[:, 1:])
 
   def _rollout(
     self,
@@ -164,7 +173,7 @@ class WorldModelLearner:
     pred_rep_states: list[torch.Tensor] = []
     pred_aux_states: list[torch.Tensor] = []
     for k in range(actions.shape[1] - 1):
-      aux, rep_state = self.dynamics(rep_state, actions[:, k], aux, sim_ctx)
+      aux, rep_state = self._transition(rep_state, actions[:, k], aux, sim_ctx)
       pred_rep_states.append(rep_state)
       pred_aux_states.append(aux)
     return torch.stack(pred_rep_states, dim=1), torch.stack(pred_aux_states, dim=1)

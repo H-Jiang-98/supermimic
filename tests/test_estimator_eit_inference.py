@@ -19,7 +19,7 @@ from supermimic.runners.supermimic_runner import (
   SuperMimicRunnerCfg,
   actor_checkpoint,
 )
-from supermimic.scripts.check_belief_training import stationary_motion
+from supermimic.scripts.check_estimator import stationary_motion
 from supermimic.scripts.train_utils import create_env
 from supermimic.tasks.env_cfgs import configure_estimator_env_cfg, gencoord_env_cfg
 
@@ -161,7 +161,8 @@ def test_adapter_reset_does_not_reset_physics_and_rejects_skipped_frames(tmp_pat
 def test_evaluation_loader_is_private_and_checks_estimator_contract(tmp_path):
   with physical_runner(tmp_path, "B") as runner:
     saved = {
-      "version": "eit_training_v1",
+      "version": "eit_training_v2",
+      "stage": "policy",
       "critic": BeliefCritic(
         "B", runner._sim_context.output_dim, runner.cfg.critic_hidden_dims
       ).checkpoint(),
@@ -191,18 +192,18 @@ def test_evaluation_loader_is_private_and_checks_estimator_contract(tmp_path):
 
 
 def test_evaluation_config_rejects_model_only_resume():
-  with pytest.raises(ValueError, match="eit_training_v1"):
-    evaluation_config({"version": "belief_model_training_v2"})
+  with pytest.raises(ValueError, match="eit_training_v2"):
+    evaluation_config({"version": "unknown"})
 
 
 @pytest.mark.parametrize("group", ["A", "B", "C"])
 @pytest.mark.parametrize(
   "fault",
   [
-    "full70",
+    "wrong_version",
     "missing_contract",
     "wrong_group",
-    "old_encoding",
+    "wrong_encoding",
     "wrong_context",
     "wrong_weights",
   ],
@@ -216,21 +217,22 @@ def test_inference_rejects_incompatible_critic_before_building_models(group, fau
   critic = BeliefCritic(group, context_dim, cfg.critic_hidden_dims).checkpoint()
   contract = critic["contract"]
   saved = {
-    "version": "eit_training_v1",
+    "version": "eit_training_v2",
+    "stage": "policy",
     "runner_config": asdict(cfg),
     "critic": critic,
     "world_model": {"sim_context": {"scale": torch.ones(context_dim)}},
   }
   evaluation_config(saved)
   error = CRITIC_INPUT_VERSION
-  if fault == "full70":
-    contract["version"] = contract["config"]["version"] = "eit_full_belief_critic_v1"
+  if fault == "wrong_version":
+    contract["version"] = contract["config"]["version"] = "unknown_critic_version"
   elif fault == "missing_contract":
     del saved["critic"]["contract"]
   elif fault == "wrong_group":
     contract["config"]["group"] = "B" if group == "A" else "A"
-  elif fault == "old_encoding":
-    contract["config"]["covariance_encoding"] = "full70_log_std_corr_v1"
+  elif fault == "wrong_encoding":
+    contract["config"]["covariance_encoding"] = "unknown_encoding"
   elif fault == "wrong_context":
     saved["critic"] = BeliefCritic(
       group, context_dim + 1, cfg.critic_hidden_dims

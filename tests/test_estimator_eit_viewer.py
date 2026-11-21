@@ -20,7 +20,7 @@ from supermimic.runners.supermimic_runner import (
   build_world_model,
 )
 from supermimic.scripts import play
-from supermimic.scripts.check_belief_training import stationary_motion
+from supermimic.scripts.check_estimator import stationary_motion
 from supermimic.scripts.train_utils import create_env
 from supermimic.scripts.viewers import (
   SuperMimicNativeViewer,
@@ -230,7 +230,8 @@ def test_local_eit_play_runs_native_viewer_step_without_wandb(
   checkpoint = tmp_path / "training.pt"
   torch.save(
     {
-      "version": "eit_training_v1",
+      "version": "eit_training_v2",
+      "stage": "policy",
       "critic": BeliefCritic(
         adapter.cfg.estimator_inputs.group,
         adapter.wm.sim_context.output_dim,
@@ -298,7 +299,7 @@ def test_local_eit_play_uses_shared_adapter_and_closes_on_viewer_error(
   cfg = play.PlayConfig(
     eit_checkpoint=tmp_path / "training.pt", motion_file="walk.npz", device="cpu"
   )
-  saved = {"version": "eit_training_v1"}
+  saved = {"version": "eit_training_v2", "stage": "policy"}
   runner_cfg = SimpleNamespace(representation="gencoord")
   actor, wm, env = Mock(), Mock(), Mock()
   api = Mock(side_effect=AssertionError("Local playback must not contact W&B"))

@@ -91,7 +91,9 @@ def test_two_rounds_update_all_components_and_exclude_validation_normalization()
   assert second["collection_actor_version"] == first["trained_actor_version"]
   assert second["collection_model_version"] == first["trained_model_version"]
   assert first["collection_actor_version"] != first["trained_actor_version"]
-  assert loop.learner.steps == loop.policy.actor_steps == loop.policy.critic_steps == 2
+  assert (
+    loop.learner.mean_steps == loop.policy.actor_steps == loop.policy.critic_steps == 2
+  )
   for before, module in (
     (model, loop.runner._dynamics),
     (actor, loop.actor),
@@ -109,7 +111,7 @@ def test_two_rounds_update_all_components_and_exclude_validation_normalization()
   "component",
   [
     "critic",
-    "legacy_critic",
+    "critic_version",
     "policy_optimizer",
     "model_optimizer",
     "actor",
@@ -124,12 +126,12 @@ def test_failed_restore_changes_no_component_or_rng(component):
   checkpoint = source.state_dict()
   if component == "critic":
     checkpoint["critic"]["state_dict"]["mlp.0.weight"][0, 0] = float("nan")
-  elif component == "legacy_critic":
-    checkpoint["critic"]["contract"]["version"] = "eit_full_belief_critic_v1"
+  elif component == "critic_version":
+    checkpoint["critic"]["contract"]["version"] = "unknown_critic_version"
   elif component == "policy_optimizer":
     checkpoint["policy"]["actor_optimizer"]["state"][0]["exp_avg"] = torch.zeros(1)
   elif component == "model_optimizer":
-    checkpoint["learner"]["optimizer"]["state"][0]["exp_avg"] = torch.zeros(1)
+    checkpoint["learner"]["cov"]["optimizer"]["state"][0]["exp_avg"] = torch.zeros(1)
   elif component == "actor":
     checkpoint["actor"]["actor"]["decoder.0.weight"][0, 0] = float("nan")
   elif component == "rng":
@@ -159,6 +161,15 @@ def test_restore_reproduces_next_model_and_policy_updates(tmp_path):
   # restore deliberately starts a fresh physical stream rather than restoring it.
   target.runner.replay_buffer = deepcopy(source.runner.replay_buffer)
   target.runner.wm_env.replay_buffer = target.runner.replay_buffer
+  replay = source.runner.replay_buffer
+  windows = replay.model_windows(replay.model_window_starts([1], 3), 3)
+  pairs = replay.model_windows(replay.model_window_starts([1], 2), 2)
+  assert_tree(target.learner.update_mean(windows), source.learner.update_mean(windows))
+  assert_tree(
+    target.learner.update_covariance(target.learner.residual_data(pairs)),
+    source.learner.update_covariance(source.learner.residual_data(pairs)),
+  )
+  assert_tree(target.learner.state_dict(), source.learner.state_dict())
   keys = torch.tensor([1, 1])
   times = torch.tensor([1, 2])
   starts = source.runner.wm_env.prepare_policy_starts(keys, times)
@@ -196,8 +207,8 @@ def test_initialization_copies_exact_weights_and_rejects_after_training():
 def test_model_only_checkpoint_cannot_masquerade_as_joint_resume():
   loop = training()
   state = loop.state_dict()
-  state["version"] = "belief_model_training_v2"
-  with pytest.raises(ValueError, match="explicit weight import"):
+  state["stage"] = "model"
+  with pytest.raises(ValueError, match="training stage"):
     loop.load_state_dict(state)
 
 
@@ -212,7 +223,7 @@ def test_no_fresh_training_frames_preserves_actor_normalizers():
 
 
 @pytest.mark.parametrize(
-  "component", ["unused_actor", "unused_critic", "legacy_critic", "missing_group"]
+  "component", ["unused_actor", "unused_critic", "critic_version", "missing_group"]
 )
 def test_initialization_preflights_all_groups_before_any_mutation(component):
   source, target = training(31), training(81)
@@ -221,8 +232,8 @@ def test_initialization_preflights_all_groups_before_any_mutation(component):
     bundle["actors"]["C"]["actor"]["decoder.0.weight"][0, 0] = float("nan")
   elif component == "unused_critic":
     bundle["critics"]["C"]["state_dict"]["mlp.0.weight"][0, 0] = float("nan")
-  elif component == "legacy_critic":
-    bundle["critics"]["C"]["contract"]["version"] = "eit_full_belief_critic_v1"
+  elif component == "critic_version":
+    bundle["critics"]["C"]["contract"]["version"] = "unknown_critic_version"
   else:
     bundle["actors"].pop("A")
   before = target.state_dict()
@@ -289,8 +300,7 @@ def test_common_initialization_rejects_prefit_critic():
     loop.load_initialization(initial)
 
 
-@pytest.mark.parametrize("legacy_nan", [False, True], ids=["json-null", "legacy-nan"])
-def test_single_target_resumes_in_place_and_checks_metric_history(tmp_path, legacy_nan):
+def test_single_target_resumes_in_place_and_checks_metric_history(tmp_path):
   loop = training()
   loop.policy.cfg = replace(loop.policy.cfg, batch_size=1, num_samples=1, horizon=1)
   loop.run(1, tmp_path)
@@ -302,11 +312,6 @@ def test_single_target_resumes_in_place_and_checks_metric_history(tmp_path, lega
   assert state["last_metrics"]["policy"][field] is None
   assert row["policy"][field] is None
   assert "NaN" not in history.read_text()
-  if legacy_nan:
-    state["last_metrics"]["policy"][field] = float("nan")
-    row["policy"][field] = float("nan")
-    torch.save(state, checkpoint)
-
   changed = deepcopy(row)
   changed["policy"][field] = 0.25
   history.write_text(json.dumps(changed, sort_keys=True) + "\n")

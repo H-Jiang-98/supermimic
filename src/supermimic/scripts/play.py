@@ -109,7 +109,8 @@ def configure_play_simulation(
 
 
 def play(task_id: str, cfg: PlayConfig) -> None:
-  configure_torch_backends()
+  # The right-local filter uses IEEE float32 for rotation and covariance matrices.
+  configure_torch_backends(allow_tf32=cfg.eit_checkpoint is None)
   device = cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
 
   print(f"[INFO] Loading environment: {task_id}")

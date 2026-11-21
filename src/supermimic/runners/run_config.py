@@ -12,13 +12,21 @@ from supermimic.critic_inputs import CRITIC_INPUT_VERSION, CriticInputConfig
 from supermimic.estimator_inputs import EITInputConfig
 from supermimic.runners.supermimic_runner import SuperMimicRunnerCfg
 
+EIT_TRAINING_VERSION = "eit_training_v2"
+EIT_INITIALIZATION_VERSION = "eit_initialization_v2"
 
-def validate_eit_checkpoint_contract(saved: dict) -> None:
-  """Check the joint checkpoint's input layout before constructing any models."""
-  if not isinstance(saved, dict) or saved.get("version") != "eit_training_v1":
-    raise ValueError(
-      "Expected eit_training_v1; model-only checkpoints require explicit weight import"
-    )
+
+def validate_eit_checkpoint_contract(saved: dict, *, stage: str | None = None) -> None:
+  """Validate the EIT format and the joint trainer's critic layout before loading."""
+  if not isinstance(saved, dict) or saved.get("version") != EIT_TRAINING_VERSION:
+    raise ValueError(f"Expected {EIT_TRAINING_VERSION} checkpoint")
+  kind = saved.get("stage")
+  if kind not in ("model", "policy") or (stage is not None and kind != stage):
+    raise ValueError(f"Unexpected EIT training stage: {kind!r}")
+  if kind == "model":
+    if "critic" in saved or "policy" in saved:
+      raise ValueError("Model-stage checkpoint contains policy training state")
+    return
   error = f"EIT checkpoint requires the {CRITIC_INPUT_VERSION} critic contract"
   try:
     contract = saved["critic"]["contract"]
@@ -61,14 +69,13 @@ def load_runner_cfg(run_config: dict[str, Any]) -> SuperMimicRunnerCfg:
   """Reconstruct ``SuperMimicRunnerCfg`` from ``run_config["runner_cfg"]``.
 
   JSON round-tripping turns tuples into lists and erases the ``policy`` union's
-  variant; both are recovered structurally. Unknown keys are ignored and missing
-  fields take today's default with a warning, so runs written by older configs
-  still load; a missing or empty ``runner_cfg`` raises.
+  variant; both are recovered structurally. EIT snapshots require every serialized field.
+  Original SuperMimic run configs can omit fields and use current defaults.
   """
   raw = run_config.get("runner_cfg")
   if not raw:
     raise ValueError("run has no serialized runner_cfg; cannot rebuild its config")
-  defaulted: list[str] = []
+  defaulted = None if raw.get("estimator_inputs") is not None else []
   cfg = _rebuild(SuperMimicRunnerCfg, raw, defaulted, "")
   if defaulted:
     print(f"[WARN] run cfg missing fields, using current defaults: {defaulted}")
@@ -86,13 +93,22 @@ def check_representation_matches(task_id: str, representation_name: str) -> None
     )
 
 
-def _rebuild(cls: type, raw: dict[str, Any], defaulted: list[str], prefix: str) -> Any:
+def _rebuild(
+  cls: type, raw: dict[str, Any], defaulted: list[str] | None, prefix: str
+) -> Any:
   hints = get_type_hints(cls)
   kwargs: dict[str, Any] = {}
+  if defaulted is None and raw.keys() != {
+    f.name for f in dataclasses.fields(cls) if f.init
+  }:
+    raise ValueError(
+      f"Incomplete or unknown EIT configuration fields in {prefix or cls.__name__}"
+    )
   for field in dataclasses.fields(cls):
     if not field.init:
       continue
     if field.name not in raw:
+      assert defaulted is not None
       defaulted.append(f"{prefix}{field.name}")
       continue
     kwargs[field.name] = _coerce(
@@ -101,7 +117,7 @@ def _rebuild(cls: type, raw: dict[str, Any], defaulted: list[str], prefix: str) 
   return cls(**kwargs)
 
 
-def _coerce(hint: Any, value: Any, defaulted: list[str], prefix: str) -> Any:
+def _coerce(hint: Any, value: Any, defaulted: list[str] | None, prefix: str) -> Any:
   origin = get_origin(hint)
   if origin is tuple and isinstance(value, list):
     # Flat tuple fields only: a tuple nested inside another hint stays a list.

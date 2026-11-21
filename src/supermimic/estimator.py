@@ -94,15 +94,6 @@ class CorrectionDiagnostics:
   cholesky_attempts: torch.Tensor
 
 
-@dataclass(frozen=True)
-class NllDiagnostics:
-  residual: torch.Tensor
-  mahalanobis: torch.Tensor
-  log_determinant: torch.Tensor
-  jitter: torch.Tensor
-  cholesky_attempts: torch.Tensor
-
-
 def _symmetric(matrix: torch.Tensor) -> torch.Tensor:
   return (matrix + matrix.transpose(-1, -2)) * 0.5
 
@@ -138,7 +129,6 @@ def _cholesky(
   name: str,
   *,
   std: torch.Tensor | None = None,
-  require_resolved_rank: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
   """Factor in the requested coordinates, adding jitter in physical units."""
   _validate_covariance(matrix, config, name)
@@ -150,13 +140,7 @@ def _cholesky(
 
   def unresolved(candidate):
     _, info = torch.linalg.cholesky_ex(coordinates(candidate))
-    failed = info != 0
-    if require_resolved_rank:
-      variance = candidate.diagonal(dim1=-2, dim2=-1)
-      std_rank = torch.where(variance > 0, variance, 1.0).sqrt()
-      rank = _effective_rank(_standardized(candidate, std_rank))
-      failed = failed | (rank < candidate.shape[-1])
-    return failed
+    return info != 0
 
   with torch.no_grad():
     jitter = matrix.new_zeros(matrix.shape[:-2])
@@ -471,43 +455,3 @@ class LieBeliefFilter:
   @staticmethod
   def to_actor_input(belief: BeliefState) -> PosteriorInput:
     return belief.to_actor_input()
-
-
-def posterior_nll(
-  belief: BeliefState,
-  truth: LieState,
-  config: FilterConfig | None = None,
-  *,
-  return_diagnostics: bool = False,
-) -> torch.Tensor | tuple[torch.Tensor, NllDiagnostics]:
-  """Full-dimensional NLL, using bounded jitter on numerically singular rows.
-
-  Rank is assessed in marginal standard-deviation units. Absolute variance
-  does not distinguish a precise observation from a deterministic constraint.
-  """
-  config = config or FilterConfig()
-  _validate_versions(belief)
-  belief.mean.validate()
-  truth.validate()
-  if truth.position.shape != belief.mean.position.shape:
-    raise ValueError("NLL truth batch must match the belief")
-  if (
-    truth.position.dtype != belief.mean.position.dtype
-    or truth.position.device != belief.mean.position.device
-  ):
-    raise ValueError("NLL truth and belief must share dtype and device")
-  if belief.covariance.shape != (*truth.position.shape[:-1], TANGENT_DIM, TANGENT_DIM):
-    raise ValueError("NLL covariance batch must match the belief")
-  residual = local_error(belief.mean, truth)
-  factor, jitter, attempts = _cholesky(
-    belief.covariance, config, "NLL covariance", require_resolved_rank=True
-  )
-  solution = torch.cholesky_solve(residual.unsqueeze(-1), factor).squeeze(-1)
-  mahalanobis = (residual * solution).sum(-1)
-  log_determinant = 2 * factor.diagonal(dim1=-2, dim2=-1).log().sum(-1)
-  result = 0.5 * (mahalanobis + log_determinant)
-  if return_diagnostics:
-    return result, NllDiagnostics(
-      residual, mahalanobis, log_determinant, jitter, attempts
-    )
-  return result

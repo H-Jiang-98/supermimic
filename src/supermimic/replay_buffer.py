@@ -1,4 +1,3 @@
-from bisect import bisect_right
 from dataclasses import dataclass
 
 import torch
@@ -19,34 +18,6 @@ class FieldSpec:
     return (num_envs, buffer_size, self.dim) if self.dim else (num_envs, buffer_size)
 
 
-@dataclass(frozen=True)
-class BeliefTrainingSequence:
-  """An immutable sampling record, with a realized segment prior.
-
-  ``prefix`` includes the window's first frame. Its measurements are consumed
-  exactly once while rebuilding the current-model boundary posterior. ``frames``
-  contains T+1 observations/truth states; only its first T actions are scored.
-  Short windows contain fewer frames, rather than fabricated reset successors.
-  Tensors are detached copies of replay and remain valid if replay is overwritten.
-  """
-
-  prior: BeliefState
-  prefix: TensorDict
-  frames: TensorDict
-
-  @property
-  def episode(self) -> int:
-    return int(self.frames["episode_id"][0])
-
-  @property
-  def start_time(self) -> int:
-    return int(self.frames["time_index"][0])
-
-  @property
-  def transitions(self) -> int:
-    return len(self.frames) - 1
-
-
 class ReplayBuffer:
   """Per-env circular buffer over a TensorDict, with env-stratified window sampling."""
 
@@ -64,7 +35,6 @@ class ReplayBuffer:
     self._episode_heads: dict[int, tuple[int, int, BeliefState]] = {}
     self.initial_prior = initial_prior or GaussianStatePrior()
     self._training_heads: dict[int, tuple[int, int, int, BeliefState]] = {}
-    self._validated_lengths: dict[int, int] | None = None
     self._finalized_at = -1
     self.insert_count = 0
     self._last_insert_token = None
@@ -161,7 +131,7 @@ class ReplayBuffer:
 
   @torch.no_grad()
   def finish_collection_round(self) -> None:
-    """Realize one training prior per retained episode fragment, including cuts."""
+    """Validate retained transitions and realize each fragment's training prior."""
     if self._finalized_at == self.insert_count:
       return
     if "episode_id" not in self._storage.keys() or not self.num_transitions:
@@ -171,6 +141,24 @@ class ReplayBuffer:
       base + torch.arange(self.num_transitions, device=self.device)
     ) % self.buffer_size
     episodes = self._storage["episode_id"][:, slots]
+    n = self.num_transitions
+    for field in ("state", "action", "sim_ctx"):
+      if not torch.isfinite(self._storage[field][:, :n]).all():
+        raise ValueError(f"Non-finite replay {field}")
+    previous_actions = self._storage["prev_action"]
+    if not torch.equal(self._storage["actor_obs"][:, :n, 64:], previous_actions[:, :n]):
+      raise ValueError("Recorded sensor action disagrees with the previous action")
+    # Compare only recorded physical successors, including the pair across wrap.
+    rows, ages = self._recorded_successors(slots, episodes).nonzero(as_tuple=True)
+    current, successor = slots[ages], slots[ages + 1]
+    if not torch.equal(
+      self._storage["action"][rows, current], previous_actions[rows, successor]
+    ):
+      raise ValueError("Executed action disagrees with the successor's previous action")
+    context = self._storage["sim_ctx"]
+    if not torch.equal(context[rows, current], context[rows, successor]):
+      raise ValueError("Inconsistent simulation context across a replay transition")
+
     begins = torch.ones_like(episodes, dtype=torch.bool)
     begins[:, 1:] = episodes[:, 1:] != episodes[:, :-1]
     rows, ages = begins.nonzero(as_tuple=True)
@@ -200,7 +188,6 @@ class ReplayBuffer:
         prior = BeliefState(priors.mean.index(j).clone(), priors.covariance[j])
         heads[ids[i]] = (row_numbers[i], slot_numbers[i], times[i], prior)
     self._training_heads = heads
-    self._validated_lengths = None
     self._finalized_at = self.insert_count
 
   def training_prefix(
@@ -229,7 +216,6 @@ class ReplayBuffer:
     A detached copy prevents normalization or callers from modifying replay.
     Episode filtering also keeps validation measurements out of normalization.
     """
-    self.finish_collection_round()
     base = self._step if self.num_transitions == self.buffer_size else 0
     slots = (
       base + torch.arange(self.num_transitions, device=self.device)
@@ -252,90 +238,47 @@ class ReplayBuffer:
   def training_episode_lengths(self) -> dict[int, int]:
     """Retained frame counts for sealed fragments, including singleton episodes."""
     self.finish_collection_round()
-    if self._validated_lengths is not None:
-      return self._validated_lengths.copy()
-    base = self._step if self.num_transitions == self.buffer_size else 0
-    slots = (
-      base + torch.arange(self.num_transitions, device=self.device)
-    ) % self.buffer_size
-    ids, counts = self._storage["episode_id"][:, slots].unique(return_counts=True)
-    lengths = dict(zip(ids.tolist(), counts.tolist(), strict=True))
-    # Check full fragments once here: discontinuous timestamps or a reset marked
-    # inside an episode cannot silently become scored training transitions.
-    for episode, length in lengths.items():
-      self.training_prefix(episode, length - 1, relative=True)
-    self._validated_lengths = lengths
-    return lengths.copy()
+    ids, counts = self._storage["episode_id"][:, : self.num_transitions].unique(
+      return_counts=True
+    )
+    return dict(zip(ids.tolist(), counts.tolist(), strict=True))
 
-  def belief_sequence(
-    self, episode: int, start_time: int, horizon: int
-  ) -> BeliefTrainingSequence:
-    """Gather a window and its current-segment prefix without crossing a reset."""
-    if not isinstance(horizon, int) or horizon < 1:
-      raise ValueError("Belief training horizon must be a positive integer")
-    lengths = self.training_episode_lengths()
-    if episode not in lengths:
-      raise ValueError(f"Episode {episode} unavailable in replay")
-    return self._belief_sequence(episode, start_time, horizon, lengths[episode])
-
-  def _belief_sequence(self, episode, start_time, horizon, length):
-    first = self._training_heads[episode][2]
-    start = start_time - first
-    if not 0 <= start < length - 1:
-      raise ValueError("Belief window requires a recorded successor in the episode")
-    end = min(start + horizon, length - 1)
-    prior, retained = self.training_prefix(episode, end, relative=True)
-    return BeliefTrainingSequence(
-      prior.detach().clone(),
-      retained[: start + 1].detach().clone(),
-      retained[start:].detach().clone(),
+  def _recorded_successors(self, slots, episodes) -> torch.Tensor:
+    times = self._storage["time_index"][:, slots]
+    source = slots[:-1]
+    done = (
+      self._storage["terminated"][:, source] | self._storage["truncated"][:, source]
+    )
+    return (
+      (episodes[:, :-1] == episodes[:, 1:])
+      & (times[:, 1:] == times[:, :-1] + 1)
+      & ~done
     )
 
-  def sample_belief_sequences(
-    self,
-    horizon: int,
-    batch_size: int,
-    *,
-    episode_ids=None,
-    generator: torch.Generator | None = None,
-  ) -> list[BeliefTrainingSequence]:
-    """Uniformly sample valid start transitions, allowing shorter tail windows.
+  def model_window_starts(self, episode_ids, window_frames: int) -> torch.Tensor:
+    """Enumerate (environment, physical slot) for each complete, consecutive window."""
+    if type(window_frames) is not int or window_frames < 2:
+      raise ValueError("A model window needs at least two frames")
+    n = self.num_transitions
+    if n < window_frames:
+      return torch.empty((0, 2), device=self.device, dtype=torch.long)
+    self.finish_collection_round()
+    base = self._step if n == self.buffer_size else 0
+    slots = (base + torch.arange(n, device=self.device)) % self.buffer_size
+    episode = self._storage["episode_id"][:, slots]
+    successor = self._recorded_successors(slots, episode)
+    complete = successor.unfold(1, window_frames - 1, 1).all(-1)
+    ids = torch.as_tensor(episode_ids, device=self.device, dtype=torch.long)
+    selected = torch.isin(episode[:, : complete.shape[1]], ids)
+    rows, ages = (complete & selected).nonzero(as_tuple=True)
+    return torch.stack((rows, slots[ages]), dim=1)
 
-    The last retained action has no recorded successor and is never selected.
-    Priors persist across optimizer updates; posteriors are deliberately absent
-    from these records and must be rebuilt using the current model.
-    """
-    if not isinstance(batch_size, int) or batch_size < 1:
-      raise ValueError("Belief training batch_size must be a positive integer")
-    if not isinstance(horizon, int) or horizon < 1:
-      raise ValueError("Belief training horizon must be a positive integer")
-    lengths = self.training_episode_lengths()
-    allowed = set(lengths) if episode_ids is None else set(episode_ids)
-    unknown = allowed - lengths.keys()
-    if unknown:
-      raise ValueError(f"Training episodes unavailable in replay: {sorted(unknown)}")
-    eligible = [
-      episode
-      for episode, length in lengths.items()
-      if episode in allowed and length > 1
-    ]
-    if not eligible:
-      raise ValueError("No recorded in-episode successor transitions for training")
-    # Sample flattened transition indices without building a Python tuple for
-    # every retained frame (large environment banks can contain millions).
-    cumulative = [0]
-    for episode in eligible:
-      cumulative.append(cumulative[-1] + lengths[episode] - 1)
-    choice = torch.randint(
-      cumulative[-1], (batch_size,), device=self.device, generator=generator
-    ).tolist()
-    sequences = []
-    for index in choice:
-      segment = bisect_right(cumulative, index) - 1
-      episode = eligible[segment]
-      start = self._training_heads[episode][2] + index - cumulative[segment]
-      sequences.append(self._belief_sequence(episode, start, horizon, lengths[episode]))
-    return sequences
+  def model_windows(self, starts: torch.Tensor, window_frames: int) -> TensorDict:
+    """Gather model inputs using starts from the current sealed replay."""
+    rows, slots = starts.unbind(-1)
+    offsets = torch.arange(window_frames, device=self.device)
+    storage = self._storage.select("state", "action", "sim_ctx")
+    return storage[rows[:, None], (slots[:, None] + offsets) % self.buffer_size]
 
   def episode_prefix(self, episode: int, t: int) -> tuple[BeliefState, TensorDict]:
     """Gather frames 0..t in chronological order from one physical env slot."""

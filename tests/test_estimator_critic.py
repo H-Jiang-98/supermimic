@@ -329,25 +329,15 @@ def test_invalid_checkpoint_does_not_partially_modify_critic(fault):
 
 
 @pytest.mark.parametrize("group", ["A", "B", "C"])
-def test_all_groups_reject_full_belief_critic_contract_before_loading_weights(group):
+def test_all_groups_reject_unknown_contract_before_loading_matching_weights(group):
   critic = BeliefCritic(group, 4, (16, 8))
   checkpoint = critic.checkpoint()
-  # A's old weights even have the same shape. The contract, including its
-  # version, is checked before applying any compatible tensor.
-  checkpoint["contract"].update(
-    version="eit_full_belief_critic_v1", input_dim=1238 if group == "A" else 3796
-  )
-  checkpoint["contract"]["config"].update(
-    version="eit_full_belief_critic_v1",
-    covariance_encoding="full70_log_std_corr_v1",
-    mean_scales=(1.0,) * 5,
-    covariance_scales=(1.0,) * 6,
-  )
+  checkpoint["contract"]["version"] = "unknown_critic_version"
   checkpoint["state_dict"]["mlp.0.bias"].add_(1)
   before = deepcopy(critic.state_dict())
   with pytest.raises(
     ValueError,
-    match=f"Group {group}.*{CRITIC_INPUT_VERSION}.*eit_full_belief_critic_v1",
+    match=f"Group {group}.*{CRITIC_INPUT_VERSION}.*unknown_critic_version",
   ):
     critic.load_checkpoint(checkpoint)
   for key, value in before.items():
@@ -364,9 +354,8 @@ def test_all_groups_reject_full_belief_critic_contract_before_loading_weights(gr
     {"mean_scales": (1, float("nan"))},
     {"covariance_scales": (1, 1, -1)},
     {"covariance_scales": (1,) * 6},
-    {"version": "old"},
-    {"version": "eit_full_belief_critic_v1"},
-    {"covariance_encoding": "full70_log_std_corr_v1"},
+    {"version": "unknown_critic_version"},
+    {"covariance_encoding": "unknown_encoding"},
     {"remaining_time_scale": float("inf")},
   ],
 )

@@ -1,4 +1,4 @@
-"""Production matrix integration, vectorized local AD and checkpoint migration."""
+"""Matrix integration, vectorized local Jacobians and frozen-model action gradients."""
 
 from dataclasses import fields, replace
 
@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from supermimic.belief import BeliefState
-from supermimic.estimator import FilterConfig, LieBeliefFilter, posterior_nll
+from supermimic.estimator import FilterConfig, LieBeliefFilter
 from supermimic.estimator_inputs import GaussianMeasurementConfig
 from supermimic.utils.lie_state import LieState, boxplus, local_error, so3_exp
 from tests.test_estimator_stochastic_dynamics import make_dynamics, model_inputs
@@ -156,37 +156,31 @@ def test_all_tangent_directions_and_unbatched_transition():
   torch.testing.assert_close(actual, torch.stack(columns, -1), atol=2e-8, rtol=2e-6)
 
 
-def test_two_step_nll_gradients_reach_both_heads_and_frozen_model_actions():
+def test_two_step_frozen_filter_action_gradient_matches_eager_and_finite_difference():
   model, _, estimator, state, action, context = fixture(batch=1)
   with torch.no_grad():
     model.noise_head[-1].weight.normal_(std=0.001)
+  model.requires_grad_(False)
   action = action.clone().requires_grad_()
   covariance = torch.eye(70, dtype=action.dtype).unsqueeze(0) * 0.01
   measurement = estimator.observation(state).detach()
+  eager = LieBeliefFilter(
+    model,
+    estimator.measurement_config,
+    estimator.default_joint_pos,
+    FilterConfig(jacobian_backend="eager"),
+  )
 
-  def objective():
+  def objective(filt=estimator):
     belief = BeliefState(state, covariance)
-    terms = []
     for _ in range(2):
-      belief = estimator.correct(
-        estimator.predict(belief, action, context), measurement
-      )
-      terms.append(posterior_nll(belief, state).mean())
-    return torch.stack(terms).mean()
+      belief = filt.correct(filt.predict(belief, action, context), measurement)
+    return belief.mean.velocity.sum() + belief.covariance.square().sum()
 
-  parameters = [
-    model.mlp[0].weight,
-    model.noise_head[0].weight,
-    model.noise_head[-1].weight,
-    action,
-  ]
-  gradients = torch.autograd.grad(objective(), parameters)
-  for parameter, gradient in zip(parameters, gradients, strict=True):
-    assert torch.isfinite(gradient).all() and gradient.norm() > 1e-10
-    directional_check(objective, parameter, gradient, 2e-6)
-  model.requires_grad_(False)
   gradient = torch.autograd.grad(objective(), action)[0]
-  directional_check(objective, action, gradient, 2e-6)
+  assert torch.isfinite(gradient).all() and gradient.norm() > 0
+  torch.testing.assert_close(gradient, torch.autograd.grad(objective(eager), action)[0])
+  directional_check(objective, action, gradient)
 
 
 def test_exact_zero_angular_increment_retains_mixed_derivative():
@@ -238,33 +232,13 @@ def test_float32_production_filter_and_action_gradient(device):
   posterior = estimator.correct(
     estimator.predict(belief, action, context), estimator.observation(state)
   )
-  gradient = torch.autograd.grad(posterior_nll(posterior, state).mean(), action)[0]
+  gradient = torch.autograd.grad(
+    posterior.mean.velocity.sum() + posterior.covariance.square().sum(), action
+  )[0]
   assert torch.isfinite(gradient).all() and gradient.norm() > 0
   with torch.no_grad():
     evaluated = estimator.predict(belief, action, context)
   assert not evaluated.covariance.requires_grad
-
-
-def test_migration_is_explicit_verified_and_invalidates_version_without_loading():
-  model, _, _, _, _, _ = fixture()
-  current = model.checkpoint()
-  metadata = {**current["metadata"], "format_version": "stochastic_dynamics_v1"}
-  metadata["integration"] = {
-    key: value for key, value in metadata["integration"].items() if key != "version"
-  }
-  legacy = {
-    **current,
-    "metadata": metadata,
-    "model_version": model._content_digest(metadata, current["state_dict"]),
-  }
-  with pytest.raises(ValueError, match="configuration or state layout mismatch"):
-    model.load_checkpoint(legacy)
-  migrated = model.migrate_checkpoint(legacy)
-  assert migrated["model_version"] != legacy["model_version"]
-  assert model.model_version == current["model_version"]
-  model.load_checkpoint(migrated)
-  with pytest.raises(ValueError, match="content does not match"):
-    model.migrate_checkpoint({**legacy, "model_version": "forged"})
 
 
 @pytest.mark.parametrize(

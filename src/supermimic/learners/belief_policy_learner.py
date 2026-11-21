@@ -14,6 +14,8 @@ from dataclasses import asdict, dataclass
 import torch
 from torch import nn
 
+from supermimic.learners.learner_utils import validate_optimizer_state
+
 
 @dataclass(frozen=True)
 class BeliefPolicyLearnerCfg:
@@ -396,55 +398,13 @@ class BeliefActorCriticPolicyLearner:
       or state.get("model_version") != self.wm_env.dynamics.model_version
     ):
       raise ValueError("Belief policy checkpoint contract mismatch")
-    for name, optimizer, module in (
-      ("actor", self.actor_optimizer, self.actor),
-      ("critic", self.critic_optimizer, self.critic),
+    for name, optimizer in (
+      ("actor", self.actor_optimizer),
+      ("critic", self.critic_optimizer),
     ):
-      steps = state.get(f"{name}_steps")
-      if type(steps) is not int or steps < 0:
-        raise ValueError("Invalid policy optimizer step count")
-      supplied = state.get(f"{name}_optimizer")
-      expected = optimizer.state_dict()
-      if (
-        not isinstance(supplied, dict)
-        or set(supplied) != {"state", "param_groups"}
-        or supplied["param_groups"] != expected["param_groups"]
-      ):
-        raise ValueError("Policy optimizer groups mismatch")
-      ids = expected["param_groups"][0]["params"]
-      if not isinstance(supplied["state"], dict) or set(supplied["state"]) != (
-        set(ids) if steps else set()
-      ):
-        raise ValueError("Policy optimizer parameter states mismatch")
-      for index, parameter in zip(ids, module.parameters(), strict=True):
-        if not steps:
-          continue
-        values = supplied["state"][index]
-        if not isinstance(values, dict) or set(values) != {
-          "step",
-          "exp_avg",
-          "exp_avg_sq",
-        }:
-          raise ValueError("Invalid policy Adam state fields")
-        for field, value in values.items():
-          if (
-            not isinstance(value, torch.Tensor)
-            or value.layout != torch.strided
-            or value.device.type == "meta"
-            or not torch.isfinite(value).all()
-          ):
-            raise ValueError("Policy Adam state must contain finite tensors")
-          if field == "step":
-            if (
-              value.ndim != 0
-              or value.dtype not in (torch.float32, torch.float64)
-              or float(value) != steps
-            ):
-              raise ValueError("Policy Adam step mismatch")
-          elif value.shape != parameter.shape or value.dtype != parameter.dtype:
-            raise ValueError("Policy Adam moment shape/dtype mismatch")
-          elif field == "exp_avg_sq" and (value < 0).any():
-            raise ValueError("Policy Adam second moment must be nonnegative")
+      validate_optimizer_state(
+        optimizer, state.get(f"{name}_optimizer"), state.get(f"{name}_steps")
+      )
     rng = state.get("rng")
     if not isinstance(rng, dict) or set(rng) != set(self.generators):
       raise ValueError("Policy RNG streams mismatch")

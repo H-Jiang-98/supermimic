@@ -15,24 +15,31 @@ import supermimic.tasks  # noqa: F401
 from supermimic.critic_inputs import CRITIC_INPUT_VERSION
 from supermimic.estimator import FilterConfig
 from supermimic.learners.belief_policy_learner import BeliefPolicyLearnerCfg
-from supermimic.learners.belief_wm_learner import BeliefWorldModelLearnerCfg
 from supermimic.models import ProcessNoiseConfig
 from supermimic.runners.eit_training import EITTraining, EITTrainingCfg
-from supermimic.runners.run_config import load_runner_cfg
+from supermimic.runners.run_config import EIT_INITIALIZATION_VERSION, load_runner_cfg
 from supermimic.runners.supermimic_runner import SuperMimicRunner, SuperMimicRunnerCfg
-from supermimic.scripts.train_utils import create_env
+from supermimic.scripts.train_utils import (
+  add_model_fit_args,
+  create_env,
+  model_fit_configs,
+)
 from supermimic.tasks.env_cfgs import configure_estimator_env_cfg
 
 
 def main():
-  parser = argparse.ArgumentParser(description=__doc__)
+  parser = argparse.ArgumentParser(
+    description=__doc__,
+    allow_abbrev=False,
+    formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+  )
   parser.add_argument("--motion-file", required=True)
   parser.add_argument("--output", required=True, type=Path)
   parser.add_argument("--resume", type=Path)
   parser.add_argument(
     "--initialization",
     type=Path,
-    help=f"Shared A/B/C initial weights (default: output parent/eit_initialization_{CRITIC_INPUT_VERSION}_seed<seed>.pt)",
+    help=f"Shared A/B/C initial weights (default: output parent/{EIT_INITIALIZATION_VERSION}_{CRITIC_INPUT_VERSION}_seed<seed>.pt)",
   )
   parser.add_argument("--group", choices=("A", "B", "C"), default="B")
   parser.add_argument(
@@ -43,10 +50,7 @@ def main():
   parser.add_argument("--rounds", type=int, default=10)
   parser.add_argument("--collection-steps", type=int, default=64)
   parser.add_argument("--buffer-size", type=int, default=128)
-  parser.add_argument("--model-updates", type=int, default=10)
-  parser.add_argument("--model-batch-size", type=int, default=4)
-  parser.add_argument("--model-microbatch-size", type=int, default=2)
-  parser.add_argument("--model-horizon", type=int, default=2)
+  add_model_fit_args(parser)
   parser.add_argument("--policy-updates", type=int, default=1)
   parser.add_argument("--policy-batch-size", type=int, default=4)
   parser.add_argument("--samples", type=int, default=2)
@@ -80,9 +84,10 @@ def main():
     runner_cfg = load_runner_cfg({"runner_cfg": saved["runner_config"]})
     loop_cfg = EITTrainingCfg(**saved["loop_config"])
     policy_cfg = BeliefPolicyLearnerCfg(**saved["policy_config"])
-    num_envs = len(saved["episode_id"])
+    num_envs = saved["num_envs"]
     del saved
   else:
+    mean, cov = model_fit_configs(args)
     runner_cfg = SuperMimicRunnerCfg.for_estimator_inputs(
       args.group,
       dynamics_hidden_dims=tuple(args.hidden_dims),
@@ -93,12 +98,8 @@ def main():
         jacobian_batch_chunk_size=args.jacobian_batch_chunk_size,
         jacobian_chunk_size=args.jacobian_chunk_size,
       ),
-      belief_wm=BeliefWorldModelLearnerCfg(
-        batch_size=args.model_batch_size,
-        microbatch_size=args.model_microbatch_size,
-        horizon=args.model_horizon,
-        num_batches=args.model_updates,
-      ),
+      mean=mean,
+      cov=cov,
       buffer_size=args.buffer_size,
       sampling_mode="uniform",
     )
@@ -125,7 +126,7 @@ def main():
       initialization = (
         args.initialization
         or args.output.parent
-        / f"eit_initialization_{CRITIC_INPUT_VERSION}_seed{args.seed}.pt"
+        / f"{EIT_INITIALIZATION_VERSION}_{CRITIC_INPUT_VERSION}_seed{args.seed}.pt"
       )
       if initialization.exists():
         initial = torch.load(

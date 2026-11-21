@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import time
-import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
-from copy import copy, deepcopy
+from copy import copy
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime
 from pathlib import Path
@@ -28,15 +27,16 @@ from supermimic.estimator_inputs import (
   PosteriorProvider,
   build_actor_features,
 )
-from supermimic.learners.belief_wm_learner import (
-  BeliefWorldModelLearner,
-  BeliefWorldModelLearnerCfg,
-)
 from supermimic.learners.policy_learner import (
   ActorCriticPolicyLearner,
   ActorCriticPolicyLearnerCfg,
   BpttPolicyLearner,
   BpttPolicyLearnerCfg,
+)
+from supermimic.learners.two_stage_wm import (
+  CovarianceFitCfg,
+  MeanFitCfg,
+  TwoStageWorldModelLearner,
 )
 from supermimic.learners.wm_learner import WorldModelLearner, WorldModelLearnerCfg
 from supermimic.models import Dynamics, MultiEncoderAE, ProcessNoiseConfig, build_mlp
@@ -95,12 +95,11 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   estimator_inputs: EITInputConfig | None = None
   """Opt-in estimator inputs/FiLM; joint optimization uses EITTraining."""
   process_noise: ProcessNoiseConfig | None = None
-  """Opt-in full right-local stochastic dynamics and posterior-NLL learning."""
+  """Opt-in full right-local stochastic dynamics and two-stage model fitting."""
   filter_config: FilterConfig = field(default_factory=FilterConfig)
   initial_prior: GaussianStatePrior = field(default_factory=GaussianStatePrior)
-  belief_wm: BeliefWorldModelLearnerCfg = field(
-    default_factory=BeliefWorldModelLearnerCfg
-  )
+  mean: MeanFitCfg = field(default_factory=MeanFitCfg)
+  cov: CovarianceFitCfg = field(default_factory=CovarianceFitCfg)
   freeze_estimator_normalization: bool = True
   """Keep the collection snapshot fixed; model training updates stats by round."""
   max_iterations: int = 1000000
@@ -169,28 +168,6 @@ class WorldModel:
   filter_config: FilterConfig = field(default_factory=FilterConfig)
   initial_prior: GaussianStatePrior = field(default_factory=GaussianStatePrior)
 
-  def migrate_bundle(self, bundle: dict) -> dict:
-    """Migrate older integrator weights and preserve their filter settings."""
-    if self.dynamics.process_noise_config is None:
-      raise ValueError("Bundle migration requires stochastic dynamics")
-    migrated = deepcopy(bundle)
-    metadata = migrated.get("estimator", {})
-    if metadata.get("version") != 1:
-      raise ValueError("Expected a versioned estimator bundle for migration")
-    if migrated["dynamics"]["metadata"]["format_version"] == "stochastic_dynamics_v1":
-      old_filter = metadata.get("filter_config", {})
-      added = {"jacobian_backend", "jacobian_chunk_size", "jacobian_batch_chunk_size"}
-      if set(old_filter) != {f.name for f in fields(FilterConfig)} - added:
-        raise ValueError("Expected a complete step-2 filter configuration")
-      metadata["filter_config"] = {
-        **old_filter,
-        **{key: getattr(self.filter_config, key) for key in added},
-      }
-    migrated["dynamics"] = self.dynamics.migrate_checkpoint(migrated["dynamics"])
-    # Validate without modifying this model or any active provider.
-    deepcopy(self).load_bundle(migrated)
-    return migrated
-
   def bundle(self) -> dict:
     """The ``world_model.pt`` contents."""
     bundle = {
@@ -204,7 +181,7 @@ class WorldModel:
     if self.dynamics.process_noise_config is not None:
       measurement = getattr(self.representation, "measurement_config", None)
       bundle["estimator"] = {
-        "version": 1,
+        "version": 2,
         "filter_config": asdict(self.filter_config),
         "initial_prior": asdict(self.initial_prior),
         "measurement_config": asdict(measurement) if measurement is not None else None,
@@ -217,40 +194,36 @@ class WorldModel:
     metadata = None
     if self.dynamics.process_noise_config is not None:
       metadata = bundle.get("estimator")
-      if metadata is None:
-        warnings.warn(
-          "Legacy stochastic bundle lacks estimator settings; using the supplied configuration",
-          stacklevel=2,
-        )
-      else:
+      if not isinstance(metadata, dict):
+        raise ValueError("Missing estimator checkpoint settings")
 
-        def decode(cls, name):
-          data = metadata.get(name)
-          if not isinstance(data, dict) or data.keys() != {f.name for f in fields(cls)}:
-            raise ValueError(f"Incomplete estimator checkpoint {name}")
-          return cls(**data)
+      def decode(cls, name):
+        data = metadata.get(name)
+        if not isinstance(data, dict) or data.keys() != {f.name for f in fields(cls)}:
+          raise ValueError(f"Incomplete estimator checkpoint {name}")
+        return cls(**data)
 
-        if metadata.get("version") != 1 or not torch.equal(
-          metadata["default_joint_pos"], self.representation._default_joint_pos
-        ):
-          raise ValueError("Estimator checkpoint layout or joint calibration mismatch")
-        filter_config = decode(FilterConfig, "filter_config")
-        prior = decode(GaussianStatePrior, "initial_prior")
-        measurement = (
-          decode(GaussianMeasurementConfig, "measurement_config")
-          if metadata["measurement_config"] is not None
-          else None
-        )
-        if (
-          measurement is None
-          and getattr(self.representation, "measurement_config", None) is not None
-          or measurement is not None
-          and self.representation.actor_obs_mode != "proprio"
-        ):
-          raise ValueError("Estimator checkpoint measurement configuration mismatch")
-        if measurement is not None:
-          # Configuration validation must not change the live representation.
-          copy(self.representation).configure_estimator_measurement(measurement)
+      if metadata.get("version") != 2 or not torch.equal(
+        metadata["default_joint_pos"], self.representation._default_joint_pos
+      ):
+        raise ValueError("Estimator checkpoint layout or joint calibration mismatch")
+      filter_config = decode(FilterConfig, "filter_config")
+      prior = decode(GaussianStatePrior, "initial_prior")
+      measurement = (
+        decode(GaussianMeasurementConfig, "measurement_config")
+        if metadata["measurement_config"] is not None
+        else None
+      )
+      if (
+        measurement is None
+        and getattr(self.representation, "measurement_config", None) is not None
+        or measurement is not None
+        and self.representation.actor_obs_mode != "proprio"
+      ):
+        raise ValueError("Estimator checkpoint measurement configuration mismatch")
+      if measurement is not None:
+        # Configuration validation must not change the live representation.
+        copy(self.representation).configure_estimator_measurement(measurement)
       self.dynamics.validate_checkpoint(bundle["dynamics"])
       dynamics_state = bundle["dynamics"]["state_dict"]
     else:
@@ -578,14 +551,8 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       initial_prior=wm.initial_prior,
     )
     if self._dynamics.process_noise_config is not None:
-      self.world_model_learner = BeliefWorldModelLearner(
-        LieBeliefFilter(
-          self._dynamics,
-          self._representation.measurement_config,
-          self._representation._default_joint_pos,
-          config=wm.filter_config,
-        ),
-        self.cfg.belief_wm,
+      self.world_model_learner = TwoStageWorldModelLearner(
+        self._dynamics, self._representation, self.cfg.mean, self.cfg.cov, self.device
       )
     else:
       self.world_model_learner = WorldModelLearner(
@@ -927,9 +894,6 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       self._representation._default_joint_pos,
       config=self._wm.filter_config,
     )
-    learner = getattr(self, "world_model_learner", None)
-    if isinstance(learner, BeliefWorldModelLearner):
-      learner.estimator = estimator
     self.posterior_provider = BeliefProvider(
       estimator, prior_factory, differentiable=False
     )
@@ -1246,7 +1210,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     if self.cfg.estimator_inputs is not None:
       raise NotImplementedError(
         "Use python -m supermimic.scripts.train_eit for joint EIT training, or "
-        "python -m supermimic.scripts.train_belief for posterior-NLL model learning."
+        "python -m supermimic.scripts.train_belief for fixed-actor model fitting."
       )
     log_dir = self._create_log_dir()
     self._init_wandb(log_dir)

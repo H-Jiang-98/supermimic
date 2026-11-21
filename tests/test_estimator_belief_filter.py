@@ -7,7 +7,7 @@ import torch
 from torch import nn
 
 from supermimic.belief import BeliefState
-from supermimic.estimator import FilterConfig, LieBeliefFilter, posterior_nll
+from supermimic.estimator import LieBeliefFilter
 from supermimic.estimator_inputs import GaussianMeasurementConfig
 from supermimic.utils.lie_state import LieState, boxplus, local_error, so3_exp
 
@@ -311,7 +311,7 @@ def test_zero_measurement_noise_is_bounded_and_jitter_consistent(dtype):
   )
 
 
-def test_invalid_covariance_and_exhausted_jitter_fail_explicitly():
+def test_invalid_covariances_fail_explicitly():
   estimator, belief, _, _ = _fixture()
   bad = belief.covariance.clone()
   bad[:, 0, 0] = -1
@@ -324,47 +324,6 @@ def test_invalid_covariance_and_exhausted_jitter_fail_explicitly():
   bad[:, 0, 1] = float("nan")
   with pytest.raises(ValueError, match="non-finite"):
     estimator.initialize(belief.mean, bad)
-  estimator, belief, _, _ = _fixture(
-    measurement=GaussianMeasurementConfig(0, 0, 0, 0),
-    config=FilterConfig(jitter_attempts=0),
-  )
-  belief = BeliefState(
-    replace(belief.mean, rotation=torch.eye(3, dtype=torch.float64).expand(2, 3, 3)),
-    belief.covariance,
-  )
-  # A degenerate Gaussian has no finite ordinary NLL without regularization.
-  with pytest.raises(ValueError, match="bounded jitter"):
-    posterior_nll(
-      BeliefState(belief.mean, torch.zeros_like(belief.covariance)),
-      belief.mean,
-      estimator.config,
-    )
-
-
-def test_posterior_nll_matches_gaussian_reference():
-  _, belief, _, _ = _fixture()
-  delta = torch.linspace(-0.02, 0.03, 70, dtype=torch.float64).expand(2, 70)
-  truth = boxplus(belief.mean, delta)
-  nll, diagnostics = posterior_nll(belief, truth, return_diagnostics=True)
-  solved = torch.linalg.solve(belief.covariance, delta.unsqueeze(-1)).squeeze(-1)
-  expected = 0.5 * (
-    (delta * solved).sum(-1) + torch.linalg.slogdet(belief.covariance).logabsdet
-  )
-  torch.testing.assert_close(nll, expected)
-  torch.testing.assert_close(diagnostics.residual, delta)
-
-
-def test_float32_precise_full_rank_gaussians_have_zero_jitter():
-  _, belief, _, _ = _fixture(batch=2, dtype=torch.float32)
-  variance = torch.full((2, 70), 1e-14)
-  variance[1, :12] = 0.1
-  covariance = torch.diag_embed(variance).requires_grad_()
-  belief = replace(belief, covariance=covariance)
-  loss, diagnostic = posterior_nll(belief, belief.mean, return_diagnostics=True)
-  assert not diagnostic.jitter.any()
-  torch.testing.assert_close(loss.double(), 0.5 * variance.double().log().sum(-1))
-  gradient = torch.autograd.grad(loss.sum(), covariance)[0]
-  torch.testing.assert_close(gradient.diagonal(dim1=-2, dim2=-1), 0.5 / variance)
 
 
 def test_scalar_belief_prediction_with_production_dynamics_and_normalizers():
@@ -384,53 +343,6 @@ def test_scalar_belief_prediction_with_production_dynamics_and_normalizers():
   scalar = estimator.predict(prior.index(1), action[1], ctx[1])
   torch.testing.assert_close(scalar.mean.to_full(), batched.mean.to_full()[1])
   torch.testing.assert_close(scalar.covariance, batched.covariance[1])
-
-
-def test_noiseless_posterior_nll_regularizes_only_degenerate_batch_rows():
-  noise = GaussianMeasurementConfig(joint_position_std=0)
-  estimator32, prior32, _, _ = _fixture(1, dtype=torch.float32, measurement=noise)
-  estimator64, _, _, _ = _fixture(1, measurement=noise)
-  losses = []
-  for estimator, prior in (
-    (estimator32, prior32),
-    (estimator64, prior32.to(torch.float64)),
-  ):
-    posterior = estimator.correct(prior, estimator.observation(prior.mean))
-    promoted = posterior.to(torch.float64)
-    _, promoted_d = posterior_nll(promoted, promoted.mean, return_diagnostics=True)
-    assert promoted_d.jitter.item() == pytest.approx(estimator.config.jitter_initial)
-    _, batch, _, _ = _fixture(2, dtype=prior.covariance.dtype)
-    covariance = torch.cat((posterior.covariance, prior.covariance)).requires_grad_()
-    batch = replace(batch, covariance=covariance)
-    loss, d = posterior_nll(batch, batch.mean, return_diagnostics=True)
-    assert d.jitter[0].item() == pytest.approx(estimator.config.jitter_initial)
-    assert d.jitter[1].item() == 0.0
-    expected = covariance.double() + d.jitter.double()[:, None, None] * torch.eye(70)
-    torch.testing.assert_close(
-      loss.double(),
-      0.5 * torch.linalg.slogdet(expected).logabsdet,
-      atol=3e-5,
-      rtol=1e-6,
-    )
-    assert torch.isfinite(torch.autograd.grad(loss.sum(), covariance)[0]).all()
-    with pytest.raises(ValueError, match="bounded jitter"):
-      posterior_nll(batch, batch.mean, FilterConfig(jitter_attempts=0))
-    losses.append(loss.detach().double())
-  torch.testing.assert_close(*losses, atol=3e-5, rtol=1e-6)
-
-
-def test_nll_detects_rank_loss_even_when_cholesky_succeeds():
-  _, belief, _, _ = _fixture(1)
-  covariance = torch.eye(70, dtype=torch.float64).unsqueeze(0)
-  covariance[:, 0, 1] = covariance[:, 1, 0] = 1 - torch.finfo(torch.float64).eps
-  assert torch.linalg.cholesky_ex(covariance).info.item() == 0
-  belief = replace(belief, covariance=covariance)
-  nll, d = posterior_nll(belief, belief.mean, return_diagnostics=True)
-  assert d.jitter.item() == pytest.approx(FilterConfig().jitter_initial)
-  expected = torch.linalg.slogdet(
-    covariance + d.jitter * torch.eye(70, dtype=covariance.dtype)
-  )
-  torch.testing.assert_close(nll, 0.5 * expected.logabsdet)
 
 
 def test_promote_valid_low_rank_posterior_preserves_psd_and_gradients():
@@ -456,63 +368,6 @@ def test_promote_valid_low_rank_posterior_preserves_psd_and_gradients():
     replace(posterior, covariance=bad).to(torch.float64)
 
 
-def test_two_step_posterior_nll_model_and_action_directional_gradients():
-  estimator, initial, action, context = _fixture(batch=1)
-  action = action.requires_grad_()
-  measurements = [
-    estimator.observation(initial.mean).detach() + shift for shift in (0.015, -0.012)
-  ]
-  truth = boxplus(
-    initial.mean, torch.linspace(-0.01, 0.02, 70, dtype=torch.float64)
-  ).detach()
-
-  def objective():
-    belief = initial
-    for measurement in measurements:
-      belief = estimator.correct(
-        estimator.predict(belief, action, context), measurement
-      )
-    return posterior_nll(belief, truth).sum()
-
-  loss = objective()
-  mean_gradient, noise_gradient, action_gradient = torch.autograd.grad(
-    loss, (estimator.dynamics.mean_weight, estimator.dynamics.noise_weight, action)
-  )
-  for gradient in (mean_gradient, noise_gradient, action_gradient):
-    assert torch.isfinite(gradient).all()
-    assert gradient.abs().sum() > 1e-9
-  epsilon = 1e-5
-  for parameter, gradient in (
-    (estimator.dynamics.mean_weight, mean_gradient),
-    (estimator.dynamics.noise_weight, noise_gradient),
-  ):
-    original = parameter.detach().clone()
-    values = []
-    for sign in (1, -1):
-      with torch.no_grad():
-        parameter.copy_(original + sign * epsilon)
-      values.append(objective().detach())
-    with torch.no_grad():
-      parameter.copy_(original)
-    finite = (values[0] - values[1]) / (2 * epsilon)
-    torch.testing.assert_close(gradient, finite, atol=2e-7, rtol=2e-5)
-  direction = torch.linspace(-0.2, 0.3, 29, dtype=torch.float64).unsqueeze(0)
-  original = action.detach().clone()
-  values = []
-  for sign in (1, -1):
-    with torch.no_grad():
-      action.copy_(original + sign * epsilon * direction)
-    values.append(objective().detach())
-  with torch.no_grad():
-    action.copy_(original)
-  torch.testing.assert_close(
-    (action_gradient * direction).sum(),
-    (values[0] - values[1]) / (2 * epsilon),
-    atol=2e-7,
-    rtol=2e-5,
-  )
-
-
 def test_scalar_and_batched_filter_have_same_results_and_no_mutation():
   estimator, belief, action, context = _fixture()
   saved = belief.clone()
@@ -524,7 +379,7 @@ def test_scalar_and_batched_filter_have_same_results_and_no_mutation():
   torch.testing.assert_close(belief.covariance, saved.covariance)
 
 
-def test_belief_versions_are_checked_by_filter_and_nll():
+def test_belief_versions_are_checked_by_filter():
   estimator, belief, action, context = _fixture()
   for field in ("state_layout_version", "tangent_version"):
     bad = replace(belief, **{field: "incompatible"})
@@ -532,79 +387,6 @@ def test_belief_versions_are_checked_by_filter_and_nll():
       estimator.predict(bad, action, context)
     with pytest.raises(ValueError, match="version"):
       estimator.correct(bad, estimator.observation(belief.mean))
-    with pytest.raises(ValueError, match="version"):
-      posterior_nll(bad, belief.mean)
-
-
-def test_real_dynamics_two_step_nll_and_frozen_model_action_directional_gradients():
-  from tests.test_estimator_stochastic_dynamics import make_dynamics, model_inputs
-
-  torch.manual_seed(81)
-  model, representation = make_dynamics()
-  rep, action, aux, context = model_inputs(representation, batch=1)
-  estimator = LieBeliefFilter(
-    model, GaussianMeasurementConfig(), torch.zeros(29, dtype=torch.float64)
-  )
-  initial = estimator.initialize(
-    LieState.from_rep(aux, rep), torch.eye(70, dtype=torch.float64).unsqueeze(0) * 0.01
-  )
-  observations = [
-    estimator.observation(initial.mean).detach() + shift for shift in (0.003, -0.002)
-  ]
-  truth = boxplus(
-    initial.mean, torch.linspace(-0.001, 0.002, 70, dtype=torch.float64)
-  ).detach()
-  action.requires_grad_()
-
-  def objective():
-    belief = initial
-    for observation in observations:
-      belief = estimator.correct(
-        estimator.predict(belief, action, context), observation
-      )
-    return posterior_nll(belief, truth).sum()
-
-  loss = objective()
-  parameters = (model.mlp[-1].bias, model.noise_head[-1].bias)
-  gradients = torch.autograd.grad(loss, parameters)
-  epsilon = 2e-6
-  for parameter, gradient in zip(parameters, gradients, strict=True):
-    assert torch.isfinite(gradient).all() and gradient.abs().sum() > 1e-8
-    # Align the direction with a known nonzero derivative to avoid cancellation.
-    direction = gradient.detach() / gradient.detach().norm()
-    original = parameter.detach().clone()
-    values = []
-    for sign in (1, -1):
-      with torch.no_grad():
-        parameter.copy_(original + sign * epsilon * direction)
-      values.append(objective().detach())
-    with torch.no_grad():
-      parameter.copy_(original)
-    torch.testing.assert_close(
-      (gradient * direction).sum(),
-      (values[0] - values[1]) / (2 * epsilon),
-      atol=3e-5,
-      rtol=3e-4,
-    )
-
-  model.requires_grad_(False)
-  gradient = torch.autograd.grad(objective(), action)[0]
-  assert torch.isfinite(gradient).all() and gradient.abs().sum() > 1e-8
-  direction = gradient.detach() / gradient.detach().norm()
-  original = action.detach().clone()
-  values = []
-  for sign in (1, -1):
-    with torch.no_grad():
-      action.copy_(original + sign * epsilon * direction)
-    values.append(objective().detach())
-  with torch.no_grad():
-    action.copy_(original)
-  torch.testing.assert_close(
-    (gradient * direction).sum(),
-    (values[0] - values[1]) / (2 * epsilon),
-    atol=3e-5,
-    rtol=3e-4,
-  )
 
 
 def test_real_transition_jacobian_mixed_parameter_derivative_matches_difference():

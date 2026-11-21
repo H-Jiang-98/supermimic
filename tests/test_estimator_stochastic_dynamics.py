@@ -79,8 +79,8 @@ def test_reparameterized_sampling_is_explicit_and_matches_right_local_covariance
   args = model_inputs(representation, batch=1)
   with torch.no_grad():
     # Include cross terms, so a diagonal-only sampler cannot pass this check.
-    model.noise_head[-1].bias[1] = 0.004
-    model.noise_head[-1].bias[4] = -0.003
+    model.noise_head[-1].bias[1] = 0.4
+    model.noise_head[-1].bias[4] = -0.3
     mean_aux, mean_rep, lower = model.distribution(*args)
     mean = LieState.from_rep(mean_aux, mean_rep)
     epsilon = torch.randn(1, 70, dtype=torch.float64)
@@ -140,11 +140,25 @@ def test_sample_gradients_reach_action_mean_and_noise_and_support_second_derivat
     assert value.abs().sum() > 0
 
 
+def test_deterministic_checkpoint_preserves_existing_quaternion_format():
+  source, representation = make_dynamics(stochastic=False)
+  checkpoint = source.checkpoint()
+  assert checkpoint["metadata"]["format_version"] == "stochastic_dynamics_v2"
+  assert checkpoint["metadata"]["integration"]["version"] == "quaternion_v1"
+  restored, _ = make_dynamics(stochastic=False)
+  restored.load_checkpoint(checkpoint)
+  assert restored.model_version == source.model_version
+  args = model_inputs(representation)
+  for expected, actual in zip(source(*args), restored(*args), strict=True):
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 def test_model_version_detects_parameter_and_normalizer_updates_and_checkpoint_restore():
   model, representation = make_dynamics()
   original = model.model_version
   assert model.model_version == original
   checkpoint = model.checkpoint()
+  assert checkpoint["metadata"]["format_version"] == "stochastic_dynamics_v3"
   with torch.no_grad():
     model.mlp[-1].bias.add_(0.001)
   assert model.model_version != original
