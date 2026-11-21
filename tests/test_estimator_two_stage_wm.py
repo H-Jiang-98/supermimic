@@ -1,12 +1,13 @@
 """Replay boundaries, physical residuals, and the two independent optimizers."""
 
 from copy import deepcopy
+from typing import Literal
+from unittest.mock import Mock
 
 import pytest
 import torch
 from tensordict import TensorDict
 
-from supermimic.belief import GaussianStatePrior
 from supermimic.estimator import LieBeliefFilter
 from supermimic.estimator_inputs import GaussianMeasurementConfig
 from supermimic.learners.two_stage_wm import (
@@ -17,13 +18,20 @@ from supermimic.learners.two_stage_wm import (
 )
 from supermimic.learners.wm_learner import WorldModelLearner, WorldModelLearnerCfg
 from supermimic.models import Dynamics, ProcessNoiseConfig
-from supermimic.replay_buffer import FieldSpec, ReplayBuffer
+from supermimic.replay_buffer import MODEL_REPLAY_FIELDS, FieldSpec, ReplayBuffer
 from supermimic.representations import GenCoordRepresentation
 from supermimic.utils.lie_state import LieState, boxplus
 
 
 def fixture(
-  *, device="cpu", dtype=torch.float64, buffer_size=12, episodes=(5, 4), seed=31
+  *,
+  device="cpu",
+  dtype=torch.float64,
+  buffer_size=12,
+  episodes=(5, 4),
+  seed=31,
+  replay_mode: Literal["full", "model"] = "full",
+  seal=True,
 ):
   torch.manual_seed(seed)
   representation = GenCoordRepresentation(
@@ -58,9 +66,9 @@ def fixture(
     "terminated": FieldSpec(dtype=torch.bool),
     "truncated": FieldSpec(dtype=torch.bool),
   }
-  replay = ReplayBuffer(
-    schema, buffer_size, 1, device, initial_prior=GaussianStatePrior()
-  )
+  if replay_mode == "model":
+    schema = {key: spec for key, spec in schema.items() if key in MODEL_REPLAY_FIELDS}
+  replay = ReplayBuffer(schema, buffer_size, 1, device, replay_mode=replay_mode)
   for episode, length in enumerate(episodes):
     previous = torch.zeros(1, 29, device=device, dtype=dtype)
     for index in range(length):
@@ -93,9 +101,10 @@ def fixture(
         },
         [1],
       )
-      replay.insert(frame)
+      replay.insert(frame.select(*schema))
       previous = action
-  replay.finish_collection_round()
+  if seal:
+    replay.finish_collection_round()
   return estimator, replay
 
 
@@ -319,12 +328,126 @@ def test_sealed_windows_and_pairs_respect_ring_cut_short_episodes_and_missing_su
   assert times([1], 2) == []
   assert times([0], 4) == []
   assert times([0, 1, 2], 9) == []
-  starts = replay.model_window_starts([2], 2)
-  replay._storage["truncated"][tuple(starts[0])] = True
-  replay._storage["time_index"][tuple(starts[-1])] += 5
-  assert times([2], 2) == []
+  # A new episode ends frame zero early and skips a physical frame at age two.
+  for age, frame in enumerate(replay.retained_frames([2]).split(1)):
+    frame["episode_id"][:] = 3
+    if age == 0:
+      frame["truncated"][:] = True
+    if age == 2:
+      frame["time_index"] += 5
+    replay.insert(frame)
+  assert times([3], 2) == []
   with pytest.raises(ValueError, match="two frames"):
     replay.model_window_starts([0, 2], 1)
+
+
+def test_model_replay_and_full_replay_fit_the_same_windows_with_one_scan(monkeypatch):
+  from tests.test_estimator_belief_training import assert_tree
+
+  results = []
+  for mode in ("full", "model"):
+    estimator, replay = fixture(
+      episodes=(6, 4, 3), buffer_size=12, replay_mode=mode, seal=False
+    )
+    scan = Mock(wraps=replay._recorded_successors)
+    monkeypatch.setattr(replay, "_recorded_successors", scan)
+    rng = torch.random.get_rng_state()
+    replay.finish_collection_round()
+    assert torch.equal(rng, torch.random.get_rng_state()) == (mode == "model")
+    assert replay.training_episode_lengths() == {0: 5, 1: 4, 2: 3}
+    counts = replay.model_fit_starts([0], [2], 3)
+    assert [len(starts) for starts in counts] == [3, 1, 4, 2]
+    # No held-in or held-out samples from the unlisted episode 1.
+    windows = [
+      replay.model_windows(starts, size)
+      for starts, size in zip(counts, (3, 3, 2, 2), strict=True)
+    ]
+    fit = learner_for(estimator.dynamics)
+    fresh = replay.retained_frames([0], fields=("state", "action"))
+    torch.manual_seed(73)
+    # Use identical eager arithmetic, including residual extraction and scoring.
+    with torch.jit.optimized_execution(False):
+      metrics = fit.fit(replay, [0], [2], fresh, 3)
+    assert scan.call_count == 1
+    results.append(
+      (windows, metrics, estimator.dynamics.state_dict(), fit.state_dict())
+    )
+    if mode == "model":
+      assert set(replay._storage.keys()) == MODEL_REPLAY_FIELDS
+      assert not replay._episode_heads and not replay._training_heads
+      with pytest.raises(ValueError, match="full replay"):
+        replay.training_prefix(0, 2)
+      with pytest.raises(ValueError, match="full replay"):
+        replay.episode_prefix(0, 2)
+  full, model = results
+  for a, b in zip(full[0], model[0], strict=True):
+    for key in a.keys():
+      torch.testing.assert_close(a[key], b[key], rtol=0, atol=0)
+  assert full[1] == model[1]
+  assert_tree(full[2:], model[2:])
+
+
+def test_model_round_index_tracks_insert_retry_and_explicit_truncation(monkeypatch):
+  _, replay = fixture(episodes=(3,), buffer_size=3, replay_mode="model", seal=False)
+  frame = replay.retained_frames(newest_count=1)
+  frame["episode_id"][:] = 1
+  frame["time_index"].zero_()
+  frame["terminated"].zero_()
+  scan = Mock(wraps=replay._recorded_successors)
+  monkeypatch.setattr(replay, "_recorded_successors", scan)
+  assert len(replay.model_window_starts([0], 2)) == 2
+  token = object()
+  replay.insert(frame, token=token)
+  assert replay.training_episode_lengths() == {0: 2, 1: 1}
+  assert len(replay.model_window_starts([0], 2)) == 1
+  replay.insert(frame, token=token)
+  assert replay.training_episode_lengths() == {0: 2, 1: 1}
+  assert scan.call_count == 2 and replay.insert_count == 4
+  replay.truncate_open_episodes()
+  replay.finish_collection_round()
+  replay.truncate_open_episodes()
+  replay.finish_collection_round()
+  assert scan.call_count == 3 and replay.insert_count == 4
+  frame["time_index"][:] = 1
+  replay.insert(frame)
+  assert len(replay.model_window_starts([1], 2)) == 0
+  assert scan.call_count == 4
+
+
+def test_model_replay_rejects_invalid_heldout_head_before_fitting():
+  from tests.test_estimator_belief_training import assert_tree
+
+  estimator, replay = fixture(episodes=(4, 2), replay_mode="model", seal=False)
+  replay._storage["state"][0, 4, 3:7].zero_()
+  fit = learner_for(estimator.dynamics)
+  fresh = replay.retained_frames([0], fields=("state", "action"))
+  state = fit.state_dict()
+  rng = torch.random.get_rng_state()
+  with pytest.raises(ValueError, match="Rotation"):
+    replay.finish_collection_round()
+  with pytest.raises(ValueError, match="Rotation"):
+    fit.fit(replay, [0], [1], fresh, 2)
+  assert_tree(fit.state_dict(), state)
+  assert torch.equal(torch.random.get_rng_state(), rng)
+
+
+@pytest.mark.parametrize("boundary", [None, "reset", "gap", "terminated", "truncated"])
+def test_model_replay_checks_previous_action_only_for_recorded_successors(boundary):
+  _, replay = fixture(episodes=(2,), buffer_size=2, replay_mode="model")
+  frame = replay.retained_frames(newest_count=1)
+  frame["time_index"][:] = 2
+  frame["terminated"][:] = boundary == "terminated"
+  frame["truncated"][:] = boundary == "truncated"
+  replay.insert(frame)
+  episode = frame["episode_id"] + int(boundary == "reset")
+  time_index = frame["time_index"] + (2 if boundary == "gap" else 1)
+  replay.validate_previous_action(episode, time_index, frame["action"])
+  different = frame["action"] + 0.1
+  if boundary is None:
+    with pytest.raises(ValueError, match="previous action"):
+      replay.validate_previous_action(episode, time_index, different)
+  else:
+    replay.validate_previous_action(episode, time_index, different)
 
 
 def test_fit_shuffles_each_pair_once_per_epoch_and_keeps_last_batch(monkeypatch):

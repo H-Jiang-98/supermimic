@@ -436,7 +436,7 @@ decoder 首层 LayerNorm 后的 FiLM。A/B 完全旁路 FiLM。旧配置保持�
 保留已有数据，同时防止恢复历史或采样训练序列时跨越手动 reset。
 也可在构造 runner 时提供 legacy `posterior_provider`，成功采集时每个时间点调用一次，
 关键字参数是 `measurement`（64 维）、`previous_action`（29 维）和
-`reset_mask`。actor、provider 和 replay 共用同一次高斯测量。
+`reset_mask`。actor 和 provider 共用同一次高斯测量，完整 replay 保存这份测量用于重建策略历史。
 `imagined_posterior_provider` 应为独立实例；想象入口
 `runner.wm_env.reset(batch, posterior=...)` 和 `step(action, posterior=...)`
 支持逐步注入，不会沿用上一时刻的注入后验。reset 的 batch 可由
@@ -512,15 +512,15 @@ runner.finish_collection_round()
 `(0.01, 0.01, 0.05, 0.05, 0.005, 0.05)`，单位依次为 rad、m、m/s、rad/s、rad、rad/s。
 首帧融合 o₀ 一次，之后使用实际执行动作和记录的测量逐帧预测、修正。
 真实采集可通过 `configure_belief_filter(prior_factory=...)` 注入其他已知先验。
-部分 reset 只初始化对应槽位。训练片段独立使用配置的高斯先验。
+部分 reset 只初始化对应槽位。EIT 策略回放从保留片段的首帧真值独立抽取配置的高斯先验。
 
 provider 持有当前完整后验及其 `episode_id`、`time_index`、`model_version`。
 同一 replay 生命周期内，各并行环境的 episode 编号唯一；每个 episode 的
 `time_index` 从 0 开始，与参考片段的 `motion_time` 分别计数。runner 每次构建
 actor 输入都以当前帧标识向 provider 查询，同帧 restore 后立即使用恢复的后验。
 
-真实 provider 的 v3 快照额外记录实际使用的在线首帧先验，可通过 `episode_prefix` 核对完整物理前缀。策略训练使用保留片段自己的先验。
-`finish_collection_round()` 对每个保留片段建立训练先验。重复读取或更新模型时复用同一份抽样，覆盖片段首帧后才为新的起点抽样。首次按键重放也会自动完成本轮分段。在线滤波和历史连续推进。
+真实 provider 的 v3 快照记录实际使用的在线首帧先验。完整 replay 另外记录这份先验，在物理首帧仍保留时可通过 `episode_prefix` 核对实际前缀。
+完整 replay 在 `finish_collection_round()` 时为每个保留片段建立策略先验。重复读取或更新模型时复用同一份抽样，覆盖片段首帧后才为新的起点抽样。首次按键重放也会自动完成本轮分段。
 想象 reset 接收标量或每个槽位各自的索引。`time_index` 定位物理 episode 中的帧，`segment_time` 定位保留片段中的帧。
 
 ```python
@@ -584,6 +584,8 @@ MuJoCo smoke 自动生成四帧静止参考，使用 2 个环境、容量为 2 �
 
 `train_belief` 固定 actor。每轮采集结束后，用新训练帧更新模型归一化，然后完成两次拟合。验证 episode 默认满足 `episode_id % 5 == 0`。采样只使用同一 episode 中时间连续的真实后继帧。
 
+`train_belief` 在创建 runner 时选择 `replay_mode="model"`。每帧保存 `state`、`action`、`sim_ctx`、`episode_id`、`time_index`、`terminated` 和 `truncated`。采集端继续用实测历史和在线滤波产生动作，在执行下一步前核对上一执行动作。模型 replay 封存和建立窗口索引均不消耗随机数。均值窗口抽样和 covariance 批次洗牌仍使用训练 RNG，旧版本与新版在相同 seed 下可能产生不同的训练轨迹。
+
 | 阶段 | 数据与目标 | 默认配置 |
 |---|---|---|
 | 预测均值 | 从真实首帧开始回喂预测，优化根位置、根朝向、关节位置和关节速度的加权 MSE | 8 帧窗口、7 步预测，每批 2048 窗，每轮 10 次 Muon/Adam 更新 |
@@ -623,14 +625,14 @@ critic 特征入口，保留 R/p/v 均值和边缘 covariance 的梯度。它是
 clip 最后一个评分动作后停止回报，普通策略 horizon 截断保留 bootstrap。
 
 每轮模型更新完毕后，先从所有保留的训练帧抽取本轮各次策略更新的起点，单帧片段也可入选。
-按 episode 从保留片段的先验顺序滤波，直到该 episode 最后一个需要的帧。只有本轮新采集的
-训练帧参与 actor/critic 归一化，每帧计一次。保存抽中起点的后验与控制历史，归一化更新后
+`train_eit` 使用默认的完整 replay，按 episode 从片段先验顺序滤波，直到最后一个需要的帧。本轮新采集且仍保留的训练帧
+参与 actor/critic 归一化，每帧计一次。保存抽中起点的后验与控制历史，归一化更新后
 按原抽样顺序启动 rollout。起点准备和策略更新期间，参考 motion 张量及其底层存储只读；
 进入该阶段时计算一次内容摘要，随后各 microbatch 共用。
 
 A/B/C 的训练、评估和播放均要求联合 checkpoint 内嵌 `eit_rpv_belief_critic_v2` critic 契约。
 加载时校验组别、输入维度和 `rpv9_log_std_corr_v1` 编码。A 组也执行同一版本检查。
-新训练默认在输出目录的父目录创建或读取 `eit_initialization_v2_eit_rpv_belief_critic_v2_seed<seed>.pt`。
+新训练默认在输出目录的父目录创建或读取 `eit_initialization_v3_eit_rpv_belief_critic_v2_seed<seed>.pt`。
 同一 seed 的三组使用同一份初始化包，分别写入各自的训练目录。也可用 `--initialization` 指定当前契约的初始化包。
 各组独立采集与更新。以下是初始工程配置，尚未验证长时控制收敛。
 
@@ -638,7 +640,7 @@ A/B/C 的训练、评估和播放均要求联合 checkpoint 内嵌 `eit_rpv_beli
 OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
   .venv/bin/python -m supermimic.scripts.train_eit \
   --motion-file data/motions/walk1_subject1.npz --device cuda:0 \
-  --group B --output logs/eit-rpv-v2/B \
+  --group B --output logs/eit-v3/B \
   --num-envs 8 --rounds 10
 ```
 
@@ -652,14 +654,14 @@ OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
 ```bash
 OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.train_eit \
   --motion-file data/motions/walk1_subject1.npz --device cuda:0 \
-  --output logs/eit-rpv-v2/B --resume logs/eit-rpv-v2/B/training.pt --rounds 10
+  --output logs/eit-v3/B --resume logs/eit-v3/B/training.pt --rounds 10
 OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.eval_eit \
-  --checkpoint logs/eit-rpv-v2/B/training.pt \
+  --checkpoint logs/eit-v3/B/training.pt \
   --motion-file data/motions/walk1_subject1.npz --device cuda:0 \
-  --num-envs 8 --output logs/eit-rpv-v2/B/evaluation.json
+  --num-envs 8 --output logs/eit-v3/B/evaluation.json
 ```
 
-`eit_training_v2` 分别记录均值 Muon/Adam 和 covariance Adam 的状态。策略训练另存 actor、critic 及其优化器、归一化和随机数流。
+`eit_training_v3` 记录本轮使用的 `replay_mode` 及均值 Muon/Adam、covariance Adam 的状态。续训时核对 replay 模式。策略训练另存 actor、critic 及其优化器、归一化和随机数流。两个训练入口、评估与播放均只接受 v3 轮次存档，初始化包只接受 `eit_initialization_v3`。
 恢复前在私有副本上校验全部组件。恢复后清空 replay 并重置真实环境；固定相同
 原始输入和噪声可以验证优化器续训一致，但不承诺恢复物理模拟轨迹。
 `eval_eit` 复用 mjlab tracking 的首 episode 评估循环和跟踪指标，从 clip 头开始，

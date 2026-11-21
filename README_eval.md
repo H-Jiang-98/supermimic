@@ -4,7 +4,7 @@
 `play.py` 加载已有模型，在单个仿真环境中观察策略跟踪效果和世界模型预测，不更新权重。
 
 旧输入布局继续使用 W&B 模型和原有 viewer。`eit_rpv_v1` 的 A/B/C 现在支持本地
-`eit_training_v2` 格式的 `training.pt` 定量评估与播放，共用 `EITPolicyAdapter`。benchmark 和 ONNX exporter
+`eit_training_v3` 格式的 `training.pt` 定量评估与播放，共用 `EITPolicyAdapter`。benchmark 和 ONNX exporter
 尚未接入 EIT。训练及梯度 smoke 仍使用 README 中的 `check_estimator` / `check_eit_training`。
 
 ## EIT 定量评估和播放
@@ -15,12 +15,12 @@ MPKPE、root-relative MPKPE、关节速度 RMS 和末端位姿误差函数。每
 
 ```bash
 OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.eval_eit \
-  --checkpoint logs/eit-rpv-v2/B/training.pt \
+  --checkpoint logs/eit-v3/B/training.pt \
   --motion-file data/motions/walk1_subject1.npz --device cpu \
-  --num-envs 8 --output logs/eit-rpv-v2/B/evaluation.json
+  --num-envs 8 --output logs/eit-v3/B/evaluation.json
 
 .venv/bin/python -m supermimic.scripts.play SuperMimic-GenCoord-G1 \
-  --eit-checkpoint logs/eit-rpv-v2/B/training.pt \
+  --eit-checkpoint logs/eit-v3/B/training.pt \
   --motion-file data/motions/walk1_subject1.npz --viewer viser
 ```
 
@@ -29,7 +29,7 @@ OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.eval_eit \
 归一化固定，不创建 replay、critic 或 optimizer。每次真实 reset 按 checkpoint 的带噪
 真值先验初始化；这是仿真的初始化知识假设，不能解释为已经支持无真值的实机初始化。
 
-评估和播放均可加载固定 actor 的模型训练快照，以及含 actor/critic 更新的策略训练快照。策略训练快照还须包含本组的 `eit_rpv_belief_critic_v2` 契约。
+评估和播放均可加载 v3 的固定 actor 模型训练快照及策略训练快照。两种入口都拒绝 v1、v2 轮次存档。模型训练快照可来自 model 或 full replay。策略训练快照须声明 full replay，并包含本组的 `eit_rpv_belief_critic_v2` 契约。
 加载器在创建推理模型前校验契约版本，并将声明的 context 宽度与世界模型的 context 宽度、声明的输入宽度与 critic 首层权重逐一核对。
 三组训练和初始化包的用法见 [训练说明](README.md#estimator-第四步完整策略与模型交替训练)。
 

@@ -14,12 +14,17 @@ from supermimic.runners.eit_inference import (
   evaluation_config,
   load_evaluation_models,
 )
+from supermimic.runners.run_config import (
+  EIT_TRAINING_VERSION,
+  validate_eit_checkpoint_contract,
+)
 from supermimic.runners.supermimic_runner import (
   SuperMimicRunner,
   SuperMimicRunnerCfg,
   actor_checkpoint,
 )
 from supermimic.scripts.check_estimator import stationary_motion
+from supermimic.scripts.eval_eit import evaluate
 from supermimic.scripts.train_utils import create_env
 from supermimic.tasks.env_cfgs import configure_estimator_env_cfg, gencoord_env_cfg
 
@@ -161,8 +166,9 @@ def test_adapter_reset_does_not_reset_physics_and_rejects_skipped_frames(tmp_pat
 def test_evaluation_loader_is_private_and_checks_estimator_contract(tmp_path):
   with physical_runner(tmp_path, "B") as runner:
     saved = {
-      "version": "eit_training_v2",
+      "version": EIT_TRAINING_VERSION,
       "stage": "policy",
+      "replay_mode": "full",
       "critic": BeliefCritic(
         "B", runner._sim_context.output_dim, runner.cfg.critic_hidden_dims
       ).checkpoint(),
@@ -191,9 +197,34 @@ def test_evaluation_loader_is_private_and_checks_estimator_contract(tmp_path):
       load_evaluation_models(runner.env, cfg, malformed, "cpu")
 
 
-def test_evaluation_config_rejects_model_only_resume():
-  with pytest.raises(ValueError, match="eit_training_v2"):
-    evaluation_config({"version": "unknown"})
+@pytest.mark.parametrize("version", ["eit_training_v1", "eit_training_v2"])
+@pytest.mark.parametrize("stage", ["model", "policy"])
+def test_evaluation_rejects_old_checkpoint_before_starting_environment(
+  tmp_path, version, stage
+):
+  checkpoint = tmp_path / "training.pt"
+  torch.save({"version": version, "stage": stage}, checkpoint)
+  with pytest.raises(ValueError, match=EIT_TRAINING_VERSION):
+    evaluate(checkpoint, tmp_path / "motion.npz")
+
+
+@pytest.mark.parametrize("replay_mode", ["model", "full"])
+def test_model_checkpoint_contract_accepts_training_or_diagnostic_replay(replay_mode):
+  validate_eit_checkpoint_contract(
+    {"version": EIT_TRAINING_VERSION, "stage": "model", "replay_mode": replay_mode}
+  )
+
+
+@pytest.mark.parametrize(
+  ("stage", "replay_mode"),
+  [("model", None), ("model", "other"), ("policy", None), ("policy", "model")],
+)
+def test_inference_rejects_missing_or_invalid_replay_contract(stage, replay_mode):
+  saved = {"version": EIT_TRAINING_VERSION, "stage": stage}
+  if replay_mode is not None:
+    saved["replay_mode"] = replay_mode
+  with pytest.raises(ValueError, match="Invalid replay mode"):
+    evaluation_config(saved)
 
 
 @pytest.mark.parametrize("group", ["A", "B", "C"])
@@ -217,8 +248,9 @@ def test_inference_rejects_incompatible_critic_before_building_models(group, fau
   critic = BeliefCritic(group, context_dim, cfg.critic_hidden_dims).checkpoint()
   contract = critic["contract"]
   saved = {
-    "version": "eit_training_v2",
+    "version": EIT_TRAINING_VERSION,
     "stage": "policy",
+    "replay_mode": "full",
     "runner_config": asdict(cfg),
     "critic": critic,
     "world_model": {"sim_context": {"scale": torch.ones(context_dim)}},

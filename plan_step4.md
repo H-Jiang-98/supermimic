@@ -50,7 +50,7 @@ covariance 取完整后验的 `Σ[..., :9, :9]` 边缘块，按 [δθ, δρ, δ�
 
 验收包括输入维度和配置恢复、固定共同输入时 A 无需 belief 且对其合法变化不敏感、B/C 对 R/p/v 均值及 9×9 内非对角 covariance 的响应、对其余合法后验均值和 covariance 变化的直接输入隔离、B/C 初始化一致，以及机器人/参考/后验共同水平旋转平移后的特征不变。分别验证均值与 covariance 的方向导数，当前投影对被排除后验坐标的直接梯度为零；完整滤波仍允许这些坐标通过后续 R/p/v 更新影响回报。critic 的输入响应在输出层离开零初始化后测试。actor 信息隔离测试继续覆盖 B/C 对真值的独立性和 A/B 对直接 covariance 输入的独立性。
 
-三组的 critic 输入版本均为 `eit_rpv_belief_critic_v2`，B/C 的 covariance 编码为 `rpv9_log_std_corr_v1`。联合训练 checkpoint（`eit_training_v2`）和共同初始化包（`eit_initialization_v2`）以内部保存的 critic 契约判定兼容性。三组训练、评估和播放都拒绝旧契约，即使 A 的输入维度相同。续训还需校验策略 optimizer 对应的参数契约，共同初始化须校验全部三个 critic，恢复想象快照时按保存的 critic 配置校验。
+三组的 critic 输入版本均为 `eit_rpv_belief_critic_v2`，B/C 的 covariance 编码为 `rpv9_log_std_corr_v1`。联合训练 checkpoint（`eit_training_v3`）和共同初始化包（`eit_initialization_v3`）以内部保存的 critic 契约判定兼容性。三组训练、评估和播放都拒绝旧契约，即使 A 的输入维度相同。续训还需校验策略 optimizer 对应的参数契约，共同初始化须校验全部三个 critic，恢复想象快照时按保存的 critic 配置校验。
 
 R/p/v 投影同时压缩均值与 covariance，是任务相关的价值输入近似；被排除的状态不确定性和交叉项仍可能影响未来滤波与回报。第五步将检验控制收益、长期价值预测及 bootstrap 梯度质量。B/C 继续使用相同 critic 设计，C−B 的结论限定在这一配置下。
 
@@ -58,7 +58,7 @@ R/p/v 投影同时压缩均值与 covariance，是任务相关的价值输入近
 
 新增按训练 episode 筛选的策略起点采样器。均匀采样保留的训练帧，返回 episode/time 键；不使用验证 episode，也不沿用会采到全部 episode 的旧 `sample_initial_states()`。策略起点可以包含片段尾帧或单帧片段。
 
-对 N 个起点使用当前模型、已实现的片段先验和已记录测量重建完整 Q₀，前缀放在 `no_grad()` 下。初始潜在状态取 replay 真值，不再从 Q₀ 抽样。每个起点的 K 条轨迹共享完全相同的潜在状态、Q₀、历史、参考对齐、motion time 和 ξ；首帧测量已融合，不重新采样或重复更新。
+对 N 个起点使用当前模型、完整 replay 中已抽取的片段先验和实际测量重建完整 Q₀，前缀放在 `no_grad()` 下。初始潜在状态取 replay 真值。每个起点的 K 条轨迹共享完全相同的潜在状态、Q₀、历史、参考对齐、motion time 和 ξ。恢复起点时直接使用已融合首帧测量的后验。
 
 新增 `BeliefRolloutStart` 一类的完整初始条件对象，提供选择、复制和 `reset_prepared()`。原始记录、历史和后验在边界 detach；对象带模型版本和 replay 帧身份，旧模型版本或被覆盖的帧不能恢复。每个唯一帧只重建一次，再展开 K 份；新接口复用现有 provider 的校验与提交机制，不放宽旧普通 batch reset 的限制。
 
@@ -121,9 +121,9 @@ actor 对所有 microbatch 累积按 `1/(N×K)` 缩放的梯度，只执行一�
 新增 `EITTraining` 调度与 `train_eit` 入口，复用 step3 公共操作，避免通过继承固定 actor 的 `BeliefModelTraining.__init__()` 意外保留冻结状态。轮次顺序固定为：
 
 1. 固定本轮模型、actor 和归一化，在真实仿真采集，保存同一份测量、执行动作及参考对齐。
-2. 封存 replay 片段，沿用 episode ID 的固定训练/验证划分，用本轮新采集的训练帧更新模型归一化。
-3. 用真实窗口的加权 MSE 更新均值，再用冻结均值产生的一步残差拟合 L。验证集分别计算均值误差与过程 NLL。
-4. 固定更新后的模型，从本轮新训练帧重建 actor/critic 特征，集中更新其归一化。A 的 actor goal 使用真值，B/C 使用当前模型重建的后验；history 使用原测量，单帧统计不重复计入 padding。验证帧和随机想象都不更新归一化。本轮没有新训练帧时沿用原统计。
+2. 封存完整 replay，在最早保留的帧和其后每个 episode 的首帧建立策略片段。同一片段首帧保留时复用已抽取的先验。按 episode ID 划分训练和验证，用本轮全部新训练帧更新模型归一化。
+3. 用真实窗口的加权 MSE 更新均值，再用冻结均值产生的一步残差拟合 L。在验证集的全部有效一步对上计算过程 NLL，有完整验证窗口时另计算均值误差。
+4. 固定更新后的模型，从本轮新采集且仍保留的训练帧重建 actor/critic 特征，集中更新其归一化。A 的 actor goal 使用真值，B/C 使用当前模型重建的后验。history 使用原测量，单帧统计不重复计入 padding。只用真实训练帧更新归一化。本轮没有新训练帧时沿用原统计。
 5. 冻结模型、filter 和全部归一化，按配置交替执行 actor 更新和 critic 回归。每次 actor 更新重新生成轨迹；固定模型阶段可复用 detach 后的 Q₀，缓存必须包含模型版本、帧身份及先验身份。
 6. 保存完整轮次 checkpoint，丢弃活动想象图，然后显式 reset 物理环境、历史与独立 provider，开始下一轮。继承 step3 对 episode ID 和模型版本的约束。
 
@@ -133,7 +133,7 @@ actor 对所有 microbatch 累积按 `1/(N×K)` 缩放的梯度，只执行一�
 
 **第五批：完整 checkpoint 与短程闭环评估。**
 
-轮次 checkpoint 保存模型 bundle、actor、critic 和归一化。均值 Muon/Adam、covariance Adam、actor 与 critic 的优化器分别保存，同时记录步数、组别和输入编码、策略配置、滤波与先验配置、motion 指纹和 RNG。固定原始输入和噪声可检查下一次更新。
+轮次 checkpoint 保存模型 bundle、actor、critic 和归一化。均值 Muon/Adam、covariance Adam、actor 与 critic 的优化器分别保存，同时记录步数、实际 replay 模式、组别和输入编码、策略配置、滤波与先验配置、motion 指纹和 RNG。续训时检查 replay 模式一致。固定原始输入和噪声可检查下一次更新。
 
 保存采用原子替换，恢复前在副本上验证模型、优化器、配置和 RNG。恢复从新的物理轨迹与空 replay 开始。
 
@@ -197,7 +197,7 @@ actor 对所有 microbatch 累积按 `1/(N×K)` 缩放的梯度，只执行一�
 prepared reset 和每个 imagined step 在提交前校验完整 critic 输入；已结束 clip 的 snapshot
 记录结束状态和 critic 编码配置，恢复后不能再多执行一个动作。
 
-共同初始化位于输出目录的父目录，默认文件名为 `eit_initialization_v2_eit_rpv_belief_critic_v2_seed<seed>.pt`。同一训练 seed 的三组共享这一文件，也可以用 `--initialization` 显式指定当前契约的共同初始化包。
+共同初始化位于输出目录的父目录，默认文件名为 `eit_initialization_v3_eit_rpv_belief_critic_v2_seed<seed>.pt`。同一训练 seed 的三组共享这一文件，也可以用 `--initialization` 显式指定当前契约的共同初始化包。
 发布采用原子且不覆盖已有文件的方式；加载前校验全部三组组件并计算指纹。
 模型使用本轮全部新训练帧更新归一化。actor 与 critic 使用其中仍可重建起点的帧。
 均值、covariance 与两个策略 optimizer 都先在副本上校验，再恢复活动状态。

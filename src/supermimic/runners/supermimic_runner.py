@@ -472,6 +472,7 @@ class Ratio:
 @dataclass
 class _CollectionStep:
   fields: dict[str, torch.Tensor]
+  motion_time: torch.Tensor | None
   actor_td: TensorDict | None
   head_priors: tuple[torch.Tensor, BeliefState] | None
   result: tuple
@@ -493,6 +494,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
   """
 
   cfg: CfgT
+  replay_mode: Literal["full", "model"] = "full"
 
   def __init__(
     self,
@@ -543,13 +545,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     self.motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
     self.motion = self.motion_cmd.motion
 
-    self.replay_buffer = ReplayBuffer(
-      schema=self._buffer_schema(),
-      buffer_size=self.cfg.buffer_size,
-      num_envs=self.env.num_envs,
-      device=self.device,
-      initial_prior=wm.initial_prior,
-    )
+    self.replay_buffer = self._make_replay_buffer()
     if self._dynamics.process_noise_config is not None:
       self.world_model_learner = TwoStageWorldModelLearner(
         self._dynamics, self._representation, self.cfg.mean, self.cfg.cov, self.device
@@ -671,11 +667,24 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
 
   @property
   def _stores_actor_obs(self) -> bool:
-    """The buffer carries the real sensor only for its sole reader, the
-    history warm-start (``WorldModelEnv.sample_initial_states``)."""
-    return self._representation.actor_obs_mode == "proprio" and (
-      self.cfg.history_length > 1
-      or getattr(self.cfg, "estimator_inputs", None) is not None
+    """Retain real sensors for history warm-starts and belief reconstruction."""
+    return (
+      self.replay_mode == "full"
+      and self._representation.actor_obs_mode == "proprio"
+      and (
+        self.cfg.history_length > 1
+        or getattr(self.cfg, "estimator_inputs", None) is not None
+      )
+    )
+
+  def _make_replay_buffer(self) -> ReplayBuffer:
+    return ReplayBuffer(
+      schema=self._buffer_schema(),
+      buffer_size=self.cfg.buffer_size,
+      num_envs=self.env.num_envs,
+      device=self.device,
+      initial_prior=self._wm.initial_prior,
+      replay_mode=self.replay_mode,
     )
 
   def _buffer_schema(self) -> dict[str, FieldSpec]:
@@ -683,21 +692,29 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     schema = {
       "state": FieldSpec(self._representation.full_state_dim),
       "action": FieldSpec(self._num_actions),
-      "prev_action": FieldSpec(self._num_actions),
-      "motion_time": FieldSpec(dtype=torch.long),
+      "sim_ctx": FieldSpec(self._sim_context.output_dim),
       "terminated": FieldSpec(dtype=torch.bool),
       "truncated": FieldSpec(dtype=torch.bool),
     }
+    estimator_inputs = getattr(self.cfg, "estimator_inputs", None)
+    if estimator_inputs is not None:
+      schema["episode_id"] = FieldSpec(dtype=torch.long)
+      schema["time_index"] = FieldSpec(dtype=torch.long)
+    if self.replay_mode == "model":
+      if estimator_inputs is None:
+        raise ValueError(
+          "Model-only replay requires estimator inputs with episode keys"
+        )
+      return schema
+    schema["prev_action"] = FieldSpec(self._num_actions)
+    schema["motion_time"] = FieldSpec(dtype=torch.long)
     if self._stores_actor_obs:
       schema["actor_obs"] = FieldSpec(
         self._representation.proprio_obs_dim(self._num_actions)
       )
-    schema["sim_ctx"] = FieldSpec(self._sim_context.output_dim)
-    if getattr(self.cfg, "estimator_inputs", None) is not None:
+    if estimator_inputs is not None:
       schema["alignment_rotation"] = FieldSpec((3, 3))
       schema["alignment_translation"] = FieldSpec(3)
-      schema["episode_id"] = FieldSpec(dtype=torch.long)
-      schema["time_index"] = FieldSpec(dtype=torch.long)
     return schema
 
   def _init_policy(self) -> None:
@@ -722,16 +739,23 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
   def _execute_collection_step(
     self, actions, curr_states, actor_td, extra_fields
   ) -> _CollectionStep:
-    motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
     fields = {
       "state": curr_states.detach().clone(),
       "action": actions.detach().clone(),
-      "prev_action": self.action_manager.action.clone(),
-      "motion_time": motion_cmd.time_steps.clone(),
     }
+    motion_time = None
+    if self.replay_mode == "full" or getattr(self, "_sampler", None) is not None:
+      motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
+      motion_time = motion_cmd.time_steps.clone()
+      if self.replay_mode == "full":
+        fields["prev_action"] = self.action_manager.action.clone()
+        fields["motion_time"] = motion_time
     if extra_fields:
       fields.update({k: v.detach().clone() for k, v in extra_fields.items()})
-    actor_td = actor_td.detach().clone() if actor_td is not None else None
+    if self._collection_normalization_frozen:
+      actor_td = None
+    elif actor_td is not None:
+      actor_td = actor_td.detach().clone()
     provider = getattr(self, "posterior_provider", None)
     head_priors = None
     if isinstance(provider, BeliefProvider) and "episode_id" in fields:
@@ -742,12 +766,15 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
         or not torch.equal(state.time_index, fields["time_index"])
       ):
         raise ValueError("Collection posterior must match the frames being recorded")
-      head_priors = state.head_priors
+      if self.replay_mode == "full":
+        head_priors = state.head_priors
       if head_priors is not None:
         self.replay_buffer.validate_head_priors(
           state.episode_id, state.time_index, head_priors
         )
-    return _CollectionStep(fields, actor_td, head_priors, self.env.step(actions))
+    return _CollectionStep(
+      fields, motion_time, actor_td, head_priors, self.env.step(actions)
+    )
 
   def _store_collection_step(self, step: _CollectionStep):
     if step.stored:
@@ -772,14 +799,17 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       )
     step.stored = True
 
+  @property
+  def _collection_normalization_frozen(self) -> bool:
+    return isinstance(
+      getattr(self, "posterior_provider", None), BeliefProvider
+    ) and getattr(self.cfg, "freeze_estimator_normalization", False)
+
   def _flush_normalization(self) -> None:
     """Apply queued normalizer updates. Call outside ``inference_mode()``."""
     if not self._pending_norm_updates:
       return
-    if (
-      isinstance(getattr(self, "posterior_provider", None), BeliefProvider)
-      and self.cfg.freeze_estimator_normalization
-    ):
+    if self._collection_normalization_frozen:
       self._pending_norm_updates.clear()
       return
     states, actions, actor_inputs = zip(*self._pending_norm_updates, strict=True)
@@ -857,6 +887,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     *args,
     posterior_provider: PosteriorProvider | None = None,
     imagined_posterior_provider: PosteriorProvider | None = None,
+    replay_mode: Literal["full", "model"] = "full",
     **kwargs,
   ):
     if (
@@ -868,6 +899,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       )
     self.posterior_provider = posterior_provider
     self.imagined_posterior_provider = imagined_posterior_provider
+    self.replay_mode = replay_mode
     self._current_posterior: PosteriorInput | None = None
     self._posterior_ready = False
     super().__init__(*args, **kwargs)
@@ -1103,7 +1135,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     )
 
   def finish_collection_round(self) -> None:
-    """Seal training segment heads after collection, preserving the live stream."""
+    """Seal the retained replay for model fitting."""
     if self._pending_collection is not None:
       self.step()
     self.replay_buffer.finish_collection_round()
@@ -1113,9 +1145,18 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     curr_states = obs["full_state"].to(self.device)
     sim_actor_obs = obs["actor"].to(self.device)
 
-    # Pre-step frames; env.step() advances time_steps in place.
-    motion_times = self.motion_cmd.time_steps.to(self.device).clone()
+    motion_times = self.motion_cmd.time_steps.to(self.device)
 
+    if self.cfg.estimator_inputs is not None:
+      if self._sim_history is None:
+        raise RuntimeError("Seed the measurement history after reset before collection")
+      previous_action = self.action_manager.action
+      if not self._sim_history[:, -1, 64:].equal(previous_action):
+        raise RuntimeError("Measured previous action differs from executed action")
+      if self.replay_mode == "model":
+        self.replay_buffer.validate_previous_action(
+          self._episode_id, self._time_index, previous_action
+        )
     rep_state = self._representation.represent(curr_states)
     aux_state = self._representation.extract_aux_state(curr_states)
     sim_ctx = self._sim_context.read(self.env.unwrapped)
@@ -1141,12 +1182,10 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         else sim_actor_obs
       )
     if self.cfg.estimator_inputs is not None:
-      if not torch.equal(actor_td["history"][:, -1, 64:], self.action_manager.action):
-        raise RuntimeError("Measured previous action differs from executed action")
-      alignment = self.motion_cmd.reference_alignment
-      extra_fields["alignment_rotation"] = alignment.rotation
-      extra_fields["alignment_translation"] = alignment.translation
-
+      if self.replay_mode == "full":
+        alignment = self.motion_cmd.reference_alignment
+        extra_fields["alignment_rotation"] = alignment.rotation
+        extra_fields["alignment_translation"] = alignment.translation
       extra_fields.update(episode_id=self._episode_id, time_index=self._time_index)
     return self._execute_collection_step(
       actions,
@@ -1181,12 +1220,13 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         step.logged = True
 
       if self._sampler is not None and not step.sampler_updated:
+        assert step.motion_time is not None
         # A failure on a step that also times out counts as the time-out.
         manager = self.env.unwrapped.termination_manager
         truncated = manager.time_outs.to(self.device, torch.bool)
         clip_end = manager.get_term("motion_end").to(self.device, torch.bool)
         step.sampling_weights = self._sampler.record(
-          step.fields["motion_time"],
+          step.motion_time,
           rewards,
           manager.terminated.to(self.device, torch.bool) & ~truncated,
           clip_end,

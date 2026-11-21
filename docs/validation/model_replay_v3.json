@@ -1,0 +1,282 @@
+{
+  "date": "2026-11-21",
+  "task": "SuperMimic-GenCoord-G1",
+  "motion": "data/motions/walk1_subject1.npz",
+  "seed": 2026,
+  "group": "B",
+  "python": "3.13.13",
+  "torch": "2.14.0+cu130",
+  "training_checkpoint_version": "eit_training_v3",
+  "initialization_version": "eit_initialization_v3",
+  "dense_storage_scope": "Populated float32 G1 replay, including 33 simulation-context channels. Bytes per physical frame count field tensors only.",
+  "cpu_rounds": {
+    "train_belief": {
+      "stage": "model",
+      "replay_mode": "model",
+      "motion_digest": "720b3b58507fd720320e208fadcee61ad6dc30a04b5a555a630b01a61c58b103",
+      "num_envs": 5,
+      "collection_steps": 8,
+      "buffer_size": 7,
+      "dynamics_hidden_dims": [
+        24,
+        16
+      ],
+      "mean_fit": {
+        "lr": 0.0002,
+        "num_batches": 1,
+        "batch_size": 4,
+        "window_frames": 3
+      },
+      "cov_fit": {
+        "lr": 0.0002,
+        "batch_size": 8,
+        "epochs": 1
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "collected_frames": 40,
+          "mean_steps": 1,
+          "cov_steps": 3,
+          "train_pairs": 24,
+          "validation_pairs": 6,
+          "validation_weighted_mean_loss": 0.637484073638916,
+          "validation_process_nll": 18546.560709635418
+        },
+        {
+          "round": 2,
+          "collected_frames": 80,
+          "mean_steps": 2,
+          "cov_steps": 6,
+          "train_pairs": 24,
+          "validation_pairs": 6,
+          "validation_weighted_mean_loss": 0.7880702614784241,
+          "validation_process_nll": 21838.618489583332
+        },
+        {
+          "round": 3,
+          "collected_frames": 120,
+          "mean_steps": 3,
+          "cov_steps": 9,
+          "train_pairs": 24,
+          "validation_pairs": 6,
+          "validation_weighted_mean_loss": 0.4403854012489319,
+          "validation_process_nll": 15609.156087239584
+        }
+      ],
+      "resumed_round": 3,
+      "resumed_replay_observations": {
+        "successor_scans": 1,
+        "training_prefix_reads": 0,
+        "physical_prefix_reads": 0,
+        "replay_mode": "model",
+        "fields": [
+          "action",
+          "episode_id",
+          "sim_ctx",
+          "state",
+          "terminated",
+          "time_index",
+          "truncated"
+        ],
+        "dense_bytes_per_frame": 550,
+        "retained_online_priors": 0,
+        "retained_segment_priors": 0,
+        "round": 3
+      },
+      "evaluation": {
+        "protocol": "clip_head_first_episode_v1",
+        "num_envs": 2,
+        "steps": 4,
+        "completed_episodes": 0,
+        "censored_episodes": 2,
+        "success_rate": null
+      },
+      "native_headless_playback": {
+        "steps_after_reset": 1,
+        "ghost": "online_posterior"
+      }
+    },
+    "train_eit": {
+      "stage": "policy",
+      "replay_mode": "full",
+      "motion_digest": "720b3b58507fd720320e208fadcee61ad6dc30a04b5a555a630b01a61c58b103",
+      "num_envs": 5,
+      "collection_steps": 8,
+      "buffer_size": 7,
+      "dynamics_hidden_dims": [
+        24,
+        16
+      ],
+      "mean_fit": {
+        "lr": 0.0002,
+        "num_batches": 1,
+        "batch_size": 4,
+        "window_frames": 3
+      },
+      "cov_fit": {
+        "lr": 0.0002,
+        "batch_size": 8,
+        "epochs": 1
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "collected_frames": 40,
+          "mean_steps": 1,
+          "cov_steps": 3,
+          "train_pairs": 24,
+          "validation_pairs": 6,
+          "validation_weighted_mean_loss": 0.8123605251312256,
+          "validation_process_nll": 28265.3232421875
+        },
+        {
+          "round": 2,
+          "collected_frames": 80,
+          "mean_steps": 2,
+          "cov_steps": 6,
+          "train_pairs": 24,
+          "validation_pairs": 6,
+          "validation_weighted_mean_loss": 0.47256284952163696,
+          "validation_process_nll": 10615.413411458334
+        },
+        {
+          "round": 3,
+          "collected_frames": 120,
+          "mean_steps": 3,
+          "cov_steps": 9,
+          "train_pairs": 24,
+          "validation_pairs": 6,
+          "validation_weighted_mean_loss": 0.6625024080276489,
+          "validation_process_nll": 15879.307291666666
+        }
+      ],
+      "resumed_round": 3,
+      "resumed_replay_observations": {
+        "successor_scans": 1,
+        "training_prefix_reads": 4,
+        "physical_prefix_reads": 0,
+        "replay_mode": "full",
+        "fields": [
+          "action",
+          "actor_obs",
+          "alignment_rotation",
+          "alignment_translation",
+          "episode_id",
+          "motion_time",
+          "prev_action",
+          "sim_ctx",
+          "state",
+          "terminated",
+          "time_index",
+          "truncated"
+        ],
+        "dense_bytes_per_frame": 1094,
+        "retained_online_priors": 0,
+        "retained_segment_priors": 5,
+        "round": 3
+      },
+      "evaluation": {
+        "protocol": "clip_head_first_episode_v1",
+        "num_envs": 2,
+        "steps": 4,
+        "completed_episodes": 0,
+        "censored_episodes": 2,
+        "success_rate": null
+      },
+      "native_headless_playback": {
+        "steps_after_reset": 1,
+        "ghost": "online_posterior"
+      }
+    }
+  },
+  "cuda_train_belief": {
+    "device": "NVIDIA GeForce RTX 5090",
+    "stage": "model",
+    "replay_mode": "model",
+    "motion_digest": "9511defc0196d775b2574aa9a1662873e7dbf1a1d2ff5c19e63bfee02e4513bf",
+    "num_envs": 5,
+    "collection_steps": 12,
+    "buffer_size": 10,
+    "dynamics_hidden_dims": [
+      2048,
+      2048,
+      2048
+    ],
+    "mean_fit": {
+      "lr": 0.0002,
+      "num_batches": 10,
+      "batch_size": 2048,
+      "window_frames": 8
+    },
+    "cov_fit": {
+      "lr": 0.0002,
+      "batch_size": 256,
+      "epochs": 1
+    },
+    "rounds": [
+      {
+        "round": 1,
+        "collected_frames": 60,
+        "mean_steps": 10,
+        "cov_steps": 1,
+        "train_pairs": 36,
+        "validation_pairs": 9,
+        "validation_weighted_mean_loss": 2.0336146354675293,
+        "validation_process_nll": 9763.46587456597
+      }
+    ]
+  },
+  "fixed_input_checks": {
+    "world_model": {
+      "device": "cpu",
+      "dtype": "float64",
+      "fixture_episode_lengths": [
+        6,
+        4,
+        3
+      ],
+      "capacity": 12,
+      "training_ids": [
+        0
+      ],
+      "validation_ids": [
+        2
+      ],
+      "fit_seed": 73,
+      "comparison": "Independent processes with the same raw frames and fit RNG. All train/validation metrics, model and normalizer tensors, optimizer states, step counters and final RNG matched bit for bit.",
+      "comparison_sha256": "af9f97409b8e0c3eb4dac5a42f6377cd545996e82d8ed7a40aa0b578518804f8"
+    },
+    "full_eit": {
+      "baseline_commit": "3df839e6e76b5325dc6e26cb93c5e2e903978e0f",
+      "device": "cpu",
+      "fixture": "tests.test_estimator_eit_training.training(seed=31), two rounds with identical eager arithmetic",
+      "comparison": "All round metrics including model, actor and critic fingerprints, and all global and policy RNG state hashes matched.",
+      "comparison_sha256": "9977d253b4eb1436f617ffcda5d25688a83063f741eca9823202471518022b9a"
+    }
+  },
+  "full_pytest": {
+    "device_available": "NVIDIA GeForce RTX 5090",
+    "command": "OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 .venv/bin/python -m pytest -q",
+    "passed": 757,
+    "warnings": 15,
+    "seconds": 30.07
+  },
+  "simulation_notes": "CPU MuJoCo emitted line-search and solver iteration-limit messages during the training runs. Both resumed runs completed. Evaluation used a four-step budget.",
+  "source_sha256": {
+    "src/supermimic/learners/two_stage_wm.py": "eee687dad170ebfad049a5339d60f8a84be0009e908e2205121e310ab7fea824",
+    "src/supermimic/replay_buffer.py": "e274ffa33403138f33a5de3eb196c12e70e73212d40f7bb95c2ed8aa9f8be0c2",
+    "src/supermimic/runners/belief_training.py": "95aec0e243ad13cc3b7ccf28749c8e70a440342a65adbf22ff42afbb716ee820",
+    "src/supermimic/runners/eit_training.py": "a52467bac2a68f2b9d172bac3920ff2c07a546e1282275a04881a448d242aaf4",
+    "src/supermimic/runners/run_config.py": "03551cc97ddb6be0a44c4bd51eb18bdcfeab439a312b406ab979274465a172c8",
+    "src/supermimic/runners/supermimic_runner.py": "134680949ddb57570be86b5768410dc9454534ae479c97338e46a05cc0617b9d",
+    "src/supermimic/scripts/train_belief.py": "f5623fb09546bdf0223dad8cfc823819775b8d1fe98a36bdbea7ce775bf56c1d",
+    "tests/test_estimator_belief_training.py": "e8bda5a0b72ae0428955089f2d9a23c3a51156fa0c34590f1b679bb213a3e9c5",
+    "tests/test_estimator_eit_inference.py": "c292712feb89996451ea7cb8ec111ac55aefb651521df27885e7cba401bd8404",
+    "tests/test_estimator_eit_rng.py": "c96d08f1f63e89f2354a0c1c2abca71cbc9efaf5f3ddf7ba69e8dd44129542d4",
+    "tests/test_estimator_eit_training.py": "0d1167134d3a15124073ea73930c25fed95b56de860a49a4cad1bdf15c212761",
+    "tests/test_estimator_eit_viewer.py": "dbb834d76fdbf77e074cceeb25c379f8350ea5a4fdd1eb3eb674be17f57b252f",
+    "tests/test_estimator_runner.py": "e64bd239ad5c79c25576ad7675ddbe6c006fad5c13a801dc5516ecf1bd521265",
+    "tests/test_estimator_two_stage_wm.py": "90fd2d26d4ae6288a3d062e2a312924376df92aae9e34c1a55cede142899ffbb"
+  }
+}

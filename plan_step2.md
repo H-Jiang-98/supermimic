@@ -174,7 +174,7 @@ actor 使用第一步的 `eit_rpv_v1`、5×93 历史和 700 维目标，每帧�
 
    想象验证需要分别维护潜在真值 s 和 belief Q：潜在状态按随机模型采样，测量从该潜在状态生成一次，滤波在自己的后验均值上预测和更新。最小接口应允许显式传入过程 ε 与测量 η，方便固定随机数进行数值梯度检查。奖励使用潜在真值及既定参考规则，B/C actor 使用后验构造目标。
 
-   每轮采集结束后，各环境在最早保留的帧和其后真实 reset 处分段。每个片段在其首帧真实状态上按配置采样完整 70 维右局部扰动，保存实际先验均值和 covariance，以首帧记录的测量与上一动作填充 actor 历史，并融合首帧测量一次。重建时，从该先验出发，以当前模型按记录的动作和测量推进到所选帧。保留物理 episode 帧号用于定位，训练片段单独从 0 计时。已在想象中推进的帧也可通过完整环境快照恢复。
+   使用完整 replay 时，每轮在各环境最早保留的帧和其后真实 reset 处分段。封存时在每个新片段首帧按配置采样完整 70 维右局部扰动，保存实际先验均值和 covariance。重建时，以该帧记录的测量与上一动作填充 actor 历史，融合首帧测量一次，再以当前模型按记录的动作和测量推进到所选帧。保留物理 episode 帧号用于定位，策略片段单独从 0 计时。已在想象中推进的帧也可通过完整环境快照恢复。
 
    当前入口为 `finish_collection_round()` 与 `training_prefix(episode, t, relative=...)`。想象环境 `reset(episode_id=..., time_index=...)` 或 `reset(episode_id=..., segment_time=...)` 从该前缀重建；同一起点保留已抽样先验，模型变化只重新传播。此重建不保留历史模型学习图，后验作为想象初始条件。模型拟合独立读取真实状态、动作和 context。
 
@@ -222,7 +222,7 @@ actor 使用第一步的 `eit_rpv_v1`、5×93 历史和 700 维目标，每帧�
 | `src/supermimic/models.py` | 二 | 可选噪声头、分布/采样接口、配置与 checkpoint 兼容性 |
 | `src/supermimic/estimator.py` | 二 | 纯函数 predict/correct、观测更新、innovation 与 jitter 诊断 |
 | `src/supermimic/belief_provider.py` | 三 | 完整后验的 prepare/commit、时序、版本与恢复 |
-| `src/supermimic/replay_buffer.py` | 三 | 在线首帧先验、保留片段训练先验、按键前缀与幂等插入 |
+| `src/supermimic/replay_buffer.py` | 三 | 幂等插入。完整 replay 还保留在线首帧先验、策略片段先验及按键前缀 |
 | `src/supermimic/runners/supermimic_runner.py` | 三 | 采集模式、独立 provider、reset/restore、版本及保存恢复 |
 | `src/supermimic/envs/world_model_env.py` | 三 | 想象双状态最小路径、随机数注入、原子提交和图边界 |
 | `src/supermimic/envs/multi_task_world_model_env.py` | 三 | 实际 runner 入口的必要接线与一致性检查 |

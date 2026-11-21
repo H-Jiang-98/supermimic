@@ -188,10 +188,9 @@ class TwoStageWorldModelLearner:
     staged_normalizers=None,
   ) -> tuple[dict, dict]:
     cfg, cov = self.mean_cfg, self.cov_cfg
-    windows = replay.model_window_starts(train_ids, cfg.window_frames)
-    valid_windows = replay.model_window_starts(valid_ids, cfg.window_frames)
-    pairs = replay.model_window_starts(train_ids, 2)
-    held_out = replay.model_window_starts(valid_ids, 2)
+    windows, valid_windows, pairs, held_out = replay.model_fit_starts(
+      train_ids, valid_ids, cfg.window_frames
+    )
     if not len(windows):
       raise ValueError(
         f"No complete {cfg.window_frames}-frame training window in replay"

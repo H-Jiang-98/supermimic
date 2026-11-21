@@ -200,13 +200,13 @@ class _PhysicalEnv:
     return self.get_observations(), torch.ones(BATCH), dones, {}
 
 
-@pytest.mark.parametrize("failure", ["sensor", "before_insert", "after_insert"])
-def test_post_physics_retry_commits_the_executed_transition_once(failure, monkeypatch):
-  provider = _MeasurementPosterior()
-  runner = _runner("B", provider=provider)
+def _collection_runner(replay_mode):
+  runner = _runner("B", provider=_MeasurementPosterior())
+  runner.replay_mode = replay_mode
   runner.env = _PhysicalEnv(runner)
   runner.action_manager = runner.env.action_manager
-  runner.replay_buffer = ReplayBuffer(runner._buffer_schema(), 2, BATCH)
+  runner.cfg.buffer_size = 2
+  runner.replay_buffer = runner._make_replay_buffer()
   runner._pending_norm_updates = []
   runner.world_model_learner = MagicMock()
   runner.logger = MagicMock()
@@ -214,6 +214,16 @@ def test_post_physics_retry_commits_the_executed_transition_once(failure, monkey
   actor = build_actor(runner.cfg, runner._wm, "cpu")
   runner.policy_learner = InputStagePolicy(actor, runner.cfg.policy)
   runner.reset_collection()
+  return runner
+
+
+@pytest.mark.parametrize("replay_mode", ["full", "model"])
+@pytest.mark.parametrize("failure", ["sensor", "before_insert", "after_insert"])
+def test_post_physics_retry_commits_the_executed_transition_once(
+  failure, replay_mode, monkeypatch
+):
+  runner = _collection_runner(replay_mode)
+  provider = runner.posterior_provider
   history = runner._sim_history.clone()
   initial_ids = runner._episode_id.clone()
   sample = MagicMock(wraps=runner._representation.add_proprio_noise)
@@ -251,11 +261,64 @@ def test_post_physics_retry_commits_the_executed_transition_once(failure, monkey
   assert runner.logger.process_env_step.call_count == 1
   stored = runner.replay_buffer._storage[:, 0]
   assert torch.equal(stored["action"], runner.env.actions[0])
-  assert torch.equal(stored["actor_obs"], history[:, -1])
+  if replay_mode == "full":
+    assert torch.equal(stored["actor_obs"], history[:, -1])
+  else:
+    assert set(stored.keys()) == {
+      "state",
+      "action",
+      "sim_ctx",
+      "episode_id",
+      "time_index",
+      "terminated",
+      "truncated",
+    }
   assert torch.equal(stored["episode_id"], initial_ids)
   assert runner._time_index.tolist() == [0, 1, 1]
   runner.step()
   assert runner.replay_buffer._storage["time_index"][:, 1].tolist() == [0, 1, 1]
+
+
+def test_model_collection_checks_the_previous_action_after_wrap_before_filter_or_physics():
+  runner = _collection_runner("model")
+  # Row zero resets on the first step. Step three overwrites the oldest slot.
+  for _ in range(3):
+    runner.step()
+  replay = runner.replay_buffer
+  rng = torch.random.get_rng_state()
+  with torch.inference_mode():
+    # Alter the simulator and its matching observation, leaving the replayed
+    # executed action as independent evidence of the bad successor.
+    previous = runner.action_manager.action.clone()
+    runner.action_manager.action[1, 0] += 1
+    runner._sim_history[1, -1, 64] = runner.action_manager.action[1, 0]
+  with pytest.raises(ValueError, match="action"):
+    runner.step()
+  assert len(runner.env.actions) == len(runner.posterior_provider.calls) == 3
+  assert replay.insert_count == 3
+  assert torch.equal(torch.random.get_rng_state(), rng)
+  with torch.inference_mode():
+    runner.action_manager.action.copy_(previous)
+    runner._sim_history[:, -1, 64:].copy_(previous)
+  runner.step()
+  runner.reset_collection()
+  runner.step()
+  assert replay.insert_count == 5
+  assert replay.model_window_starts(runner._episode_id.tolist(), 2).shape == (0, 2)
+
+
+def test_model_collection_retains_pre_step_motion_time_for_return_sampling():
+  runner = _collection_runner("model")
+  manager = runner.env.termination_manager
+  manager.time_outs = torch.zeros(BATCH, dtype=torch.bool)
+  manager.get_term = lambda _: torch.zeros_like(manager.time_outs)
+  sampler = runner._sampler = MagicMock()
+  sampler.record.return_value = None
+  for _ in range(2):
+    before = runner.motion_cmd.time_steps.clone()
+    runner.step()
+    torch.testing.assert_close(sampler.record.call_args.args[0], before)
+  assert "motion_time" not in runner.replay_buffer.retained_frames().keys()
 
 
 def test_two_real_collection_steps_share_measurements_actions_and_reset_history():

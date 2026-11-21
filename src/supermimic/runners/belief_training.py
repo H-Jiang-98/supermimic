@@ -190,6 +190,7 @@ class BeliefModelTraining:
       {
         "version": EIT_TRAINING_VERSION,
         "stage": "model",
+        "replay_mode": runner.replay_buffer.replay_mode,
         "motion_digest": motion_content_digest(runner.motion),
         "loop_config": asdict(self.cfg),
         "runner_config": asdict(runner.cfg),
@@ -217,6 +218,8 @@ class BeliefModelTraining:
     """Preflight every component on private copies, then refresh the live stream."""
     runner = self.runner
     self._check_checkpoint_version(state)
+    if state.get("replay_mode") != runner.replay_buffer.replay_mode:
+      raise ValueError("Training checkpoint replay mode differs from the runner")
     if state.get("motion_digest") != motion_content_digest(runner.motion):
       raise ValueError("Belief training checkpoint motion content mismatch")
     if state.get("loop_config") != asdict(self.cfg):
@@ -289,15 +292,7 @@ class BeliefModelTraining:
     self.rounds, self.collected_frames = state["rounds"], state["collected_frames"]
     # Existing replay may contain later episodes with reused IDs. Restore begins
     # a fresh replay and physical trajectory, while preserving optimizer state.
-    from supermimic.replay_buffer import ReplayBuffer
-
-    runner.replay_buffer = ReplayBuffer(
-      runner._buffer_schema(),
-      runner.cfg.buffer_size,
-      runner.env.num_envs,
-      runner.device,
-      initial_prior=runner._wm.initial_prior,
-    )
+    runner.replay_buffer = runner._make_replay_buffer()
     runner.wm_env.replay_buffer = runner.replay_buffer
     runner._episode_id = ids.to(runner.device).clone() if ids is not None else None
     runner._pending_norm_updates.clear()
@@ -398,8 +393,7 @@ class BeliefModelTraining:
         or last["mean_steps"] != state["learner"]["mean"]["steps"]
         or last["cov_steps"] != state["learner"]["cov"]["steps"]
         or last["collected_frames"] != state["collected_frames"]
-        # Earlier snapshots of this format could publish NaN metrics. Compare
-        # their serialized values so an intact model can resume its own history.
+        # Compare the metric row using the same JSON encoding as the writer.
         or (
           completed is not None
           and json.dumps(last, sort_keys=True) != json.dumps(completed, sort_keys=True)

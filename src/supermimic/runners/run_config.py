@@ -12,8 +12,8 @@ from supermimic.critic_inputs import CRITIC_INPUT_VERSION, CriticInputConfig
 from supermimic.estimator_inputs import EITInputConfig
 from supermimic.runners.supermimic_runner import SuperMimicRunnerCfg
 
-EIT_TRAINING_VERSION = "eit_training_v2"
-EIT_INITIALIZATION_VERSION = "eit_initialization_v2"
+EIT_TRAINING_VERSION = "eit_training_v3"
+EIT_INITIALIZATION_VERSION = "eit_initialization_v3"
 
 
 def validate_eit_checkpoint_contract(saved: dict, *, stage: str | None = None) -> None:
@@ -23,6 +23,11 @@ def validate_eit_checkpoint_contract(saved: dict, *, stage: str | None = None) -
   kind = saved.get("stage")
   if kind not in ("model", "policy") or (stage is not None and kind != stage):
     raise ValueError(f"Unexpected EIT training stage: {kind!r}")
+  replay_mode = saved.get("replay_mode")
+  if replay_mode not in ("model", "full") or (
+    kind == "policy" and replay_mode != "full"
+  ):
+    raise ValueError(f"Invalid replay mode {replay_mode!r} for {kind} checkpoint")
   if kind == "model":
     if "critic" in saved or "policy" in saved:
       raise ValueError("Model-stage checkpoint contains policy training state")

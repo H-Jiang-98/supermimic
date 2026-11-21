@@ -89,7 +89,9 @@ def main():
   )
   env = create_env(env_cfg, num_envs, args.device)
   try:
-    runner = SuperMimicRunner(env, runner_cfg, task_id, device=args.device)
+    runner = SuperMimicRunner(
+      env, runner_cfg, task_id, device=args.device, replay_mode="model"
+    )
     training = BeliefModelTraining(runner, loop_cfg)
     training.run(args.rounds, args.output, resume=args.resume)
   finally:

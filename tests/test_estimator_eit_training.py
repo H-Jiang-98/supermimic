@@ -154,6 +154,9 @@ def test_restore_reproduces_next_model_and_policy_updates(tmp_path):
   saved = torch.load(tmp_path / "training.pt", weights_only=True)
   target.load_state_dict(saved)
   assert target.rounds == source.rounds
+  assert target.runner.wm_env.replay_buffer is target.runner.replay_buffer
+  assert target.runner.replay_buffer.replay_mode == "full"
+  assert target.runner.replay_buffer.num_transitions == 0
   assert_tree(target.actor.state_dict(), source.actor.state_dict())
   assert_tree(target.policy.critic.state_dict(), source.policy.critic.state_dict())
   assert_tree(target.policy.state_dict(), source.policy.state_dict())
@@ -210,6 +213,13 @@ def test_model_only_checkpoint_cannot_masquerade_as_joint_resume():
   state["stage"] = "model"
   with pytest.raises(ValueError, match="training stage"):
     loop.load_state_dict(state)
+
+
+def test_policy_training_requires_full_replay_before_collection():
+  runner = _RoundRunner(replay_mode="model")
+  with pytest.raises(ValueError, match="policy starts require full replay"):
+    EITTraining(runner)
+  assert runner.replay_buffer.num_transitions == 0
 
 
 def test_no_fresh_training_frames_preserves_actor_normalizers():

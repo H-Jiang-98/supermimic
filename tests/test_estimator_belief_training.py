@@ -16,7 +16,7 @@ from supermimic.learners.two_stage_wm import (
   TwoStageWorldModelLearner,
 )
 from supermimic.learners.wm_learner import WorldModelLearner
-from supermimic.replay_buffer import FieldSpec, ReplayBuffer
+from supermimic.replay_buffer import MODEL_REPLAY_FIELDS, FieldSpec
 from supermimic.runners.belief_training import BeliefModelTraining, BeliefTrainingCfg
 from supermimic.runners.supermimic_runner import (
   BaseRunner,
@@ -34,12 +34,14 @@ from tests.test_estimator_two_stage_wm import fixture
 class _RoundRunner(SuperMimicRunner):
   """Deterministic physical stream; production providers/actor/replay are real."""
 
-  def __init__(self, seed=31):
+  def __init__(self, seed=31, replay_mode="full"):
     estimator, source = fixture(episodes=(4,), seed=seed)
     self.template = source.retained_frames([0])
+    self.replay_mode = replay_mode
     self._schema = {
       key: FieldSpec(tuple(value.shape[2:]), value.dtype)
       for key, value in source._storage.items()
+      if replay_mode == "full" or key in MODEL_REPLAY_FIELDS
     }
     self._dynamics = estimator.dynamics
     self._representation = self._dynamics._apply_prediction.__self__
@@ -68,9 +70,7 @@ class _RoundRunner(SuperMimicRunner):
     self.policy_learner = InputStagePolicy(
       build_actor(self.cfg, self._wm, "cpu").double(), self.cfg.policy
     )
-    self.replay_buffer = ReplayBuffer(
-      self._schema, self.cfg.buffer_size, 2, initial_prior=self._wm.initial_prior
-    )
+    self.replay_buffer = self._make_replay_buffer()
     self.wm_env = SimpleNamespace(replay_buffer=self.replay_buffer)
     self._pending_collection = None
     self._pending_norm_updates = []
@@ -128,9 +128,15 @@ class _RoundRunner(SuperMimicRunner):
     frame["episode_id"] = self._episode_id.clone()
     frame["time_index"] = torch.full((2,), self.index)
     frame["terminated"] = frame["truncated"] = torch.zeros(2, dtype=torch.bool)
-    self.replay_buffer.insert(
-      frame, head_priors=self.posterior_provider.state.head_priors
-    )
+    if self.replay_mode == "model":
+      self.replay_buffer.validate_previous_action(
+        frame["episode_id"], frame["time_index"], self.previous
+      )
+      self.replay_buffer.insert(frame.select(*MODEL_REPLAY_FIELDS))
+    else:
+      self.replay_buffer.insert(
+        frame, head_priors=self.posterior_provider.state.head_priors
+      )
     self._pending_norm_updates.append((frame["state"], action, obs))
     self._flush_normalization()
     self.collected.append(
@@ -141,7 +147,7 @@ class _RoundRunner(SuperMimicRunner):
 
 
 def training(seed=31):
-  runner = _RoundRunner(seed)
+  runner = _RoundRunner(seed, replay_mode="model")
   return BeliefModelTraining(
     runner,
     BeliefTrainingCfg(collection_steps=4, validation_stride=2, validation_batch_size=2),
@@ -250,6 +256,7 @@ def test_two_rounds_freeze_actor_exclude_validation_and_refresh_current_model():
     "filter",
     "prior",
     "measurement",
+    "replay_mode",
   ],
 )
 def test_malformed_checkpoint_does_not_partially_restore_any_live_component(component):
@@ -273,6 +280,8 @@ def test_malformed_checkpoint_does_not_partially_restore_any_live_component(comp
     checkpoint["world_model"]["estimator"]["filter_config"]["jitter_initial"] *= 2
   elif component == "prior":
     checkpoint["world_model"]["estimator"]["initial_prior"]["std"] = (0.02,) * 6
+  elif component == "replay_mode":
+    checkpoint["replay_mode"] = "full"
   else:
     checkpoint["world_model"]["estimator"]["measurement_config"]["gravity_std"] *= 2
   before = target.state_dict()
@@ -302,9 +311,15 @@ def test_saved_round_restores_optimizer_for_identical_next_input_and_fresh_colle
   path = tmp_path / "training.pt"
   source.run_round(path)
   checkpoint = torch.load(path, weights_only=True)
+  assert checkpoint["replay_mode"] == "model"
   target.load_state_dict(checkpoint)
   assert target.rounds == source.rounds == 1
   assert target.runner.replay_buffer.num_transitions == 0
+  assert target.runner.wm_env.replay_buffer is target.runner.replay_buffer
+  assert target.runner.replay_buffer.replay_mode == "model"
+  assert (
+    set(target.runner.replay_buffer.retained_frames().keys()) == MODEL_REPLAY_FIELDS
+  )
   assert target.runner.posterior_provider.state is None
   replay = source.runner.replay_buffer
   windows = replay.model_windows(replay.model_window_starts([1], 3), 3)
@@ -422,7 +437,8 @@ def test_model_normalization_streams_overwritten_frames_before_mean_fit(steps):
   runner = loop.runner
   loop.cfg = replace(loop.cfg, collection_steps=steps)
   runner.template = torch.cat([runner.template] * 3)
-  runner.replay_buffer = ReplayBuffer(runner._schema, 3, 2)
+  runner.cfg.buffer_size = 3
+  runner.replay_buffer = runner._make_replay_buffer()
   runner.wm_env.replay_buffer = runner.replay_buffer
   reference = deepcopy(runner._dynamics.normalizers())
   with patch.object(

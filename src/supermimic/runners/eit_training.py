@@ -62,6 +62,8 @@ class EITTraining(BeliefModelTraining):
     cfg: EITTrainingCfg | None = None,
     policy_cfg: BeliefPolicyLearnerCfg | None = None,
   ):
+    if runner.replay_buffer.replay_mode != "full":
+      raise ValueError("EIT policy starts require full replay")
     # Reuse all model-loop preconditions, then explicitly undo its fixed-actor mode.
     super().__init__(runner, cfg or EITTrainingCfg())
     actor = runner.policy_learner.actor

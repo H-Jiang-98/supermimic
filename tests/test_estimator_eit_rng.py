@@ -2,16 +2,19 @@
 
 from contextlib import closing
 
+import pytest
 import torch
 
 from supermimic.models import ProcessNoiseConfig
 from supermimic.runners.eit_training import EITTraining
+from supermimic.runners.run_config import EIT_TRAINING_VERSION
 from supermimic.runners.supermimic_runner import SuperMimicRunner, SuperMimicRunnerCfg
 from supermimic.scripts.check_eit_training import parse_args
 from supermimic.scripts.check_estimator import stationary_motion
 from supermimic.scripts.eval_eit import evaluate
 from supermimic.scripts.train_utils import create_env
 from supermimic.tasks.env_cfgs import configure_estimator_env_cfg, gencoord_env_cfg
+from tests.test_estimator_belief_training import training as model_training
 from tests.test_estimator_eit_training import training
 
 
@@ -30,6 +33,31 @@ def test_creating_and_reusing_shared_initialization_leave_same_training_rng():
   second = training(31)
   second.load_initialization(initial)
   assert torch.equal(created, torch.random.get_rng_state())
+
+
+@pytest.mark.parametrize(
+  "make_loop", [model_training, training], ids=["model", "policy"]
+)
+def test_resume_rejects_prior_replay_contract_without_changing_rng(make_loop):
+  loop = make_loop()
+  checkpoint = loop.state_dict()
+  assert checkpoint["version"] == "eit_training_v3"
+  checkpoint["version"] = "eit_training_v2"
+  rng = torch.random.get_rng_state()
+  with pytest.raises(ValueError, match=EIT_TRAINING_VERSION):
+    loop.load_state_dict(checkpoint)
+  assert torch.equal(torch.random.get_rng_state(), rng)
+
+
+def test_shared_initialization_rejects_prior_replay_contract_without_changing_rng():
+  loop = training()
+  bundle = loop.initialization_bundle()
+  assert bundle["version"] == "eit_initialization_v3"
+  bundle["version"] = "eit_initialization_v2"
+  rng = torch.random.get_rng_state()
+  with pytest.raises(ValueError, match="initialization"):
+    loop.load_initialization(bundle)
+  assert torch.equal(torch.random.get_rng_state(), rng)
 
 
 def test_eval_seed_pairs_first_reset_and_measurement_across_actor_architectures(

@@ -1,10 +1,16 @@
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 from tensordict import TensorDict
 
 from supermimic.belief import BeliefState, GaussianStatePrior
 from supermimic.utils.lie_state import LieState
+from supermimic.utils.validation import validate_rotation
+
+MODEL_REPLAY_FIELDS = frozenset(
+  ("state", "action", "sim_ctx", "episode_id", "time_index", "terminated", "truncated")
+)
 
 
 @dataclass(frozen=True)
@@ -18,6 +24,35 @@ class FieldSpec:
     return (num_envs, buffer_size, self.dim) if self.dim else (num_envs, buffer_size)
 
 
+@dataclass(frozen=True)
+class _ReplayRound:
+  slots: torch.Tensor
+  episodes: torch.Tensor
+  successors: torch.Tensor
+  episode_lengths: dict[int, int]
+
+  def window_starts(
+    self, window_frames: int, *episode_groups
+  ) -> tuple[torch.Tensor, ...]:
+    """Enumerate each group's starts in environment then chronological order."""
+    if self.slots.numel() < window_frames:
+      return tuple(self.slots.new_empty((0, 2)) for _ in episode_groups)
+    complete = self.successors
+    if window_frames > 2:
+      complete = complete.unfold(1, window_frames - 1, 1).all(-1)
+    rows, ages = complete.nonzero(as_tuple=True)
+    starts = torch.stack((rows, self.slots[ages]), dim=1)
+    episodes = self.episodes[rows, ages]
+    return tuple(
+      starts[
+        torch.isin(
+          episodes, torch.as_tensor(ids, device=episodes.device, dtype=torch.long)
+        )
+      ]
+      for ids in episode_groups
+    )
+
+
 class ReplayBuffer:
   """Per-env circular buffer over a TensorDict, with env-stratified window sampling."""
 
@@ -29,13 +64,21 @@ class ReplayBuffer:
     device: str = "cpu",
     *,
     initial_prior: GaussianStatePrior | None = None,
+    replay_mode: Literal["full", "model"] = "full",
   ):
+    if replay_mode not in ("full", "model"):
+      raise ValueError(f"Unknown replay_mode: {replay_mode}")
+    if replay_mode == "model" and schema.keys() != MODEL_REPLAY_FIELDS:
+      raise ValueError("Model replay requires the seven model transition fields")
     if not {"terminated", "truncated"} <= schema.keys():
       raise ValueError("schema needs 'terminated' and 'truncated'")
+    self.replay_mode = replay_mode
     self._episode_heads: dict[int, tuple[int, int, BeliefState]] = {}
-    self.initial_prior = initial_prior or GaussianStatePrior()
+    self.initial_prior = (
+      (initial_prior or GaussianStatePrior()) if replay_mode == "full" else None
+    )
     self._training_heads: dict[int, tuple[int, int, int, BeliefState]] = {}
-    self._finalized_at = -1
+    self._round_index: _ReplayRound | None = None
     self.insert_count = 0
     self._last_insert_token = None
     self.num_transitions = 0
@@ -60,6 +103,8 @@ class ReplayBuffer:
     head_priors: tuple[torch.Tensor, BeliefState] | None,
   ) -> None:
     """Check the replay seeds before a real environment can advance."""
+    if self.replay_mode == "model":
+      raise ValueError("Episode head priors require full replay")
     heads = episode_id[time_index == 0]
     if head_priors is None:
       if heads.numel():
@@ -84,6 +129,28 @@ class ReplayBuffer:
         "Episode head priors must match replay measurement dtype and device"
       )
     priors.validate()
+
+  def validate_previous_action(
+    self,
+    episode_id: torch.Tensor,
+    time_index: torch.Tensor,
+    previous_action: torch.Tensor,
+  ) -> None:
+    """Check the current measurement against the last committed physical action."""
+    if not self.num_transitions:
+      return
+    last = (self._step - 1) % self.buffer_size
+    consecutive = (
+      (self._storage["episode_id"][:, last] == episode_id)
+      & (self._storage["time_index"][:, last] + 1 == time_index)
+      & ~(self._storage["terminated"][:, last] | self._storage["truncated"][:, last])
+    )
+    action = self._storage["action"][:, last]
+    if (
+      action.shape != previous_action.shape
+      or (consecutive & (action != previous_action).any(dim=-1)).any()
+    ):
+      raise ValueError("Executed action disagrees with the successor's previous action")
 
   def insert(
     self,
@@ -117,7 +184,7 @@ class ReplayBuffer:
         for i, (episode, env_row) in enumerate(zip(ids.tolist(), rows, strict=True))
       }
     expired = []
-    if "episode_id" in td.keys() and self.num_transitions == self.buffer_size:
+    if self._episode_heads and self.num_transitions == self.buffer_size:
       oldest = self._storage[:, self._step]
       expired = oldest["episode_id"][oldest["time_index"] == 0].tolist()
     self._storage[:, self._step] = td
@@ -128,12 +195,17 @@ class ReplayBuffer:
     self.num_transitions = min(self.buffer_size, self.num_transitions + 1)
     self.insert_count += 1
     self._last_insert_token = token
+    self._round_index = None
+
+  def finish_collection_round(self) -> None:
+    """Prepare the retained data for fitting and, in full mode, belief reconstruction."""
+    self._sealed_round()
 
   @torch.no_grad()
-  def finish_collection_round(self) -> None:
-    """Validate retained transitions and realize each fragment's training prior."""
-    if self._finalized_at == self.insert_count:
-      return
+  def _sealed_round(self) -> _ReplayRound:
+    """Validate and index retained transitions once per sealed collection round."""
+    if self._round_index is not None:
+      return self._round_index
     if "episode_id" not in self._storage.keys() or not self.num_transitions:
       raise ValueError("A training segment requires retained estimator frames")
     base = self._step if self.num_transitions == self.buffer_size else 0
@@ -145,16 +217,22 @@ class ReplayBuffer:
     for field in ("state", "action", "sim_ctx"):
       if not torch.isfinite(self._storage[field][:, :n]).all():
         raise ValueError(f"Non-finite replay {field}")
-    previous_actions = self._storage["prev_action"]
-    if not torch.equal(self._storage["actor_obs"][:, :n, 64:], previous_actions[:, :n]):
-      raise ValueError("Recorded sensor action disagrees with the previous action")
     # Compare only recorded physical successors, including the pair across wrap.
-    rows, ages = self._recorded_successors(slots, episodes).nonzero(as_tuple=True)
+    successors = self._recorded_successors(slots, episodes)
+    rows, ages = successors.nonzero(as_tuple=True)
     current, successor = slots[ages], slots[ages + 1]
-    if not torch.equal(
-      self._storage["action"][rows, current], previous_actions[rows, successor]
-    ):
-      raise ValueError("Executed action disagrees with the successor's previous action")
+    if self.replay_mode == "full":
+      previous_actions = self._storage["prev_action"]
+      if not torch.equal(
+        self._storage["actor_obs"][:, :n, 64:], previous_actions[:, :n]
+      ):
+        raise ValueError("Recorded sensor action disagrees with the previous action")
+      if not torch.equal(
+        self._storage["action"][rows, current], previous_actions[rows, successor]
+      ):
+        raise ValueError(
+          "Executed action disagrees with the successor's previous action"
+        )
     context = self._storage["sim_ctx"]
     if not torch.equal(context[rows, current], context[rows, successor]):
       raise ValueError("Inconsistent simulation context across a replay transition")
@@ -162,12 +240,26 @@ class ReplayBuffer:
     begins = torch.ones_like(episodes, dtype=torch.bool)
     begins[:, 1:] = episodes[:, 1:] != episodes[:, :-1]
     rows, ages = begins.nonzero(as_tuple=True)
-    start_slots = slots[ages]
     ids = episodes[rows, ages].tolist()
     if len(set(ids)) != len(ids):
       raise ValueError(
         "Replay episode IDs must identify a single contiguous environment segment"
       )
+    # Every environment starts a segment at age zero, so differences of flat
+    # offsets also give the correct length for the last segment of each row.
+    offsets = rows * n + ages
+    lengths = offsets.diff(append=offsets.new_tensor([self.num_envs * n]))
+    episode_lengths = dict(sorted(zip(ids, lengths.tolist(), strict=True)))
+    if self.replay_mode == "full":
+      self._realize_training_heads(rows, slots[ages], ids)
+    else:
+      # Full replay checks these rotations when drawing the segment priors.
+      head_states = self._storage["state"][rows, slots[ages]]
+      validate_rotation(LieState.from_full(head_states).rotation)
+    self._round_index = _ReplayRound(slots, episodes, successors, episode_lengths)
+    return self._round_index
+
+  def _realize_training_heads(self, rows, start_slots, ids) -> None:
     times = self._storage["time_index"][rows, start_slots].tolist()
     row_numbers, slot_numbers = rows.tolist(), start_slots.tolist()
     heads = {}
@@ -181,6 +273,7 @@ class ReplayBuffer:
       else:
         missing.append(i)
     if missing:
+      assert self.initial_prior is not None
       full = self._storage["state"][rows[missing], start_slots[missing]]
       priors = self.initial_prior.sample(LieState.from_full(full))
       for j, i in enumerate(missing):
@@ -188,12 +281,13 @@ class ReplayBuffer:
         prior = BeliefState(priors.mean.index(j).clone(), priors.covariance[j])
         heads[ids[i]] = (row_numbers[i], slot_numbers[i], times[i], prior)
     self._training_heads = heads
-    self._finalized_at = self.insert_count
 
   def training_prefix(
     self, episode: int, t: int, *, relative: bool = False
   ) -> tuple[BeliefState, TensorDict]:
     """Return the realized prior and frames from retained segment frame zero to t."""
+    if self.replay_mode == "model":
+      raise ValueError("Belief prefix reconstruction requires full replay")
     self.finish_collection_round()
     head = self._training_heads.get(episode)
     if head is None:
@@ -237,11 +331,7 @@ class ReplayBuffer:
 
   def training_episode_lengths(self) -> dict[int, int]:
     """Retained frame counts for sealed fragments, including singleton episodes."""
-    self.finish_collection_round()
-    ids, counts = self._storage["episode_id"][:, : self.num_transitions].unique(
-      return_counts=True
-    )
-    return dict(zip(ids.tolist(), counts.tolist(), strict=True))
+    return self._sealed_round().episode_lengths.copy()
 
   def _recorded_successors(self, slots, episodes) -> torch.Tensor:
     times = self._storage["time_index"][:, slots]
@@ -259,19 +349,27 @@ class ReplayBuffer:
     """Enumerate (environment, physical slot) for each complete, consecutive window."""
     if type(window_frames) is not int or window_frames < 2:
       raise ValueError("A model window needs at least two frames")
-    n = self.num_transitions
-    if n < window_frames:
+    if self.num_transitions < window_frames:
       return torch.empty((0, 2), device=self.device, dtype=torch.long)
-    self.finish_collection_round()
-    base = self._step if n == self.buffer_size else 0
-    slots = (base + torch.arange(n, device=self.device)) % self.buffer_size
-    episode = self._storage["episode_id"][:, slots]
-    successor = self._recorded_successors(slots, episode)
-    complete = successor.unfold(1, window_frames - 1, 1).all(-1)
-    ids = torch.as_tensor(episode_ids, device=self.device, dtype=torch.long)
-    selected = torch.isin(episode[:, : complete.shape[1]], ids)
-    rows, ages = (complete & selected).nonzero(as_tuple=True)
-    return torch.stack((rows, slots[ages]), dim=1)
+    return self._sealed_round().window_starts(window_frames, episode_ids)[0]
+
+  def model_fit_starts(
+    self, train_ids, valid_ids, window_frames: int
+  ) -> tuple[torch.Tensor, ...]:
+    """Build both episode splits' mean windows and covariance pairs from one index."""
+    if type(window_frames) is not int or window_frames < 2:
+      raise ValueError("A model window needs at least two frames")
+    if self.num_transitions < 2:
+      empty = torch.empty((0, 2), device=self.device, dtype=torch.long)
+      return empty, empty, empty, empty
+    index = self._sealed_round()
+    pairs = index.window_starts(2, train_ids, valid_ids)
+    windows = (
+      pairs
+      if window_frames == 2
+      else index.window_starts(window_frames, train_ids, valid_ids)
+    )
+    return windows + pairs
 
   def model_windows(self, starts: torch.Tensor, window_frames: int) -> TensorDict:
     """Gather model inputs using starts from the current sealed replay."""
@@ -282,6 +380,8 @@ class ReplayBuffer:
 
   def episode_prefix(self, episode: int, t: int) -> tuple[BeliefState, TensorDict]:
     """Gather frames 0..t in chronological order from one physical env slot."""
+    if self.replay_mode == "model":
+      raise ValueError("Episode prefix reconstruction requires full replay")
     head = self._episode_heads.get(episode)
     if head is None:
       raise ValueError(f"Episode {episode} head or initial prior unavailable in replay")
@@ -328,7 +428,10 @@ class ReplayBuffer:
     last = (self._step - 1) % self.buffer_size
     terminated = self._storage["terminated"][:, last]
     truncated = self._storage["truncated"][:, last]
-    truncated.logical_or_(~(terminated | truncated))
+    open_rows = ~(terminated | truncated)
+    if open_rows.any():
+      truncated.logical_or_(open_rows)
+      self._round_index = None
 
   def sample_causal(
     self, sequence_length: int, batch_size: int
