@@ -44,6 +44,7 @@ from supermimic.utils.lie_state import LieState
 from supermimic.utils.validation import validate_rotation
 
 if TYPE_CHECKING:
+  from supermimic.critic_inputs import CriticInputConfig
   from supermimic.models import Dynamics
   from supermimic.representations import StateRepresentation
 
@@ -168,7 +169,7 @@ class WorldModelEnv(ABC):
     self._task_uncertainty: torch.Tensor | None = None
     self._pending_belief_step = None
     self.eit_critic = False
-    self.critic_input_config = None
+    self.critic_input_config: CriticInputConfig | None = None
     self._reference_finished = None
     if estimator_input_config is not None:
       if not self._supports_estimator_inputs:

@@ -455,7 +455,7 @@ provider 自身的状态更新及其调用前的噪声采样不在环境回滚�
 输入阶段可运行采集和短序列计算图验证，`run()` / policy learner `update()` 明确拒绝
 完整策略训练。第二步接入真实滤波器，第三步通过 `train_belief` 先拟合预测均值，再拟合过程 covariance。第四步通过 `train_eit` 接通 belief critic、策略优化和短程闭环评估。
 play/viewer 已通过共享 EIT 适配层支持本地 `training.pt`，用法见
-[EIT 评估与播放](README_eval.md#eit-定量评估和播放)；benchmark 和 ONNX exporter 尚未适配。
+[EIT 评估与播放](README_eval.md#eit-定量评估和播放)，其中包含 EIT ONNX 导出与共享运行时的命令。
 
 CPU 验收测试（无需完整 MuJoCo 闭环）：
 

@@ -379,6 +379,7 @@ class BeliefActorCriticPolicyLearner:
         "config": asdict(self.cfg),
         "contract": self._contract(),
         "model_version": self.wm_env.dynamics.model_version,
+        "bootstrap_value_cap": self._v_max if self.cfg.value_clipping else None,
         "actor_steps": self.actor_steps,
         "critic_steps": self.critic_steps,
         "actor_optimizer": self.actor_optimizer.state_dict(),

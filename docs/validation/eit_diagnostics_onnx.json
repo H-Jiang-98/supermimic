@@ -1,0 +1,365 @@
+{
+  "purpose": "One-round small-network protocol and runtime acceptance on CPU. Each group has a single trained candidate.",
+  "motion": "data/motions/walk1_subject1.npz",
+  "training_seed": 731,
+  "training_frames": 40,
+  "initialization_group": "B",
+  "platform": {
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "torch": "2.14.0+cu130",
+    "onnx": "1.20.1"
+  },
+  "training_args": "--device cpu --motion-file data/motions/walk1_subject1.npz --seed 731 --num-envs 5 --rounds 1 --collection-steps 8 --buffer-size 8 --mean-window-frames 3 --mean-updates 1 --mean-batch-size 2 --cov-batch-size 24 --cov-epochs 1 --policy-batch-size 2 --policy-microbatch-size 1 --samples 1 --policy-horizon 2 --critic-epochs 1 --hidden-dims 16 --actor-hidden-dims 16 --critic-hidden-dims 12",
+  "initialization": {
+    "file": "artifacts/step5/run/shared.pt",
+    "sha256": "7bc63924433afa68e50d331c0f15679fefb7100857b4d1973dc39afff5efb68e"
+  },
+  "manifest_digest": "6232d3a8c2f761f8195a81ab142b676677c79834a8c797a0202e97e9e609ce49",
+  "validation_seed": 17031,
+  "test_seed": 17032,
+  "critic_seed": 4795,
+  "fixed_record": {
+    "file": "artifacts/step5/episodes.pt",
+    "sha256": "afc26e745cf328b8fbf9f9db2958ae597cbdbc9a4a74dddb51deff0e6826f26a"
+  },
+  "fixed_drift_record": {
+    "file": "artifacts/step5/drift_episodes.pt",
+    "sha256": "7a977fa842d52297635c023f3c34a921862dfbf0036a781f03c1c2c9f3b58dd3"
+  },
+  "gui": {
+    "viser": "Started on loopback with ONNX, two motion clips and online_posterior.",
+    "control_callbacks": "Covered by tests/test_estimator_eit_viewer.py.",
+    "browser_interaction": "Unverified: no browser provider available."
+  },
+  "groups": {
+    "A": {
+      "snapshot": {
+        "file": "artifacts/step5/run/A/snapshots/frames_40.pt",
+        "sha256": "c166cf9b54a272286f2f1556f9a81293f822bc9a87960d41c3c212908ea9417e"
+      },
+      "graph": {
+        "file": "artifacts/step5/run/A/actor.onnx",
+        "sha256": "9863bdfd73ba1cb1b386e3d62918529f500acddfc6a5051bbd7e8c5229f23293"
+      },
+      "actor_fingerprint": "c41c3cbd40817a9160b388fbe3a3bbbe2e92b774089d77271fe0eb6bfe7b771c",
+      "model_fingerprint": "9945d158f0d66cb64a3de4dd9e9a87e7dfa8c9fa13bc8e8435937ad6c2f54470",
+      "test": {
+        "ee_ori_error": 0.9537420272827148,
+        "ee_pos_error": 0.40208038687705994,
+        "joint_vel_error": 1.52634596824646,
+        "length": 41.0,
+        "mpkpe": 0.31904563307762146,
+        "progress": 0.0031379151997550894,
+        "r_mpkpe": 0.24292652308940887,
+        "return": 1.086249589920044,
+        "success_rate": 0.0
+      },
+      "test_task_key": "c65cfde3b6de2b96448eff962953ab1a21b6cc3f787b6d412e0d164cc362714e",
+      "fixed_process": {
+        "windows": 31,
+        "window_frames": 8,
+        "window_scored_successors": 217,
+        "multistep_mse": {
+          "root_pos": 0.022110731795516304,
+          "root_ori": 0.003954209485337507,
+          "joint_pos": 0.023914177605618075,
+          "joint_vel": 5.5848127412110635
+        },
+        "transitions": 37,
+        "process_nll": 8060.434680241852,
+        "rpv_bias_truth_minus_prediction_right_local": [
+          0.004430345158923317,
+          0.0022767394607276278,
+          0.005540060891370238,
+          -0.011369926483697584,
+          0.0003927645452062574,
+          0.003433877053179753,
+          -0.9076952362382734,
+          0.031381575617234446,
+          0.2763770711230668
+        ]
+      },
+      "fixed_posterior": [
+        {
+          "start_s": 0.0,
+          "end_s": 1.0,
+          "surviving_episodes": 1,
+          "frames": 38,
+          "rotation_rmse_rad": 0.19329543817901598,
+          "right_local_rho_rmse_m": 2.989792195418421,
+          "position_rmse_m": 2.9870303094398287,
+          "right_local_nu_rmse_m_s": 11.613348258960317,
+          "velocity_rmse_m_s": 11.596494966879142,
+          "mean_supported_mahalanobis_squared": 4765.415703638252,
+          "null_direction_violations": 0,
+          "coverage_95": 0.02631578947368421,
+          "jitter_frames": 0,
+          "mean_innovation_norm": 10.141578498639559,
+          "rank_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            38
+          ]
+        }
+      ],
+      "drift_coverage_by_second": [
+        0.02,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "critic": {
+        "truth": {
+          "file": "artifacts/step5/run/A/truth.pt",
+          "sha256": "20355475330991a6d19fb63645bb8b8f0a3c86d2834ceffd2d1b13a98518a0ba",
+          "gamma": 0.99,
+          "value_cap": 9.999999999999991,
+          "samples": 37,
+          "bias": -0.4319839806525101,
+          "mae": 0.4319839806525101,
+          "rmse": 0.5183007131319008
+        },
+        "posterior": {
+          "file": "artifacts/step5/run/A/posterior.pt",
+          "sha256": "fdc71a583d34b596461b8980eb8f9a03628941ea88a49dcc027f4cc9bd2cbbf0",
+          "gamma": 0.99,
+          "value_cap": 9.999999999999991,
+          "samples": 37,
+          "bias": -0.43350504716839316,
+          "mae": 0.43350504716839316,
+          "rmse": 0.5239673456646342
+        }
+      },
+      "onnx_smoke": {
+        "calls": 3,
+        "device": "cpu",
+        "mean_actor_ms": 0.450106,
+        "runtime": "onnx.reference.ReferenceEvaluator"
+      }
+    },
+    "B": {
+      "snapshot": {
+        "file": "artifacts/step5/run/B/snapshots/frames_40.pt",
+        "sha256": "99f83d68c15738caf8acfa538a6f6aa63d342b980c16317c7d672511460b1791"
+      },
+      "graph": {
+        "file": "artifacts/step5/run/B/actor.onnx",
+        "sha256": "51f34eec9cc48a0cf9cc5c642d7951ba195c46ab48479fc91fddab48587bb3d7"
+      },
+      "actor_fingerprint": "207904ba0ae2e9c0e8bcd7eafbbbfc75c7836ff42b0981388c75c87c8c7b65c5",
+      "model_fingerprint": "fe906d0b167733a1cbb4cb57885e58e2230dea7d474136f91d04641065c968da",
+      "test": {
+        "ee_ori_error": 0.9330430626869202,
+        "ee_pos_error": 0.3717648386955261,
+        "joint_vel_error": 1.4944671392440796,
+        "length": 42.0,
+        "mpkpe": 0.2993970513343811,
+        "progress": 0.0032144497168222867,
+        "r_mpkpe": 0.2341017872095108,
+        "return": 1.191031813621521,
+        "success_rate": 0.0
+      },
+      "test_task_key": "0120025b9fbf68a617126b937837f80b2ae52e293cb787ba4e92b3b511c85fe9",
+      "fixed_process": {
+        "windows": 31,
+        "window_frames": 8,
+        "window_scored_successors": 217,
+        "multistep_mse": {
+          "root_pos": 0.0316806751163079,
+          "root_ori": 0.004017178022537008,
+          "joint_pos": 0.024672878549576508,
+          "joint_vel": 5.702037480917461
+        },
+        "transitions": 37,
+        "process_nll": 8321.01508523672,
+        "rpv_bias_truth_minus_prediction_right_local": [
+          0.0037036861381115945,
+          0.001686068978144888,
+          0.0063687861192856625,
+          -0.012487990309710841,
+          0.0003645820574633576,
+          0.004448607507239669,
+          -0.9971429544526178,
+          0.029128216830006725,
+          0.3575542222116948
+        ]
+      },
+      "fixed_posterior": [
+        {
+          "start_s": 0.0,
+          "end_s": 1.0,
+          "surviving_episodes": 1,
+          "frames": 38,
+          "rotation_rmse_rad": 0.23093674057409003,
+          "right_local_rho_rmse_m": 3.2662458829322243,
+          "position_rmse_m": 3.2592859755871206,
+          "right_local_nu_rmse_m_s": 12.851174335111752,
+          "velocity_rmse_m_s": 12.818725568306542,
+          "mean_supported_mahalanobis_squared": 5092.7585392221235,
+          "null_direction_violations": 0,
+          "coverage_95": 0.02631578947368421,
+          "jitter_frames": 0,
+          "mean_innovation_norm": 10.188484003669338,
+          "rank_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            38
+          ]
+        }
+      ],
+      "drift_coverage_by_second": [
+        0.02,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "critic": {
+        "posterior": {
+          "file": "artifacts/step5/run/B/posterior.pt",
+          "sha256": "d9e1877c3223601449f5fd5722485eb1f1f7271865f4149e9f3ec45fd327de52",
+          "gamma": 0.99,
+          "value_cap": 9.999999999999991,
+          "samples": 47,
+          "bias": -0.5382853720199194,
+          "mae": 0.5382853720199194,
+          "rmse": 0.6465397136685598
+        }
+      },
+      "onnx_smoke": {
+        "calls": 3,
+        "device": "cpu",
+        "mean_actor_ms": 0.4754773333333333,
+        "runtime": "onnx.reference.ReferenceEvaluator"
+      }
+    },
+    "C": {
+      "snapshot": {
+        "file": "artifacts/step5/run/C/snapshots/frames_40.pt",
+        "sha256": "66eaecc95eade8f87f7643437737abf668423bfeadedcb058092d51bcc62cae3"
+      },
+      "graph": {
+        "file": "artifacts/step5/run/C/actor.onnx",
+        "sha256": "30924da8b055afd353a6b17072a04cba42561081a87775b22c62feaff17754ae"
+      },
+      "actor_fingerprint": "9044a222028cbab0c53f061e95483b2047d7d1391f1b5801a37e0f59e2e36494",
+      "model_fingerprint": "8e8ae742036e6d1079ef896c8167c4857d36726a16780aa9a3c5c179b55295ca",
+      "test": {
+        "ee_ori_error": 0.9496439099311829,
+        "ee_pos_error": 0.3545411229133606,
+        "joint_vel_error": 1.269304633140564,
+        "length": 47.0,
+        "mpkpe": 0.3030387759208679,
+        "progress": 0.0035971223021582736,
+        "r_mpkpe": 0.22735543549060822,
+        "return": 1.497105598449707,
+        "success_rate": 0.0
+      },
+      "test_task_key": "6ab77d760573521bc7ec2d2eaec0ee9b82103508504d35ad958c0d6589faafe2",
+      "fixed_process": {
+        "windows": 31,
+        "window_frames": 8,
+        "window_scored_successors": 217,
+        "multistep_mse": {
+          "root_pos": 0.02683043550777725,
+          "root_ori": 0.004925537392089459,
+          "joint_pos": 0.023915848657001814,
+          "joint_vel": 5.554888013773582
+        },
+        "transitions": 37,
+        "process_nll": 8188.066488291423,
+        "rpv_bias_truth_minus_prediction_right_local": [
+          0.0032111805599384213,
+          0.0030859871594411496,
+          0.006647389342204504,
+          -0.011145102885878971,
+          0.000879439665712542,
+          0.004686087218106951,
+          -0.8897116675570205,
+          0.07031945788578407,
+          0.37655059499917803
+        ]
+      },
+      "fixed_posterior": [
+        {
+          "start_s": 0.0,
+          "end_s": 1.0,
+          "surviving_episodes": 1,
+          "frames": 38,
+          "rotation_rmse_rad": 0.4941941022383287,
+          "right_local_rho_rmse_m": 3.9927260684699677,
+          "position_rmse_m": 3.931120565347741,
+          "right_local_nu_rmse_m_s": 14.513033867333514,
+          "velocity_rmse_m_s": 14.312215805112773,
+          "mean_supported_mahalanobis_squared": 7157.689002667468,
+          "null_direction_violations": 0,
+          "coverage_95": 0.02631578947368421,
+          "jitter_frames": 0,
+          "mean_innovation_norm": 10.072619789525083,
+          "rank_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            38
+          ]
+        }
+      ],
+      "drift_coverage_by_second": [
+        0.02,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "critic": {
+        "posterior": {
+          "file": "artifacts/step5/run/C/posterior.pt",
+          "sha256": "18f76b497d8a97cb4030710f149c601999e897a93db565c7b2872e608469af02",
+          "gamma": 0.99,
+          "value_cap": 9.999999999999991,
+          "samples": 48,
+          "bias": -0.5960461828367231,
+          "mae": 0.5960461828367231,
+          "rmse": 0.720792080974105
+        }
+      },
+      "onnx_smoke": {
+        "calls": 3,
+        "device": "cpu",
+        "mean_actor_ms": 0.683393,
+        "runtime": "onnx.reference.ReferenceEvaluator"
+      }
+    }
+  },
+  "initialization_fingerprint": "e07211856a4e22e9801f2aec99ae5e6691dfaa98ac80e434c943b2d461da2279",
+  "runtime_parity_test": "tests/test_estimator_step5_runtime.py compares raw and limited actions across a real reset for all groups, including nonzero FiLM and increased task covariance.",
+  "regression": {
+    "command": "OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 .venv/bin/python -m pytest -q",
+    "cuda_available": true,
+    "passed": 794,
+    "warnings": 22,
+    "seconds": 34.12,
+    "ruff": "All source and test files passed lint and formatting."
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "description": "Synthetic first episodes. Each list contains one MPKPE per nonterminal post-action frame. The final action contributes reward and length.",
+  "clips": {
+    "short": [
+      {"env_id": 0, "reason": "clip_complete", "censored": false, "length": 4, "reference_steps": 4, "return": 4, "mpkpe_frames": [0, 1, 2]},
+      {"env_id": 1, "reason": "failure", "censored": false, "length": 2, "reference_steps": 4, "return": 0, "mpkpe_frames": [3]},
+      {"env_id": 2, "reason": "failure", "censored": false, "length": 1, "reference_steps": 4, "return": -1, "mpkpe_frames": []}
+    ],
+    "long": [
+      {"env_id": 0, "reason": "failure", "censored": false, "length": 6, "reference_steps": 8, "return": 5, "mpkpe_frames": [1, 1, 2, 2, 4]}
+    ]
+  },
+  "expected": {
+    "success_rate": 0.16666666666666666,
+    "progress": 0.6666666666666666,
+    "mpkpe": 2,
+    "length": 4.166666666666667,
+    "return": 3,
+    "mpkpe_valid_clips": 2,
+    "mpkpe_valid_episodes": {"short": 2, "long": 1},
+    "mpkpe_frames": {"short": 4, "long": 5}
+  }
+}

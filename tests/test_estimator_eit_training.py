@@ -12,6 +12,7 @@ import torch
 from supermimic.learners.belief_policy_learner import BeliefPolicyLearnerCfg
 from supermimic.motion_loader import motion_content_digest
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
+from supermimic.runners.eit_snapshots import file_sha256
 from supermimic.runners.eit_training import EITTraining, EITTrainingCfg
 from supermimic.sim_context import SimContext
 from tests.test_estimator_belief_training import _RoundRunner, assert_tree
@@ -207,6 +208,81 @@ def test_initialization_copies_exact_weights_and_rejects_after_training():
     source.load_initialization(bundle)
 
 
+def test_snapshot_baseline_actual_counters_and_repair_after_interrupted_index(tmp_path):
+  loop = training()
+  loop.load_initialization(loop.initialization_bundle())
+  loop.run(1, tmp_path)
+  index = tmp_path / "snapshots/index.json"
+  registry = json.loads(index.read_text())
+  baseline, first = registry["snapshots"]
+  state = torch.load(tmp_path / "training.pt", weights_only=True)
+  for name in ("mean_steps", "cov_steps", "actor_steps", "critic_steps"):
+    assert baseline[name] == 0
+    assert first[name] > 0
+  assert baseline["round"] == baseline["collected_frames"] == 0
+  assert first["actor_steps"] == state["policy"]["actor_steps"]
+  assert first["critic_steps"] == state["policy"]["critic_steps"]
+  assert first["mean_steps"] == state["learner"]["mean"]["steps"]
+  assert first["cov_steps"] == state["learner"]["cov"]["steps"]
+  assert first["sha256"] == file_sha256(tmp_path / "training.pt")
+  assert first["sha256"] == file_sha256(tmp_path / first["path"])
+  assert (
+    first["initialization_digest"]
+    == baseline["initialization_digest"]
+    == loop.initialization_digest
+  )
+  assert first["model_version"] == state["learner"]["model_version"]
+  assert first["round"] == 1 and first["collected_frames"] == 8
+  registry["snapshots"].pop()
+  index.write_text(json.dumps(registry))
+  training().run(1, tmp_path, resume=tmp_path / "training.pt")
+  restored = json.loads(index.read_text())["snapshots"]
+  assert restored[:2] == [baseline, first]
+  assert len(restored) == 3 and restored[-1]["round"] == 2
+  assert file_sha256(tmp_path / first["path"]) == first["sha256"]
+
+
+def test_snapshot_same_frame_conflict_preserves_immutable_bytes(tmp_path):
+  loop = training()
+  loop.run(1, tmp_path)
+  path = tmp_path / "training.pt"
+  state = torch.load(path, weights_only=True)
+  row = json.loads((tmp_path / "snapshots/index.json").read_text())["snapshots"][-1]
+  state["extra_marker"] = 1
+  torch.save(state, path)
+  with pytest.raises(ValueError, match="Snapshot index conflict"):
+    training().run(1, tmp_path, resume=path)
+  assert file_sha256(tmp_path / row["path"]) == row["sha256"]
+
+
+def test_rolled_back_checkpoint_and_metrics_cannot_reuse_published_frame_key(tmp_path):
+  loop = training()
+  loop.run(1, tmp_path)
+  path = tmp_path / "training.pt"
+  original = path.read_bytes()
+  path.write_bytes((tmp_path / "snapshots/frames_0.pt").read_bytes())
+  (tmp_path / "metrics.jsonl").write_text("")
+  with pytest.raises(ValueError, match="index is ahead"):
+    loop.run(1, tmp_path, resume=path)
+  assert (tmp_path / "snapshots/frames_8.pt").read_bytes() == original
+
+
+@pytest.mark.parametrize(
+  "target", ["snapshots", "snapshots/index.json", "snapshots/frames_8.pt"]
+)
+def test_snapshot_symlink_cannot_redirect_resumed_output(tmp_path, target):
+  loop = training()
+  output = tmp_path / "run"
+  loop.run(1, output)
+  path = output / target
+  outside = tmp_path / "outside"
+  path.rename(outside)
+  path.symlink_to(outside)
+  with pytest.raises(ValueError, match="local files"):
+    loop.run(1, output, resume=output / "training.pt")
+  assert path.is_symlink()
+
+
 def test_model_only_checkpoint_cannot_masquerade_as_joint_resume():
   loop = training()
   state = loop.state_dict()
@@ -291,6 +367,11 @@ def test_joint_output_resume_reconciles_metrics_and_preserves_unrelated_director
   second = resumed.run(1, tmp_path / "new", resume=checkpoint)[0]
   assert second["round"] == first["round"] + 1
   assert second["collection_actor_version"] == first["trained_actor_version"]
+  fork_index = json.loads((tmp_path / "new/snapshots/index.json").read_text())
+  parent, child = fork_index["snapshots"]
+  assert parent["sha256"] == file_sha256(checkpoint)
+  assert file_sha256(tmp_path / "new" / parent["path"]) == parent["sha256"]
+  assert child["sha256"] == file_sha256(tmp_path / "new/training.pt")
   unrelated = tmp_path / "unrelated"
   unrelated.mkdir()
   marker = unrelated / "training.pt"

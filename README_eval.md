@@ -4,8 +4,7 @@
 `play.py` 加载已有模型，在单个仿真环境中观察策略跟踪效果和世界模型预测，不更新权重。
 
 旧输入布局继续使用 W&B 模型和原有 viewer。`eit_rpv_v1` 的 A/B/C 现在支持本地
-`eit_training_v3` 格式的 `training.pt` 定量评估与播放，共用 `EITPolicyAdapter`。benchmark 和 ONNX exporter
-尚未接入 EIT。训练及梯度 smoke 仍使用 README 中的 `check_estimator` / `check_eit_training`。
+`eit_training_v3` 格式的 `training.pt` 定量评估与播放，共用 `EITPolicyAdapter`。同一适配器可执行 PyTorch 或导出的 ONNX actor。训练及梯度 smoke 仍使用 README 中的 `check_estimator` / `check_eit_training`。
 
 ## EIT 定量评估和播放
 
@@ -39,10 +38,11 @@ OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.eval_eit \
 
 结果中每个环境恰有一条 episode 记录。`reason` 区分 `failure`、`clip_complete`、
 `timeout` 和 `evaluation_truncated`，物理失败优先于同时发生的 clip 结束。
-`timeout` 布尔值保留 mjlab 原始标志，clip 完成时也可能为 true，应以 `reason` 分类。
+`timeout` 布尔值表示普通时间上限，`clip_end` 表示抵达末帧，`termination_terms` 列出当步触发的环境终止项。
 只有正常 clip 完成计为成功，普通 timeout 不算成功。
 
-可加 `--steps 100` 做有预算的 smoke。未结束轨迹仍保存，并标记 `censored=true`；
+默认 `--protocol full_clip` 保留训练环境的初始扰动和物理失败项，将普通时限设在最后一个合法动作之后。结果记录控制周期 `control_period_s`、帧数 `clip_frames` 和配置秒数 `timeout_s`；`timeout_steps` 是环境向上取整后的实际步数。
+使用 `--protocol legacy_10s` 可重现原有的 10 秒评估。可加 `--steps 100` 做有预算的 smoke。未结束轨迹仍保存，并标记 `censored=true`；
 存在截断时 `success_rate=null`，不能用该 smoke 的完成率代替正式评估。
 `mean_episode_return` 和 `mean_episode_length` 包括每条首轨迹已观察到的部分。
 
@@ -57,6 +57,50 @@ EIT viewer 的蓝紫色半透明模型标为 `online_posterior`，显示当前�
 它不是第二条世界模型预测轨迹。暂停、单步、真实 reset 和 clip 切换沿用原 viewer。
 `num_steps_rollout` 仅用于下述旧策略预测可视化，不重置 EIT 在线后验或历史。
 相同 seed 保证首次 reset/测量可复现，不承诺失败时间不同后的全程噪声配对。
+
+## 共同初始化、快照与批量选模
+
+下面的命令在 CPU 上运行一个 40 个实采帧的小网络验收。先用 B 组和固定配置生成初始化包，然后用相同参数启动各组。每个输出目录的 `snapshots/index.json` 记录候选摘要、实际更新步数和共同初始化指纹。第 0 轮也有独立快照。
+
+```bash
+PY=.venv/bin/python
+export OMP_NUM_THREADS=1
+motion=data/motions/walk1_subject1.npz
+shared=logs/step5/shared_364.pt
+args=(--motion-file "$motion" --device cpu --seed 364 --num-envs 5
+      --collection-steps 8 --buffer-size 7 --rounds 1
+      --mean-window-frames 3 --mean-updates 1 --mean-batch-size 4 --cov-batch-size 8
+      --policy-batch-size 1 --samples 1 --policy-horizon 2 --policy-microbatch-size 1
+      --critic-epochs 1 --hidden-dims 24 16 --actor-hidden-dims 16 --critic-hidden-dims 16)
+"$PY" -m supermimic.scripts.train_eit "${args[@]}" --group B \
+  --prepare-initialization --initialization "$shared"
+for group in A B C; do
+  "$PY" -m supermimic.scripts.train_eit "${args[@]}" --group "$group" \
+    --initialization "$shared" --output "logs/step5/$group"
+done
+```
+
+冻结场景清单后，依次运行验证和测试。每组每个训练 seed 使用验证集选出的同一份快照评估所有测试条件。清单示例、重试命令、缺失任务和逐 clip 等权汇总的定义见[批量评估说明](docs/eit_batch.md)。真实时限、原始 episode 和不同长度轨迹的手算期望值分别见[整段协议验收](docs/validation/eit_full_clip.json)和[聚合样例](docs/validation/eit_clip_aggregation.json)。
+
+## 独立诊断和 ONNX actor
+
+```bash
+PY=.venv/bin/python
+motion=data/motions/walk1_subject1.npz
+ckpt=logs/step5/B/snapshots/frames_40.pt
+out=logs/step5/diagnostics
+"$PY" -m supermimic.scripts.eval_eit --checkpoint "$ckpt" --motion-file "$motion" \
+  --num-envs 1 --seed 4795 --posterior-bin-steps 50 --record "$out/episodes.pt" \
+  --export-onnx "$out/actor.onnx" --output "$out/evaluation.json"
+"$PY" -m supermimic.scripts.diagnose_eit --checkpoint "$ckpt" --recording "$out/episodes.pt" \
+  --window-frames 8 --imagined-horizon 128 --imagined-samples 4 --output "$out/offline.json"
+"$PY" -m supermimic.scripts.eval_eit --checkpoint "$ckpt" --motion-file "$motion" \
+  --onnx-actor "$out/actor.onnx" --device cpu --num-envs 1 --seed 4795 --output "$out/onnx.json"
+```
+
+`--record` 保存每个环境首个 episode 的实测序列、已执行动作、真值、参考目标、上下文、实际初始 prior、奖励和终止原因。用同一份记录跨模型打分时选择 `--mode process` 或 `--mode posterior`。critic 的折扣回报诊断使用本快照控制的独立 episode。A 组另用 `--truth-actor` 采集训练输入条件。可用 `--no-posterior-diagnostics` 关闭在线统计。记录格式、删失处理和固定轨迹漂移验收见[诊断说明](docs/eit_diagnostics.md)。
+
+EIT 导出图接受 CPU float32 的 `history[1,5,93]`（最旧帧在前）和 `goal[1,700]`。C 组额外接受 `uncertainty[1,450]`。输出 `actions[1,29]` 是限幅前的归一化动作。图内含归一化、motion encoder、decoder 和 C 的 FiLM。图的 `eit_contract` 元数据包含特征排列、关节顺序、动作仿射映射和快照身份。适配器在图外完成滤波、历史、参考构造及限幅。当前 CPU 执行使用 ONNX ReferenceEvaluator，`onnx_timing` 记录本次图执行的平均耗时。播放时将 `--eit-onnx-actor "$out/actor.onnx" --device cpu` 加到对应快照的 `play` 命令。三组小网络的图、快照摘要、CPU 计时、相同记录上的模型和后验评分，以及各自独立 episode 上的 critic 误差见[本地验收汇总](docs/validation/eit_diagnostics_onnx.json)。
 
 ## 旧 checkpoint 启动播放
 

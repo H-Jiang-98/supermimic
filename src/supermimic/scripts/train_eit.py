@@ -16,7 +16,11 @@ from supermimic.critic_inputs import CRITIC_INPUT_VERSION
 from supermimic.estimator import FilterConfig
 from supermimic.learners.belief_policy_learner import BeliefPolicyLearnerCfg
 from supermimic.models import ProcessNoiseConfig
-from supermimic.runners.eit_training import EITTraining, EITTrainingCfg
+from supermimic.runners.eit_training import (
+  EITTraining,
+  EITTrainingCfg,
+  initialization_fingerprint,
+)
 from supermimic.runners.run_config import EIT_INITIALIZATION_VERSION, load_runner_cfg
 from supermimic.runners.supermimic_runner import SuperMimicRunner, SuperMimicRunnerCfg
 from supermimic.scripts.train_utils import (
@@ -34,7 +38,12 @@ def main():
     formatter_class=argparse.ArgumentDefaultsHelpFormatter,
   )
   parser.add_argument("--motion-file", required=True)
-  parser.add_argument("--output", required=True, type=Path)
+  parser.add_argument("--output", type=Path)
+  parser.add_argument(
+    "--prepare-initialization",
+    action="store_true",
+    help="Publish the shared initialization at --initialization and exit before training",
+  )
   parser.add_argument("--resume", type=Path)
   parser.add_argument(
     "--initialization",
@@ -70,6 +79,18 @@ def main():
     parser.error("num-envs and rounds must be positive")
   if args.resume and args.initialization:
     parser.error("resume and initialization are mutually exclusive")
+  if args.prepare_initialization and not args.initialization:
+    parser.error("--prepare-initialization requires an explicit --initialization path")
+  if not args.prepare_initialization and not args.output:
+    parser.error("training requires --output")
+  if (
+    args.initialization
+    and not args.prepare_initialization
+    and not args.initialization.is_file()
+  ):
+    parser.error(
+      "Explicit --initialization must exist; create it with --prepare-initialization"
+    )
   torch.manual_seed(args.seed)
   torch.compiler.set_stance("force_eager")
   task_id = "SuperMimic-GenCoord-G1"
@@ -85,6 +106,8 @@ def main():
     loop_cfg = EITTrainingCfg(**saved["loop_config"])
     policy_cfg = BeliefPolicyLearnerCfg(**saved["policy_config"])
     num_envs = saved["num_envs"]
+    if saved.get("training_seed") is not None:
+      env_cfg.seed = saved["training_seed"]
     del saved
   else:
     mean, cov = model_fit_configs(args)
@@ -128,28 +151,37 @@ def main():
         or args.output.parent
         / f"{EIT_INITIALIZATION_VERSION}_{CRITIC_INPUT_VERSION}_seed{args.seed}.pt"
       )
-      if initialization.exists():
+      expected = None
+      if args.prepare_initialization or not initialization.exists():
+        initial = training.initialization_bundle()
+        expected = (
+          initialization_fingerprint(initial) if args.prepare_initialization else None
+        )
+        initialization.parent.mkdir(parents=True, exist_ok=True)
+        with NamedTemporaryFile(
+          dir=initialization.parent, delete_on_close=False
+        ) as stream:
+          torch.save(initial, stream)
+          stream.close()
+          try:
+            os.link(stream.name, initialization)
+          except FileExistsError:
+            pass
+        del initial
+      if initialization.is_file():
         initial = torch.load(
           initialization, map_location=args.device, weights_only=True
         )
       else:
-        initial = training.initialization_bundle()
-        initialization.parent.mkdir(parents=True, exist_ok=True)
-        # A complete file is published atomically without overwriting another
-        # concurrently starting ablation's initialization.
-        with NamedTemporaryFile(dir=initialization.parent, delete=False) as stream:
-          temporary = Path(stream.name)
-          torch.save(initial, stream)
-        try:
-          try:
-            os.link(temporary, initialization)
-          except FileExistsError:
-            initial = torch.load(
-              initialization, map_location=args.device, weights_only=True
-            )
-        finally:
-          temporary.unlink(missing_ok=True)
+        raise ValueError(f"Initialization path is not a file: {initialization}")
       training.load_initialization(initial)
+      if args.prepare_initialization:
+        if training.initialization_digest != expected:
+          raise ValueError(
+            "Existing initialization differs from the requested seed/group/configuration"
+          )
+        print(f"EIT_INITIALIZATION {training.initialization_digest} {initialization}")
+        return
     training.run(args.rounds, args.output, resume=args.resume)
   finally:
     env.close()

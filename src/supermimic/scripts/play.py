@@ -25,6 +25,7 @@ from supermimic.runners.eit_inference import (
   EITPolicyAdapter,
   evaluation_config,
   load_evaluation_models,
+  load_hashed_checkpoint,
 )
 from supermimic.runners.run_config import check_representation_matches, load_runner_cfg
 from supermimic.runners.supermimic_runner import build_actor, build_world_model
@@ -64,6 +65,8 @@ class PlayConfig:
   """W&B run path: entity/project/run_id. Alternative to eit_checkpoint."""
   eit_checkpoint: Path | None = None
   """Local EIT training.pt. Requires motion_file; does not contact W&B."""
+  eit_onnx_actor: Path | None = None
+  """Optional batch-one CPU actor graph paired with eit_checkpoint."""
   config: Path | None = None
   """TOML settings file. Explicit command-line options override its values."""
   checkpoint: str = "latest"
@@ -111,14 +114,19 @@ def configure_play_simulation(
 def play(task_id: str, cfg: PlayConfig) -> None:
   # The right-local filter uses IEEE float32 for rotation and covariance matrices.
   configure_torch_backends(allow_tf32=cfg.eit_checkpoint is None)
-  device = cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
+  device = cfg.device or (
+    "cuda:0" if cfg.eit_onnx_actor is None and torch.cuda.is_available() else "cpu"
+  )
 
   print(f"[INFO] Loading environment: {task_id}")
   env_cfg = load_env_cfg(task_id, play=True)
   env_cfg.scene.num_envs = 1
   env_cfg.observations["actor"].enable_corruption = True
 
+  if cfg.eit_onnx_actor is not None and cfg.eit_checkpoint is None:
+    raise ValueError("--eit-onnx-actor requires --eit-checkpoint")
   saved = None
+  backend = None
   if cfg.eit_checkpoint is not None:
     if cfg.wandb_path.strip():
       raise ValueError("Choose either wandb_path or eit_checkpoint")
@@ -126,9 +134,21 @@ def play(task_id: str, cfg: PlayConfig) -> None:
       raise ValueError("eit_checkpoint playback requires motion_file")
     if cfg.initial_task != "motion":
       raise ValueError("EIT playback supports the motion task")
-    saved = torch.load(
-      cfg.eit_checkpoint.expanduser(), map_location=device, weights_only=True
-    )
+    if cfg.eit_onnx_actor is None:
+      saved = torch.load(
+        cfg.eit_checkpoint.expanduser(), map_location=device, weights_only=True
+      )
+    else:
+      from supermimic.runners.exporter import load_eit_backend
+
+      saved, digest = load_hashed_checkpoint(cfg.eit_checkpoint.expanduser(), device)
+      backend = load_eit_backend(
+        cfg.eit_onnx_actor,
+        digest,
+        saved["runner_config"]["estimator_inputs"]["group"],
+        device,
+        1,
+      )
     runner_cfg = evaluation_config(saved)
     run_config = saved
     motion_artifacts = []
@@ -182,6 +202,8 @@ def play(task_id: str, cfg: PlayConfig) -> None:
     if saved is not None:
       wm, actor = load_evaluation_models(env, runner_cfg, saved, device)
       adapter = EITPolicyAdapter(env, actor, wm, runner_cfg)
+      if backend is not None:
+        adapter.actor_backend = backend
     else:
       assert model_dir is not None
       wm = build_world_model(runner_cfg, env, device)

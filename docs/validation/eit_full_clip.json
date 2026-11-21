@@ -1,0 +1,140 @@
+{
+  "date": "2026-11-21",
+  "purpose": "CPU MuJoCo full-clip termination and checkpoint publication regression",
+  "motion": "data/motions/walk1_subject1.npz",
+  "motion_sha256": "bdbd3200585aa661f5c8a76744241e342ea0d6401b8d8159495b6c64dc0c0ab7",
+  "initialization_args": "--prepare-initialization --initialization seed2026.pt --group B --seed 2026 --num-envs 5 --device cpu --hidden-dims 24 16 --actor-hidden-dims 12 --critic-hidden-dims 12 --mean-window-frames 3 --buffer-size 8 --mean-updates 1 --mean-batch-size 2 --policy-microbatch-size 1 --policy-horizon 2",
+  "training_args": "--initialization seed2026.pt --output B --group B --seed 2026 --num-envs 5 --device cpu --hidden-dims 24 16 --actor-hidden-dims 12 --critic-hidden-dims 12 --mean-window-frames 3 --buffer-size 8 --mean-updates 1 --mean-batch-size 2 --policy-microbatch-size 1 --policy-horizon 2 --rounds 1 --collection-steps 8 --cov-batch-size 8 --policy-batch-size 2",
+  "resume_args": "--resume B/training.pt --output B-resumed --rounds 1 --device cpu",
+  "evaluation_args": "--checkpoint B/snapshots/frames_40.pt --protocol full_clip --num-envs 2 --seed 2718 --device cpu",
+  "command_note": "Each command also takes --motion-file data/motions/walk1_subject1.npz. All commands used OMP_NUM_THREADS=1 and MUJOCO_GL=egl.",
+  "snapshot_rounds": [
+    {
+      "path": "snapshots/frames_0.pt",
+      "sha256": "542533524912eafa07fa2cd9d9814a9d02cc0286005098dc79f34fc06d1a6a02",
+      "round": 0,
+      "collected_frames": 0,
+      "mean_steps": 0,
+      "cov_steps": 0,
+      "actor_steps": 0,
+      "critic_steps": 0,
+      "model_version": "3c28a8b4fc3ee1e8d17c6c7b86bc0d751e92172c707b107dfd29c778caedb20e",
+      "initialization_digest": "42277e3e85004c88dfc9aecacf25530c27126184db1a432fe6f1459312fe76cb",
+      "actor_version": "34acbbd84aa6523ff13d2a3a440e030614baa9a705d3deef66e10986ea13bd29",
+      "critic_version": "94acba008d8bec4542a6906af1e46be02da426fe18999d05806d9c72ec77d9b2",
+      "stage": "policy",
+      "group": "B",
+      "training_seed": 2026
+    },
+    {
+      "path": "snapshots/frames_40.pt",
+      "sha256": "f70f6358dee210b0c34e65d029f06715468a3d95569680834311bdf0cf3b0b38",
+      "round": 1,
+      "collected_frames": 40,
+      "mean_steps": 1,
+      "cov_steps": 4,
+      "actor_steps": 1,
+      "critic_steps": 2,
+      "model_version": "274a661622773e23d8fbab927de90a511fe70713f280de60ae261c676ebbb092",
+      "initialization_digest": "42277e3e85004c88dfc9aecacf25530c27126184db1a432fe6f1459312fe76cb",
+      "actor_version": "c3c1f0368d2c72062c925e35a7faf8bb99a200eea359dfa37e5830f62f6d3b30",
+      "critic_version": "1a88a5babf195ae85f92cb78ba4c7907753becc260b065e0bafb302c2a44e86c",
+      "stage": "policy",
+      "group": "B",
+      "training_seed": 2026
+    },
+    {
+      "path": "snapshots/frames_80.pt",
+      "sha256": "5a1db664cba0fb7d74f1d2d047c033e91386ba68692d2da7919124d0918f5ef5",
+      "round": 2,
+      "collected_frames": 80,
+      "mean_steps": 2,
+      "cov_steps": 8,
+      "actor_steps": 2,
+      "critic_steps": 4,
+      "model_version": "4700cc750b7b0af6b2a1bfbf63c8e12d4206908463807f0d2a9d3daf50ffd510",
+      "initialization_digest": "42277e3e85004c88dfc9aecacf25530c27126184db1a432fe6f1459312fe76cb",
+      "actor_version": "a60e92bd05f0b188d066aadb475882f558fb652208fdd68139a4aafd4cd3ee4e",
+      "critic_version": "bc27585daf022b6e53a9785527d378d676c60f5650027f1235f66af390a43f14",
+      "stage": "policy",
+      "group": "B",
+      "training_seed": 2026
+    }
+  ],
+  "source_snapshot_sha256_after_fork": "f70f6358dee210b0c34e65d029f06715468a3d95569680834311bdf0cf3b0b38",
+  "expected_controlled_long_episode": {
+    "reference_steps": 532,
+    "legacy_10s_v1": {
+      "length": 500,
+      "reason": "timeout"
+    },
+    "full_clip_v1": {
+      "length": 532,
+      "reason": "clip_complete"
+    }
+  },
+  "real_evaluation": {
+    "group": "B",
+    "seed": 2718,
+    "protocol": "full_clip_v1",
+    "step_budget": null,
+    "evaluation_motion_digest": "720b3b58507fd720320e208fadcee61ad6dc30a04b5a555a630b01a61c58b103",
+    "checkpoint_sha256": "f70f6358dee210b0c34e65d029f06715468a3d95569680834311bdf0cf3b0b38",
+    "control_period_s": 0.02,
+    "clip_frames": 13066,
+    "timeout_s": 261.34000000000003,
+    "timeout_steps": 13068,
+    "episodes": [
+      {
+        "censored": false,
+        "clip_end": false,
+        "env_id": 0,
+        "length": 39,
+        "metric_steps": 38,
+        "metrics": {
+          "ee_ori_error": 1.1079139709472656,
+          "ee_pos_error": 0.3597733974456787,
+          "joint_vel_error": 1.4027682542800903,
+          "mpkpe": 0.2871381640434265,
+          "r_mpkpe": 0.2757028043270111
+        },
+        "physical_failure": true,
+        "reason": "failure",
+        "reference_steps": 13066,
+        "return": 1.1564956903457642,
+        "start_frame": 0,
+        "termination_terms": [
+          "anchor_pos"
+        ],
+        "timeout": false
+      },
+      {
+        "censored": false,
+        "clip_end": false,
+        "env_id": 1,
+        "length": 48,
+        "metric_steps": 47,
+        "metrics": {
+          "ee_ori_error": 0.9455475211143494,
+          "ee_pos_error": 0.3687434494495392,
+          "joint_vel_error": 1.3512295484542847,
+          "mpkpe": 0.27805256843566895,
+          "r_mpkpe": 0.22814172506332397
+        },
+        "physical_failure": true,
+        "reason": "failure",
+        "reference_steps": 13066,
+        "return": 1.7332535982131958,
+        "start_frame": 0,
+        "termination_terms": [
+          "anchor_pos"
+        ],
+        "timeout": false
+      }
+    ],
+    "completed_episodes": 2,
+    "censored_episodes": 0,
+    "success_rate": 0.0,
+    "mpkpe": 0.28259536623954773
+  }
+}

@@ -493,8 +493,9 @@ def test_invalid_heldout_frame_preserves_published_round_and_can_resume(tmp_path
 
 def test_resume_recognizes_a_matching_preexisting_nan_metric(tmp_path):
   loop = training()
-  loop.run(1, tmp_path)
   path = tmp_path / "training.pt"
+  # Legacy v3 output predates the immutable snapshot registry.
+  loop.run_round(path)
   state = torch.load(path, weights_only=True)
   state["last_metrics"]["validation"]["Loss/process_nll"] = float("nan")
   torch.save(state, path)

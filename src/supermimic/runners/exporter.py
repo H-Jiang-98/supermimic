@@ -19,6 +19,7 @@ needs at inference:
 from __future__ import annotations
 
 import copy
+import math
 import os
 from typing import TYPE_CHECKING, cast
 
@@ -92,7 +93,7 @@ class _SingleEncoderOnnx(nn.Module):
     super().__init__()
     if actor.input_version != "legacy" or actor.film is not None:
       raise NotImplementedError(
-        "ONNX encoder wrapper does not yet support estimator inputs"
+        "Legacy flat observations require a legacy actor. Use the EIT motion actor for estimator inputs"
       )
     self.obs_normalizer = actor.obs_normalizer
     self.goal_normalizer = actor.goal_normalizers[task_name]
@@ -344,7 +345,7 @@ def export_actor_as_onnx(
     or getattr(actor, "film", None) is not None
   ):
     raise NotImplementedError(
-      "ONNX exporter does not yet support estimator input targets and FiLM"
+      "Use export_eit_actor with the EIT checkpoint digest and estimator configuration"
     )
   written: list[str] = []
   for ts in actor.task_specs:
@@ -361,3 +362,136 @@ def export_actor_as_onnx(
   if replay is not None:
     written.append(replay)
   return written
+
+
+class _EITMotionActor(nn.Module):
+  """One motion encoder with the training normalizers and optional FiLM."""
+
+  def __init__(self, actor):
+    super().__init__()
+    self.encoder = actor.encoders["motion"]
+    self.goal_normalizer = actor.goal_normalizers["motion"]
+    self.obs_normalizer = actor.obs_normalizer
+    self.decoder = actor.decoder
+    self.film = actor.film
+
+  def forward(self, history, goal, uncertainty=None):
+    z = self.encoder(self.goal_normalizer(goal)).tanh()
+    inputs = torch.cat((z, self.obs_normalizer(history).flatten(1)), dim=-1)
+    if self.film is None:
+      return self.decoder(inputs)
+    gamma, beta = self.film(uncertainty).chunk(2, dim=-1)
+    hidden = self.decoder[1](self.decoder[0](inputs))
+    hidden = (1 + gamma) * hidden + beta
+    for layer in self.decoder[2:]:
+      hidden = layer(hidden)
+    return hidden
+
+
+def export_eit_actor(actor, env, wm, cfg, checkpoint_sha, path):
+  """Export a fixed batch-one raw-action graph and embed the runtime contract."""
+  import json
+  from tempfile import TemporaryDirectory
+
+  from supermimic.estimator_inputs import GOAL_BLOCK_ORDER
+  from supermimic.runners.belief_training import parameter_digest
+  from supermimic.utils.helpers import (
+    extract_action_scale_offset,
+    normalized_action_limits,
+  )
+
+  inputs = cfg.estimator_inputs
+  if (
+    actor.history_length != 5 or actor.obs_dim != 93 or actor._task_names != ["motion"]
+  ):
+    raise ValueError("EIT export requires the G1 five-frame motion actor")
+  scale, offset = extract_action_scale_offset(env)
+  lower, upper = normalized_action_limits(env, 29)
+  joint_term = env.unwrapped.action_manager.get_term("joint_pos")
+  names = ["history", "goal"]
+  samples = [torch.zeros(1, 5, 93), torch.zeros(1, 700)]
+  if inputs.uses_uncertainty:
+    names.append("uncertainty")
+    samples.append(torch.zeros(1, 450))
+  contract = dict(
+    version="eit_actor_onnx_v1",
+    checkpoint_sha256=checkpoint_sha,
+    actor_sha256=parameter_digest(actor),
+    world_model_version=wm.dynamics.model_version,
+    group=inputs.group,
+    input_config=inputs.to_dict(),
+    history_order="oldest_to_current_frame_major",
+    sensor_order=[
+      "gravity_b",
+      "angular_velocity_b",
+      "relative_joint_position",
+      "joint_velocity",
+      "previous_action",
+    ],
+    goal_order=GOAL_BLOCK_ORDER,
+    action_output="normalized_before_limits",
+    joint_names=joint_term.target_names,
+    joint_target_scale=scale.flatten().tolist(),
+    joint_target_offset=offset.flatten().tolist(),
+    action_lower=[v if math.isfinite(v) else None for v in lower.tolist()],
+    action_upper=[v if math.isfinite(v) else None for v in upper.tolist()],
+  )
+  path.parent.mkdir(parents=True, exist_ok=True)
+  with TemporaryDirectory(dir=path.parent) as staging:
+    staged = _export_module(
+      _EITMotionActor(actor), tuple(samples), names, ["actions"], staging, "actor.onnx"
+    )
+    attach_metadata_to_onnx(
+      staged, {"eit_contract": json.dumps(contract, allow_nan=False)}
+    )
+    os.replace(staged, path)
+
+
+class EITOnnxBackend:
+  """CPU reference execution for the batch-one deploy graph, including timing."""
+
+  def __init__(self, model, group):
+    from onnx.reference import ReferenceEvaluator
+
+    self.runtime = ReferenceEvaluator(model)
+    self.inputs = {"history": "history", "goal": "goal_motion"}
+    if group == "C":
+      self.inputs["uncertainty"] = "task_uncertainty"
+    if self.runtime.input_names != list(self.inputs) or self.runtime.output_names != [
+      "actions"
+    ]:
+      raise ValueError("EIT graph input/output contract mismatch")
+    self.calls = 0
+    self.total_ns = 0
+
+  def __call__(self, inputs):
+    from time import perf_counter_ns
+
+    feed = {name: inputs[key].detach().numpy() for name, key in self.inputs.items()}
+    start = perf_counter_ns()
+    (action,) = self.runtime.run(["actions"], feed)
+    self.total_ns += perf_counter_ns() - start
+    self.calls += 1
+    result = torch.from_numpy(action)
+    if result.shape != (1, 29) or result.dtype != torch.float32:
+      raise ValueError("EIT graph produced incompatible actions")
+    return result
+
+
+def load_eit_backend(path, checkpoint_sha, group, device, num_envs):
+  import json
+
+  import onnx
+
+  if torch.device(device).type != "cpu" or num_envs != 1:
+    raise ValueError("EIT ONNX evaluation requires --device cpu and --num-envs 1")
+  model = onnx.load(path)
+  onnx.checker.check_model(model)
+  metadata = {prop.key: prop.value for prop in model.metadata_props}
+  contract = json.loads(metadata.get("eit_contract", "{}"))
+  expected = dict(
+    version="eit_actor_onnx_v1", checkpoint_sha256=checkpoint_sha, group=group
+  )
+  if any(contract.get(key) != value for key, value in expected.items()):
+    raise ValueError("EIT graph and evaluation checkpoint disagree")
+  return EITOnnxBackend(model, group)

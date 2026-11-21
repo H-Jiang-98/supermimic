@@ -6,7 +6,10 @@ frame, its history and the corresponding posterior; it has no replay or learner.
 
 from __future__ import annotations
 
+import hashlib
+from collections.abc import Callable
 from dataclasses import replace
+from pathlib import Path
 
 import torch
 from tensordict import TensorDict
@@ -29,6 +32,14 @@ from supermimic.runners.supermimic_runner import (
 from supermimic.tasks.task_spec import build_actor_obs_td
 from supermimic.utils.helpers import normalized_action_limits
 from supermimic.utils.lie_state import LieState
+
+
+def load_hashed_checkpoint(path: Path, device):
+  """Hash and decode one file descriptor so atomic replacement cannot mix versions."""
+  with Path(path).open("rb") as stream:
+    digest = hashlib.file_digest(stream, "sha256").hexdigest()
+    stream.seek(0)
+    return torch.load(stream, map_location=device, weights_only=True), digest
 
 
 def evaluation_config(saved: dict) -> SuperMimicRunnerCfg:
@@ -80,7 +91,16 @@ class EITPolicyAdapter:
   Calling ``reset`` never resets the physical environment or visualization.
   """
 
-  def __init__(self, env, actor, wm: WorldModel, cfg: SuperMimicRunnerCfg):
+  def __init__(
+    self,
+    env,
+    actor,
+    wm: WorldModel,
+    cfg: SuperMimicRunnerCfg,
+    *,
+    truth_actor=False,
+    actor_backend: Callable[[TensorDict], torch.Tensor] | None = None,
+  ):
     if cfg.estimator_inputs is None or cfg.estimator_inputs.mode != "eval":
       raise ValueError("EIT policy adapter requires estimator_inputs.mode='eval'")
     if wm.dynamics.process_noise_config is None:
@@ -93,6 +113,14 @@ class EITPolicyAdapter:
     ):
       raise ValueError("Adapter estimator settings disagree with runner configuration")
     self.env, self.actor, self.wm, self.cfg = env, actor, wm, cfg
+    if truth_actor and cfg.estimator_inputs.group != "A":
+      raise ValueError("Truth-input diagnostics require group A")
+    self.actor_inputs = (
+      replace(cfg.estimator_inputs, mode="train")
+      if truth_actor
+      else cfg.estimator_inputs
+    )
+    self.actor_backend = actor_backend if actor_backend is not None else actor
     self.actor.eval()
     self.wm.dynamics.eval()
     self.command = env.unwrapped.command_manager.get_term("motion")
@@ -213,7 +241,7 @@ class EITPolicyAdapter:
       self.command.reference_alignment,
     )
     goal, uncertainty = build_actor_features(
-      self.cfg.estimator_inputs,
+      self.actor_inputs,
       representation.true_rpv(aux, rep),
       belief.to_actor_input(),
       reference,
@@ -221,7 +249,7 @@ class EITPolicyAdapter:
     inputs = build_actor_obs_td(
       {"motion": goal}, self.history, task_uncertainty=uncertainty
     )
-    actions = self.actor(inputs).clamp(min=self._lower, max=self._upper)
+    actions = self.actor_backend(inputs).clamp(min=self._lower, max=self._upper)
     if not torch.isfinite(actions).all():
       raise ValueError("EIT actor produced non-finite actions")
     if candidate is not None:

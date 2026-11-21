@@ -65,6 +65,8 @@ def main():
     runner_cfg = load_runner_cfg({"runner_cfg": saved["runner_config"]})
     loop_cfg = BeliefTrainingCfg(**saved["loop_config"])
     num_envs = saved["num_envs"]
+    if saved.get("training_seed") is not None:
+      env_cfg.seed = saved["training_seed"]
     del saved
   else:
     mean, cov = model_fit_configs(args)

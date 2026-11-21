@@ -53,6 +53,27 @@ class EITTrainingCfg(BeliefTrainingCfg):
       raise ValueError("normalization_batch_size must be positive")
 
 
+def initialization_fingerprint(bundle: dict) -> str:
+  digest = hashlib.sha256()
+
+  def hash_value(value):
+    if isinstance(value, torch.Tensor):
+      digest.update(str((value.dtype, tuple(value.shape))).encode())
+      digest.update(value.detach().cpu().contiguous().numpy().tobytes())
+    elif isinstance(value, dict):
+      for name in sorted(value):
+        digest.update(name.encode())
+        hash_value(value[name])
+    elif isinstance(value, (tuple, list)):
+      for item in value:
+        hash_value(item)
+    else:
+      digest.update(json.dumps(value, sort_keys=True).encode())
+
+  hash_value(bundle)
+  return digest.hexdigest()
+
+
 class EITTraining(BeliefModelTraining):
   """Train the model, actor and critic in separate, versioned phases."""
 
@@ -278,6 +299,8 @@ class EITTraining(BeliefModelTraining):
     return deepcopy(
       {
         "version": EIT_INITIALIZATION_VERSION,
+        "generation_group": runner.cfg.estimator_inputs.group,
+        "generation_seed": self.training_seed,
         "world_model": runner._wm.bundle(),
         "actors": {
           group: actor_checkpoint(
@@ -304,6 +327,8 @@ class EITTraining(BeliefModelTraining):
       raise ValueError("Initialization cannot replace an active training run")
     if bundle.get("version") != EIT_INITIALIZATION_VERSION:
       raise ValueError("Unsupported EIT initialization")
+    if bundle.get("generation_seed") not in (None, self.training_seed):
+      raise ValueError("Initialization seed differs from the training seed")
     runner = self.runner
     group = runner.cfg.estimator_inputs.group
     wm = deepcopy(runner._wm)
@@ -340,24 +365,7 @@ class EITTraining(BeliefModelTraining):
         ).to(next(self.actor.parameters()))
         critic.load_checkpoint(bundle["critics"][key])
     # Hash every group's weights/config and the context, before mutating anything.
-    digest = hashlib.sha256()
-
-    def hash_value(value):
-      if isinstance(value, torch.Tensor):
-        digest.update(str((value.dtype, tuple(value.shape))).encode())
-        digest.update(value.detach().cpu().contiguous().numpy().tobytes())
-      elif isinstance(value, dict):
-        for name in sorted(value):
-          digest.update(name.encode())
-          hash_value(value[name])
-      elif isinstance(value, (tuple, list)):
-        for item in value:
-          hash_value(item)
-      else:
-        digest.update(json.dumps(value, sort_keys=True).encode())
-
-    hash_value(bundle)
-    identity = digest.hexdigest()
+    identity = initialization_fingerprint(bundle)
     runner._wm.load_bundle(bundle["world_model"])
     load_actor_checkpoint(self.actor, runner.cfg, bundle["actors"][group])
     self.policy.critic.load_checkpoint(bundle["critics"][group])

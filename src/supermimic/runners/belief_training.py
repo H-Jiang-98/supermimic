@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from shutil import copyfileobj
 from tempfile import NamedTemporaryFile
 from typing import cast
 
@@ -21,6 +23,7 @@ from filelock import FileLock
 from supermimic.learners.two_stage_wm import TwoStageWorldModelLearner
 from supermimic.models import MultiEncoderAE
 from supermimic.motion_loader import motion_content_digest
+from supermimic.runners.eit_snapshots import file_sha256, publish_snapshot
 from supermimic.runners.run_config import (
   EIT_TRAINING_VERSION,
   validate_eit_checkpoint_contract,
@@ -78,6 +81,11 @@ class BeliefModelTraining:
     self.cfg = cfg or BeliefTrainingCfg()
     self.rounds = 0
     self.collected_frames = 0
+    self.training_seed = getattr(getattr(runner.env, "cfg", None), "seed", None)
+    self.training_motion_files = [
+      {"path": str(path), "sha256": file_sha256(path)}
+      for path in (Path(f).resolve() for f in runner.motion.files)
+    ]
     self._ready = False
     # This entry point does not optimize the policy or change its normalizers.
     runner.policy_learner.actor.eval().requires_grad_(False)
@@ -192,6 +200,8 @@ class BeliefModelTraining:
         "stage": "model",
         "replay_mode": runner.replay_buffer.replay_mode,
         "motion_digest": motion_content_digest(runner.motion),
+        "training_motion_files": self.training_motion_files,
+        "training_seed": self.training_seed,
         "loop_config": asdict(self.cfg),
         "runner_config": asdict(runner.cfg),
         "world_model": runner._wm.bundle(),
@@ -222,6 +232,14 @@ class BeliefModelTraining:
       raise ValueError("Training checkpoint replay mode differs from the runner")
     if state.get("motion_digest") != motion_content_digest(runner.motion):
       raise ValueError("Belief training checkpoint motion content mismatch")
+    if state.get("training_seed") not in (None, self.training_seed):
+      raise ValueError("Checkpoint training seed differs from the environment seed")
+    if state.get("training_motion_files") and [
+      f["sha256"] for f in state["training_motion_files"]
+    ] != [f["sha256"] for f in self.training_motion_files]:
+      raise ValueError(
+        "Checkpoint training motion file digests differ from this runner"
+      )
     if state.get("loop_config") != asdict(self.cfg):
       raise ValueError("Belief training loop configuration mismatch")
     if state.get("runner_config") != asdict(runner.cfg):
@@ -290,6 +308,10 @@ class BeliefModelTraining:
     self.learner.load_state_dict(state["learner"])
     load_actor_checkpoint(self.actor, runner.cfg, state["actor"])
     self.rounds, self.collected_frames = state["rounds"], state["collected_frames"]
+    # Older v3 checkpoints do not document the original collection seed/files.
+    self.training_seed = state.get("training_seed")
+    if not state.get("training_motion_files"):
+      self.training_motion_files = []
     # Existing replay may contain later episodes with reused IDs. Restore begins
     # a fresh replay and physical trajectory, while preserving optimizer state.
     runner.replay_buffer = runner._make_replay_buffer()
@@ -331,6 +353,8 @@ class BeliefModelTraining:
     lock_path = output / ".belief-training.lock"
 
     def check_destination():
+      if lock_path.is_symlink():
+        raise ValueError("Training lock must be local to the output directory")
       occupied = any(p != lock_path for p in output.iterdir())
       source = Path(resume).resolve() if resume is not None else self._output_checkpoint
       if occupied and (
@@ -349,24 +373,37 @@ class BeliefModelTraining:
       occupied = check_destination()
       if resume is not None or occupied:
         source = resume if resume is not None else checkpoint
-        state = torch.load(source, map_location=self.runner.device, weights_only=True)
-        self._check_checkpoint_version(state)
-        missing = self._missing_metric_bytes(metrics_path, state) if occupied else b""
-        if resume is not None:
-          self.load_state_dict(state)
-        elif (
-          self.rounds != state["rounds"]
-          or self.runner._dynamics.model_version != state["learner"]["model_version"]
-        ):
-          raise ValueError("Active training state differs from the output checkpoint")
+        with Path(source).open("rb") as stream:
+          state = torch.load(stream, map_location=self.runner.device, weights_only=True)
+          self._check_checkpoint_version(state)
+          missing = self._missing_metric_bytes(metrics_path, state)
+          if resume is not None:
+            self.load_state_dict(state)
+          elif (
+            self.rounds != state["rounds"]
+            or self.runner._dynamics.model_version != state["learner"]["model_version"]
+          ):
+            raise ValueError("Active training state differs from the output checkpoint")
+          if not occupied:
+            # Fork the exact bytes just loaded even if the source trainer advances.
+            with NamedTemporaryFile(dir=output, delete_on_close=False) as temporary:
+              stream.seek(0)
+              copyfileobj(stream, temporary)
+              temporary.close()
+              os.link(temporary.name, checkpoint)
+        publish_snapshot(checkpoint, state)
         if missing:
           with metrics_path.open("ab") as stream:
             stream.write(missing)
         del state
+      elif self.rounds == 0:
+        self.save(checkpoint)
+        publish_snapshot(checkpoint)
       self._output_checkpoint = checkpoint
       logs = []
       for _ in range(rounds):
         metrics = self.run_round(checkpoint)
+        publish_snapshot(checkpoint)
         row = json.dumps(metrics, sort_keys=True, allow_nan=False)
         with metrics_path.open("ab") as stream:
           stream.write((row + "\n").encode())
