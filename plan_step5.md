@@ -1,133 +1,63 @@
-# 第五步 正式评估 部署导出与三组消融
+# Step 5　整段评估协议与独立诊断
 
-**实施状态：计划，启动前修复已完成。** 本步承接 [第四步](plan_step4.md)，在现有训练、评估与播放入口上补齐实验组织、长期诊断、actor 导出及规模验收，随后开展 A/B/C 多 seed 消融。沿用 SuperMimic 与 mjlab 的评估代码；新增代码集中在 EIT 适配和实验需要的扩展。
+以 `dev_controller@675042e` 为实现基线。Step 1–4 已接通真实采集、模型拟合、随机想象、actor/critic 更新、恢复及独立仿真评估。下一步先解决长 motion 无法完成评分的问题，再判断两项简化是否足以支持闭环控制。原第五步的工作重新分配如下。
 
-## 已完成的实施基线
+| 阶段 | 承接原计划 | 进入下一阶段的条件 |
+|---|---|---|
+| Step 5　评估协议与诊断 | 第一批的快照和批量评估、第二批的默认条件诊断 | 长 clip 的成功、失败、截断可区分。一次运行可追到快照和原始 episode。过程模型、在线后验和 critic 各有独立评分 |
+| [Step 6　单 seed A/B/C 与性能](plan_step6.md) | 第四批的真实 motion pilot 及完整开销 | 在真实 MuJoCo 闭环上跑通三组、恢复并重现固定输入结果，取得当前版本的训练预算与设备开销 |
+| [Step 7　多 seed 消融与报告](plan_step7.md) | 第五批的配置锁定、训练和报告 | 固定协议下交付三组逐 seed 配对结果、原始数据和方法说明 |
+| 并行交付　ONNX actor | 第三批的部署导出 | Step 5 输入契约确定后可开始。最终导出物与 Step 7 入选 checkpoint 一一对应 |
 
-第一至第四步已实现策略输入、完整 belief 滤波、直接旋转矩阵积分与向量化 Jacobian、分阶段拟合均值和过程 covariance，以及 actor/critic 交替训练。第五步启动前又完成以下修正，后续直接复用。
+## Step 4 审阅结论
 
-| 已有能力 | 实现与使用约定 |
-|---|---|
-| 共享 EIT 推理 | [eit_inference.py](src/supermimic/runners/eit_inference.py) 提供 checkpoint 配置解码、模型加载和 `EITPolicyAdapter`；只构建推理所需模型，归一化固定 |
-| 定量评估 | [eval_eit.py](src/supermimic/scripts/eval_eit.py) 沿用 mjlab tracking evaluator 的首 episode 循环，直接调用其跟踪指标函数；从 clip 头开始，每次评估一个 motion 文件 |
-| 统计边界 | 区分失败、clip 完成、普通 timeout 和评估预算截断；预算截断保留记录，成功率为 null；没有有效评分帧时误差为 null |
-| 参考与状态时序 | 跟踪指标使用动作前评分参考和动作后物理状态，相对身体指标按当前根位姿重锚；排除已被自动 reset 替换的终止状态 |
-| 播放与在线后验 | 原 [play.py](src/supermimic/scripts/play.py) 和 [viewers.py](src/supermimic/scripts/viewers.py) 支持本地 EIT checkpoint；蓝紫 ghost 标为 `online_posterior`，显示后验均值 |
-| 生命周期 | 手动/自动 reset、clip 切换和 Start Here 刷新在线状态；纯参考帧拖动复用当前后验；可视化重启不重置真实后验或历史 |
-| 新 motion | 允许兼容的新 motion 用于评估，分别记录训练与评估内容指纹；续训继续严格检查训练 motion 身份 |
+| 组别 | 构造 actor 目标时的 R/p/v（训练 → 评估） | actor 显式 covariance | critic 输入 |
+|---|---|---|---|
+| A | 真值 → 后验均值 | 无 | 共同特权输入，1234 + dim(ξ)，无 belief |
+| B | 后验均值 → 后验均值 | 无 | 共同输入 + 12 维相对均值 + 45 维 R/p/v 边缘 covariance |
+| C | 后验均值 → 后验均值 | 每个参考帧 45 维，共 450 维，经 FiLM | 与 B 相同的 1291 + dim(ξ) 维输入和网络结构 |
 
-真实 walking 参考的 smoke 使用未训练小网络，验证首 episode 记录与失败分类。viewer 已验证真实 MuJoCo 的无窗口执行和绘图回调；实际 GUI 展示与本轮 GPU 验收仍待完成。上述修复已提交为 `b87a0cd`（`fix: share EIT inference across tracking evaluation and playback`），作为第五步编码基线。
+共同输入包括真实状态表征、基于真值的参考目标、5 帧实测历史、clip 剩余时间与 ξ。B/C 相对均值用真值机身系下的旋转 rot6d、位置差、线速度差编码。45 维是后验右局部切空间 [δθ, δρ, δν] 的 **9×9 边缘块**，包含 9 个 log std 和 36 个相关系数。C 将同一个块按 10 个参考帧分别投影为任务误差 covariance。滤波、策略起点重建及想象继续传播完整的 70×70 covariance。这个投影与跟踪目标一致，代价是 critic 无法直接区分 R/p/v 边缘相同、其他状态不确定性不同的后验。是否影响 bootstrap，要看独立回报上的误差。[critic 特征](src/supermimic/critic_inputs.py) · [actor 特征](src/supermimic/estimator_inputs.py) · [策略目标](src/supermimic/learners/belief_policy_learner.py)
 
-现有命令和统计口径见 [README_eval.md](README_eval.md#eit-定量评估和播放)。本步不重复建设 evaluator、在线滤波器或 viewer。
+每个训练 seed 固定相同的初始世界模型和 actor 共同参数。B/C critic 初值相同，C 的 FiLM 输出层从零开始。三组随后独立采集并逐轮做两阶段拟合。先用连续真值窗口和实际动作自由滚动均值模型，默认 8 帧、评分 7 个后继，优化根位置、根朝向、关节位置和关节速度的加权 MSE。再冻结均值与归一化，用训练集中全部有效真实相邻帧计算 70 维右局部一步残差，以过程 NLL 单独训练完整 Cholesky 噪声头。该设计省去了模型拟合时反传穿过整段滤波器的开销，策略梯度仍穿过冻结模型和滤波器。均值存在系统误差时，零均值噪声头会吸收残差偏差的二阶矩。一步 NLL 的下降需要和长时后验校准分别验证。[两阶段实现](src/supermimic/learners/two_stage_wm.py) · [模型拟合与 replay](plan_step3.md)
 
-## 实验定义和结论边界
+`train_belief` 默认用七字段 model replay，`train_eit` 要求 full replay，以录下的动作、测量和片段先验重建后验。当前格式为 `eit_training_v3`、`eit_initialization_v3`，策略存档使用 `eit_rpv_belief_critic_v2`。v3 已有两个入口各两轮并恢复第三轮的 CPU 记录、RTX 5090 上默认均值网络的模型拟合记录及 757 项历史回归。v3 记录中两个入口各有一次四步评估，两次均在预算处截断，成功率为空。较早 v2 有 B 组默认 GPU 联合训练从第 10 轮恢复到第 11 轮的记录。当前单 clip evaluator、共享在线推理和无窗口播放可以直接复用。[版本校验](src/supermimic/runners/run_config.py) · [v3 验收](docs/validation/model_replay_v3.json) · [两阶段历史验收](docs/validation/two_stage_world_model.json) · [现有命令](README_eval.md#eit-定量评估和播放)
 
-| 组别 | 训练 actor 的 R/p/v 来源 | 评估 actor 的 R/p/v 来源 | actor covariance 路径 | critic |
-|---|---|---|---|---|
-| A | 潜在真值 | 后验均值 | 无，FiLM 旁路 | 共同特权输入，不含 belief |
-| B | 后验均值 | 后验均值 | 无，FiLM 旁路 | 共同输入、12 维 R/p/v 后验均值编码与 45 维 9×9 边缘 covariance 编码 |
-| C | 后验均值 | 后验均值 | 450 维任务 covariance 编码与 FiLM | 与 B 相同的输入和结构 |
+实验解释沿用既定分组。B−A 包含训练 actor 改用估计状态及 critic 获得 RPV belief 两项变化。C−B 衡量相同 critic 设计下，显式任务 covariance、参考信息路径及额外 FiLM 参数的整体增益。各组独立学习后，采集分布与模型权重也会分化。这三组可回答控制方案比较。判定“两阶段优于联合后验 NLL”或“RPV 优于完整 critic”需要单独的对照实验。
 
-按 [第四步 RPV critic 修订](plan_step4.md#rpv-critic-输入修订2026-11-20)，B/C 总输入为 `1291 + dim(ξ)`，仅追加 R/p/v 后验均值与 `[δθ, δρ, δν]` 的 9×9 边缘 covariance；保留该块内全部交叉项。完整滤波和 replay 策略起点仍使用 70 维 belief。三组均使用 `eit_rpv_belief_critic_v2` 契约加载共同初始化包和联合训练 checkpoint。批量评估与播放也在加载 checkpoint 时检查其中的 critic 契约。
+## Step 5　先让评估能回答实验问题
 
-每个训练 seed 使用一份显式共同初始化包：世界模型和 actor 共同权重一致，B/C critic 初值一致，C 的 FiLM 输出层零初始化。加载后三组独立采集与训练，不共享活动参数或后验。每轮用真实窗口拟合预测均值，再用同一训练集内的全部一步残差拟合过程 covariance。
+### 5.1 修正整段 motion 的终止协议
 
-B−A 衡量训练目标采用估计状态、同时为 critic 增加 belief 信息的整体收益。C−B 衡量相同 critic 设计下任务 covariance 编码与 FiLM 的增量收益；该分支包含额外参数和目标信息路径，不能解释为排除了这些因素的纯 uncertainty 因果效应。主实验保持三组。
+现有 `eval_eit.evaluate()` 使用训练任务配置，每步 0.02 s，含普通 10 s timeout。当前本地 40 个 50 Hz 文件长度为 5,109–13,656 帧，`walk1_subject1.npz` 有 13,066 帧。即使零物理失败，从片头开始也会在第 500 步先收到 timeout。现有成功定义只把 `clip_complete` 计为成功，直接以此选模会使全部候选的完成率都为零。[单 clip 评估](src/supermimic/scripts/eval_eit.py) · [环境配置](src/supermimic/tasks/env_cfgs.py) · [末帧终止](src/supermimic/motion_command.py)
 
-pilot 使用独立 rollout 的实测回报检验 RPV critic 的价值预测误差，记录 bootstrap 对 actor 目标的贡献。
+为正式评估增加单独版本的**整段协议**。构建评估环境时仅调整普通时间上限，使它严格晚于该文件最后一个合法评分动作。保留物理失败项、原 reset/域随机化、首帧起点、逐文件首 episode 以及末帧奖励。直接切到 play 配置会连带改变初始扰动。结果记录协议版本、控制周期、clip 帧数、实际 timeout 和外部步数预算。原有 10 s 协议与带 `--steps` 的 smoke 各自标记。若另报固定时长存活率，分母和时间窗单列。
 
-当前模拟评估的 episode 起点使用带噪真值 prior，context 使用已知仿真参数。这是三组共同的初始化和参数知识条件。只有本体感知的长期在线结果应报告位置、朝向和速度漂移；不能以片段重新初始化后的短窗口结果代替连续在线表现。
+验收用超过 500 帧且可控无失败的轨迹，分别验证原协议触发 timeout、整段协议在片尾计一次成功。再覆盖中途失败、物理失败与片尾同帧、外部预算提前耗尽、首步失败无可评分帧。终止动作计入回报和长度。已被 auto-reset 替换的状态不进跟踪误差。预算截断保留原始记录，所在评估的完成率为 null，正式选模要求预定 episode 均有结果。用一个本地真实 motion 核对环境实际时限和终止原因。
 
-## 分批实施
+### 5.2 固定候选快照、场景清单和选模规则
 
-**第一批：组织可复现的评估清单、checkpoint 和结果汇总。**
+1. 在输出目录的训练锁内，用当轮已原子写入 `training.pt` 的同一份内容发布按实采帧数索引的不可变快照。索引包含内容摘要、轮次、均值、covariance、actor、critic 的实际更新步数、模型指纹和共同初始化指纹。保留已有原子替换及 `metrics.jsonl` 断点修复。中断后补登记同一快照，拒绝同键异内容。[训练保存](src/supermimic/runners/belief_training.py) · [联合存档](src/supermimic/runners/eit_training.py)
+2. 每个训练 seed 以固定的生成组和配置预先生成一份 v3 共同初始化包，三组显式引用同一指纹。批量入口读取存档内容并检查 group、`stage=policy`、`replay_mode=full`、critic 契约、非空初值指纹和实际训练步数。现有 evaluator 也能读取固定 actor 的 `stage=model` 存档，该类型仅进入模型诊断。评估在独立进程调用现有 `evaluate()`，使评估的设 seed 操作与训练 RNG 隔离。[训练入口](src/supermimic/scripts/train_eit.py) · [推理加载](src/supermimic/runners/eit_inference.py)
+3. 每个场景固定原始 motion 文件及摘要、加载后的 motion digest、评估 seed、环境数、episode 数、时限、扰动和初始 prior 条件。逐文件从片头运行，用快照摘要、场景与协议摘要作任务键，再按 episode 槽位去重。为训练、选模和最终测试分别划清清单。仅研究已见 motion 时用独立评估 seed。报告跨 clip/subject 泛化时按 clip/subject 预先留出，核对训练实际展开的文件列表。模型内部的 `episode_id % validation_stride` 只服务于拟合验证。
+4. 第 0 轮单列为未训练基线。对已训练的候选，在验证集先按 clip 等权的整段完成率选模，同分比较平均有效进度，再比较 MPKPE，仍同分选较早快照。进度直接取首 episode 的 `length / reference_steps`，其中 `length` 含终止动作，同时保留失败原因。早期所有策略都跌倒时，进度仍能区分表现。无有效误差帧时将 MPKPE 记为空，不能以零胜出。选定的每组每 seed 快照用于全部测试条件。
 
-复用 `train_eit`、`eval_eit.evaluate()`、`EITTraining` 和现有 JSON 输出，增加薄的批量调度与汇总入口。评估清单记录 group、训练 seed、评估 seed、共同初值指纹、checkpoint 身份、motion 列表、每个 clip 的 episode 数，以及实际环境覆盖项。已有 `runner_config`、模型配置和 motion digest 继续作为配置来源；新增配置只覆盖实验组织所需字段。
+验收覆盖同轮快照和 `training.pt` 的字节摘要、恢复写入和重试去重、缺失/失败任务、model-stage 误入正式排名、同分且早期全失败的候选。用不同长度的人工轨迹手算并核对聚合。每个 episode 内先按有效帧平均，clip 内各 episode 等权，每个训练 seed 内各 clip 等权。记录每个指标的有效样本数。选模程序只读验证结果，任何待补任务都须在报告中可见。
 
-先完成训练 motion 上的独立 episode 评估。需要研究泛化时，另行固定 train/validation/test 的 clip 或 subject 划分，写入清单；当前 `episode_id % stride` 留出只属于模型训练内部验证。多 clip 通过逐文件调用现有 evaluator 完成，每个文件均从自身第 0 帧开始，不能把拼接 motion 的全局第 0 帧当成全部 clip 的起点。
+### 5.3 分别验证过程模型、在线后验和 RPV critic
 
-`training.pt` 保持最新续训 checkpoint 的职责，保留现有文件锁、原子替换和日志恢复约定。在指定轮次或采集帧数保存额外的不可变快照，记录对应轮次、实际采集帧数和 optimizer 步数；快照复用同一次完整保存的状态，避免额外取样或改变 RNG。验证集按预先固定的规则选择 checkpoint，选定后用于全部测试条件，测试集不参与选模。第一版可采用“验证集 clip 完成率优先，同分比较跟踪误差，仍同分选较早 checkpoint”的规则；无有效误差样本时不能以零误差胜出。
+| 对象 | 数据与实施 | 验收重点 |
+|---|---|---|
+| 过程模型 | 在固定、独立的 MuJoCo 状态/动作/ξ 记录上，对各冻结模型使用相同窗口和一步对。报告四组多步 MSE、R/p/v 一步有符号偏差、过程 NLL、白化残差 L⁻¹r 的均值和二阶矩，注明窗口和转移数。保留各组自身训练与验证日志 | 已知有偏均值和含交叉项的高斯残差能被分辨。短片段只有有效一步对时仍计入过程 NLL。核对 reset 两侧的帧和缺失后继的帧没有被配成转移 |
+| 在线后验 | 在 `policy.act` 后读取 actor 当前使用的测量和已提交后验，按经过时间给出旋转、位置、速度误差及 RPV9 的校准。例如用 e = local_error(后验均值, 真值) 的前 9 维和同帧 Σ₉ 检查 95% 椭球经验覆盖率。同时报告 innovation、jitter、在该时间段仍存活的 episode 数 | 同一条连续记录分块或整段打分一致。用可手算的相关 covariance 检查二次型，用合成高斯样本检查经验覆盖率。遇到半正定块记录有效秩与零方差方向的违规。开启和关闭诊断须产生相同的逐帧动作、后验、归一化与 RNG 状态。若真实闭环过早失败，在固定连续记录上补测漂移并单列 |
+| RPV critic | 离线加载被评估快照的冻结 critic 和归一化，复用共同特征 builder，从独立 episode 的动作前真值、真值目标、实测历史、片尾剩余时间、ξ 及该帧后验构造输入。用同一 γ 和逐步奖励计算到物理失败/片尾的折扣回报，记录各检查点所用的 V（包括 bootstrap 的取值上限），报告折扣回报预测的偏差、MAE、RMSE 和样本数。A 的真值输入训练策略与后验输入部署策略分别标记。B/C 直接在其后验策略上评分 | 手算含终止奖励的短轨迹。删失样本单列。当前训练解释方差来自同批 λ-target，评估 JSON 的 episode return 是未折扣总和，均不能直接作此对照。物理轨迹用硬终止，想象目标用 soft survival。若出现偏差，再从同一起点按训练的输入和 survival 规则生成独立长想象回报，对照模型与 critic 各自的误差 |
 
-结果按 clip 内 episode、clip、训练 seed 分层汇总，三组使用相同 clip 权重。记录成功率、回报、长度、原有跟踪误差，以及失败、timeout、截断和无有效误差样本的数量。沿用每个 episode 内平均、episode 间等权的指标定义；同时展示失败统计，避免把较短的存活片段误差解释为整体控制优势。批量结果以 checkpoint/clip/seed 的组合标识去重，失败任务保留错误状态，不生成伪造的成功记录。
+后验诊断沿用 evaluator 的动作前采样点。真实 reset 只初始化一次。统计分箱、暂停或输出均不能重启滤波。当前 online prior 从带噪仿真真值初始化，ξ 来自仿真上下文。模型专用 replay 缺少连续实测历史，共用轨迹应另行保存每个 episode 的初始 prior、实测序列、动作、真值、上下文与真实 episode 边界。记录其来源及划分，隔离诊断数据和拟合数据。[评估已有诊断](src/supermimic/scripts/eval_eit.py) · [共享策略适配器](src/supermimic/runners/eit_inference.py) · [provider](src/supermimic/belief_provider.py)
 
-验收：用不同长度的人工 episode 检查分层汇总；重跑和中断恢复不重复计数；快照与当轮 `training.pt` 的模型/optimizer/RNG 一致；验证选模不读取测试结果；独立评估进程不影响训练状态。已有真实新 motion 集成测试继续保留。
+Step 5 按 5.1 → 5.2 → 5.3 分三次交付。先在 `scripts/eval_eit.py` 接入时限并通过终止分类回归，再在训练保存处发布快照，增加逐文件调度和汇总入口。最后给 evaluator 增加可关闭的后验统计，同时为固定轨迹的模型/critic 评分增加离线入口。届时把实际命令写入 `README_eval.md`，并保存一个含原始记录及期望汇总的可重复样例。
 
-**第二批：增加连续后验诊断，按实验需要扩展噪声条件。**
+## 并行交付　ONNX actor 与运行时验收
 
-评估按物理块报告后验误差、边缘 covariance 覆盖率、innovation 和 jitter。训练日志另记录分组多步 MSE 与一步过程 NLL。
+在已有 exporter 增加 EIT actor wrapper，保留归一化、motion encoder、decoder 及 C 的 FiLM。输入是逐帧排列的 history (B,5,93)、已构造的 goal (B,700)，仅 C 再输入 uncertainty (B,450)，输出限幅前的归一化动作 (B,29)。`EITPolicyAdapter` 给 PyTorch 或 ONNX 后端同一份输入，复用测量、滤波、历史和参考构造，输出统一限幅一次后映射至物理动作。元数据记录动作顺序/映射、特征编码、组别、对应 actor 和 world model 身份。[导出入口](src/supermimic/runners/exporter.py) · [在线动作执行](src/supermimic/runners/eit_inference.py)
 
-诊断消费 actor 实际使用的同一测量和后验，不重新采样、不额外 correct、不更新统计。整段 episode 连续运行，仅真实 reset 时初始化；时间分箱和日志输出不得触发片段 prior 重建。按经过时间报告误差和校准指标，同时记录每个时间区间仍有观测的 episode 数，避免把早期失败轨迹的缺失当作误差下降。
-
-先验证默认 checkpoint 条件。若策略早期失败，使用固定连续状态/动作/测量记录补充滤波器长时诊断，明确区分记录序列的估计实验和真实控制闭环结果。
-
-噪声及 prior 失配属于本批可选实验扩展：仅在开展对应实验时，增加实际传感采样分布与滤波器 V 的独立覆盖项，以及初始均值误差与初始 covariance 的独立配置。默认路径精确复现 checkpoint；覆盖项单独记录，不静默改写保存的训练语义。至少区分默认匹配、实际噪声与 V 同步变化、仅实际噪声变化三种条件。
-
-现有相同 seed 只保证首次 reset/测量条件可复现。需要严格配对噪声实验时，再增加按场景编号和 episode 时间索引的随机流，明确记录实际 reset/prior/测量扰动；不能宣称现有全局 seed 已保证不同失败时间后的全程配对。这项扩展不阻塞默认条件下的主消融。
-
-验收：与独立连续滤波参考比较分块及整段结果；日志开关不改变动作、后验、归一化或 RNG；覆盖率在可手算分布上正确；实现失配覆盖时检查实际采样方差、滤波器 V 和输出标签分别符合配置。
-
-**第三批：复用现有 exporter 导出 EIT actor。**
-
-在 [exporter.py](src/supermimic/runners/exporter.py) 中增加 EIT wrapper，复用现有导出和 metadata 工具。保留 legacy 导出格式。首版 EIT 图只覆盖归一化、motion encoder、decoder 和 C 的 FiLM。
-
-| 导出输入或输出 | 形状与语义 |
-|---|---|
-| `history` | B×5×93，时间从旧到新；直接使用 EIT 的逐帧布局 |
-| `goal` | B×700，已由共享 builder 用后验均值构造 |
-| `uncertainty`，仅 C | B×450，既有任务 covariance 编码 |
-| `action` | B×29，限幅前的归一化动作 |
-
-滤波、历史维护、参考对齐和几何特征仍由共享 EIT 运行时完成。为 `EITPolicyAdapter` 增加最小的 actor 执行后端接口，使 PyTorch 和 ONNX 消费同一份输入；动作限幅继续在适配层执行一次，随后使用既有物理 scale/offset。metadata 保存组别、输入布局/编码版本、动作顺序及映射、归一化和模型身份。导出文件表示 actor，不宣称包含完整估计闭环或实机初始化。
-
-验收先用 batch=1、CPU float32，比对 A/B/C 的原始动作和最终执行动作。覆盖正常状态、较大 covariance、非零 FiLM、限幅以及 reset 后的输入；C 的响应测试应使用离开零输出初始化的权重。再在同一批已记录输入上比较 ONNX Runtime 与 PyTorch，并用共享运行时做短闭环。以动作逐帧一致性作为数值验收，长期物理轨迹仅作容差内诊断。实际目标设备及 batch 支持在导出元数据中明确。
-
-ONNX 批次可与后续 PyTorch 性能和训练实验并行，不作为主消融的运行依赖。
-
-**第四批：测量完整开销并完成单 seed 真实运动 pilot。**
-
-扩展既有 `benchmark.py` / `check_eit_scale.py`，接入共享适配层和完整轮次计时，使用真实历史与在线滤波。分别报告物理采集、前缀重建、模型更新、策略 rollout/反向、critic 回归、保存及整轮开销。覆盖默认网络宽度、滤波器完整 70 维 covariance、critic 的 12+45 维 RPV belief 输入、实际 episode 前缀长度，以及 batch、K、H 和 microbatch 的变化。critic 降维只减少其特征与网络开销，完整滤波和 Jacobian 的计算仍须计入。
-
-在线路径测量“测量/滤波—特征构造—actor—动作限幅”的完整延迟，记录均值、p95/p99、峰值内存和持续运行后的保留内存。保存设备、dtype、线程、预热、重复次数和 CUDA 同步方式；PyTorch 分配与进程/驱动总占用分开报告。对 50 Hz 控制周期给出相对 20 ms 的余量或超时情况，actor 单独推理时间不代表完整控制周期。
-
-优先使用现有 eager 路径。模型内容哈希、参考摘要或 Python 校验等只有在 profile 显示为瓶颈时再优化；优化后保留版本失效和缓存一致性测试。`no_grad()` 下的在线推理仍需要局部 Jacobian，继续保留现有 inference-mode 适配与防护。
-
-pilot 使用真实运动参考，从每组同一共同初值开始。起始参数沿用第四步的工程配置：
-
-| 参数 | pilot 起始值 |
-|---|---|
-| 模型学习 | 均值每轮 10 批，每批 2048 个 8 帧窗口。covariance 每批 256 对，打乱遍历一次 |
-| 策略学习 | N=4、K=2、H=4、microbatch=2，每轮 1 次 actor 更新和 2 个 critic epoch |
-| 真实采集 | 8 环境、每轮 64 步、buffer=128 |
-| 网络 | 均值 2048³、噪声 (128,64)、actor (2048,1024,512,256)、critic (256,128) |
-
-先运行 10 轮检查持续更新、保存恢复和实际闭环评估，再依据性能与学习曲线延长训练或统一调整工程配置。该轮数是排错起点，不作为收敛标准。主要监控真实控制指标、均值 MSE、过程 NLL 与校准、动作限幅、FiLM 尺度、bootstrap 占比及各阶段梯度，检查想象回报与真实回报的偏离。
-
-验收：持续更新无旧图积累，实际更新预算与日志一致，恢复后能继续收集和优化；默认宽度 CPU/GPU 分别保存实测结果。GPU 验收记录本次运行的 critic 输入契约与源码指纹。GUI 展示在可用显示环境下检查暂停、单步、clip、Start Here 及 `online_posterior` 标签。
-
-**第五批：锁定配置，运行多 seed 消融并形成报告。**
-
-根据 pilot 确定统一训练预算与工程配置，固定训练/验证/测试清单、评估次数、checkpoint 选择规则、主要指标和报告方式，再运行正式 A/B/C。优先按真实采集帧数和 optimizer 更新数对齐预算，并单列耗时、显存和 actor 参数量；三组分别使用各自数据和模型。
-
-建议先完成 3 个训练 seed 检查实验方差和失败模式，再扩展至至少 5 个训练 seed。每个 seed 的 A/B/C 使用同一初始化包及相同评估清单。完整保存单次 episode、单 clip 和单 seed 结果；以训练 seed 为独立重复单位报告均值和不确定区间，并报告 B−A、C−B 的逐 seed 差值。不能把同一策略的时间步或并行环境数量当作训练重复数。若只完成少量 seed，应相应限定结论强度。
-
-主报告包括训练预算下的学习曲线、最终真实回报/完成率/跟踪误差、后验误差与校准，以及完整计算开销。区分训练 motion 上的控制表现、未见 clip/subject 泛化，以及可选的噪声/prior 失配结果。未训练模型 smoke、正常结束的程序和正向控制收益是不同验收结果；允许消融没有显著增益或存在退化，不能以要求 C 优于 B 作为工程完成条件。
-
-交付可重跑的配置、初始化/模型身份、不可变 checkpoint 索引、原始 JSON/表格、汇总脚本和独立图表。导出的 actor 与报告中对应的评估 checkpoint 一一对应，测试结果和可视化示例不得混用不同版本。
-
-## 修改位置与执行顺序
-
-| 位置 | 剩余修改 |
-|---|---|
-| `scripts/train_eit.py`、`runners/eit_training.py`、共享保存逻辑 | 周期快照、预算与评估关联；保留既有续训/日志原子性 |
-| `scripts/eval_eit.py`，拟新增薄的批量评估/汇总脚本 | 逐 clip 调度、实验清单、分层汇总、后验诊断；需要时增加噪声覆盖 |
-| `runners/eit_inference.py` | ONNX actor 执行后端；按实验需要扩展测量/prior 覆盖，复用当前生命周期 |
-| `runners/exporter.py`，拟新增 EIT 导出 CLI | EIT actor wrapper、输入/动作 metadata 和导出验证 |
-| `scripts/benchmark.py`、`scripts/check_eit_scale.py`、训练计时 | 完整在线延迟、完整轮次耗时、长前缀及内存测量 |
-| 既有 evaluator/adapter/viewer 测试及新增导出、汇总测试 | 信息权限、指标口径、后端等价、选模与快照恢复 |
-| `README_eval.md`、`README.md`、`docs/validation/` | 新命令、协议、源码指纹、CPU/GPU 验收记录及实验结果索引 |
-
-实现顺序为第一批 → 第二批默认诊断 → 第四批 pilot → 第五批正式实验；第三批 ONNX 可以独立推进。噪声失配和严格随机流配对按对应实验需要加入第二批，不阻塞默认条件主实验。
-
-各批形成独立可审阅提交，先运行受影响测试，再执行相应真实闭环验收。新增或改变训练/推理生产路径后运行完整回归；纯报告生成复核数据、汇总和图表，不重复无关训练。
-
-第五步的工程完成条件是：复用现有评估的批量实验与选模可复现，连续后验诊断正确，EIT actor 导出和完整开销通过目标设备验收。实验完成条件是：固定预算下的三组多 seed 原始结果、统计和结论边界完整交付。实现就绪不等同于已经完成正式训练，也不预设三组性能排序。
+先固定 batch=1、CPU float32，用记录输入逐帧比对三组原始及最终执行的动作，覆盖非零 FiLM、较大 covariance、限幅与 reset，然后在共享运行时完成短闭环并记录目标设备延迟。GUI 在有显示的环境验证暂停、单步、clip 切换、Start Here 和 `online_posterior`。导出验收交付 actor 图、运行时契约及对应快照。正式控制消融可直接使用 PyTorch。

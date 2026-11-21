@@ -373,6 +373,9 @@ def diagnose(
   imagined_horizon=0,
   imagined_samples=4,
   imagined_seed=2027,
+  actor_gradients=False,
+  gradient_seed=2028,
+  gradient_episodes=4,
   motion_file=None,
 ):
   if mode not in ("all", "process", "posterior", "critic"):
@@ -441,6 +444,21 @@ def diagnose(
       device,
       motion_file=motion_file,
     )
+  if actor_gradients:
+    if "critic" not in result:
+      raise ValueError("Actor gradient diagnostics require critic scoring")
+    from supermimic.imagined_diagnostics import episode_head_actor_gradients
+
+    result["actor_gradients"] = episode_head_actor_gradients(
+      saved,
+      cfg,
+      record,
+      critic[0],
+      gradient_seed,
+      device,
+      motion_file=motion_file,
+      max_episodes=gradient_episodes,
+    )
   return result
 
 
@@ -463,6 +481,13 @@ def main():
   parser.add_argument("--imagined-horizon", type=int, default=0)
   parser.add_argument("--imagined-samples", type=int, default=4)
   parser.add_argument("--imagined-seed", type=int, default=2027)
+  parser.add_argument(
+    "--actor-gradients",
+    action="store_true",
+    help="Separate reward/bootstrap actor gradients on fixed episode heads and noise",
+  )
+  parser.add_argument("--gradient-seed", type=int, default=2028)
+  parser.add_argument("--gradient-episodes", type=int, default=4)
   parser.add_argument("--output", type=Path, required=True)
   kwargs = vars(parser.parse_args())
   output = kwargs.pop("output")

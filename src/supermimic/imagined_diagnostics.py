@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
@@ -123,17 +125,39 @@ def _compare_returns(imagined, ep, physical, gamma, same_policy):
   }
 
 
-@torch.no_grad()
-def compare_episode_heads(
-  saved, cfg, record, critic_scores, horizon, samples, seed, device, *, motion_file=None
-):
+def _inference_device_view(saved, device):
+  """Move device-sensitive calibration only; loaders copy the actual weights.
+
+  Offline diagnostics load checkpoints on CPU, including large optimizer states.
+  WorldModel's joint-calibration comparison requires a tensor on the inference
+  device. A shallow view leaves the checkpoint and all optimizer tensors intact.
+  """
+  bundle = saved["world_model"]
+  metadata = bundle["estimator"]
+  return {
+    **saved,
+    "world_model": {
+      **bundle,
+      "estimator": {
+        **metadata,
+        "default_joint_pos": metadata["default_joint_pos"].to(device),
+      },
+    },
+  }
+
+
+@contextmanager
+def _episode_head_environment(saved, cfg, record, samples, device, motion_file):
+  """A private frozen model and replay for independent episode-head diagnostics."""
   motion_file = Path(motion_file or record["motion_file"])
   if file_sha256(motion_file) != record["motion_sha256"]:
     raise ValueError("Recording's reference motion changed")
   env_cfg = evaluation_env_config(motion_file, record["seed"])
   env = create_env(env_cfg, 1, device)
   try:
-    wm, actor = load_evaluation_models(env, cfg, saved, device)
+    wm, actor = load_evaluation_models(
+      env, cfg, _inference_device_view(saved, device), device
+    )
     estimator = LieBeliefFilter(
       wm.dynamics,
       cfg.estimator_inputs.measurement_noise,
@@ -167,6 +191,21 @@ def compare_episode_heads(
     digest = motion_content_digest(imagined.motion)
     if digest != record["motion_digest"]:
       raise ValueError("Loaded reference differs from recording")
+    yield actor, imagined, estimator, digest
+  finally:
+    env.close()
+
+
+@torch.no_grad()
+def compare_episode_heads(
+  saved, cfg, record, critic_scores, horizon, samples, seed, device, *, motion_file=None
+):
+  with _episode_head_environment(saved, cfg, record, samples, device, motion_file) as (
+    actor,
+    imagined,
+    estimator,
+    digest,
+  ):
     generator = torch.Generator(device=device).manual_seed(seed)
     actor_source = "truth" if cfg.estimator_inputs.group == "A" else "posterior"
     same_policy = actor_source == record["actor_state_source"]
@@ -193,5 +232,70 @@ def compare_episode_heads(
       "physical_actor_state_source": record["actor_state_source"],
       "episodes": rows,
     }
-  finally:
-    env.close()
+
+
+def episode_head_actor_gradients(
+  saved, cfg, record, critic, seed, device, *, motion_file=None, max_episodes=4
+):
+  """Training-input actor gradients at independently recorded physical heads.
+
+  Noise comes from a private seeded generator. The saved policy's H, K and
+  microbatch schedule are retained; available episode heads determine N.
+  """
+  from supermimic.actor_gradient_diagnostics import actor_objective_gradients
+  from supermimic.learners.belief_policy_learner import (
+    BeliefActorCriticPolicyLearner,
+    BeliefPolicyLearnerCfg,
+  )
+
+  if type(max_episodes) is not int or max_episodes < 1:
+    raise ValueError("Gradient diagnostics need positive max_episodes")
+  policy_cfg = BeliefPolicyLearnerCfg(**saved["policy_config"])
+  selected = record["episodes"][:max_episodes]
+  device = torch.device(device)
+  devices = (
+    [device.index if device.index is not None else torch.cuda.current_device()]
+    if device.type == "cuda"
+    else []
+  )
+  with (
+    torch.random.fork_rng(devices=devices),
+    _episode_head_environment(
+      saved, cfg, record, policy_cfg.num_samples, str(device), motion_file
+    ) as (actor, imagined, estimator, digest),
+  ):
+    learner = BeliefActorCriticPolicyLearner(actor, critic, imagined, policy_cfg)
+    # The diagnostic must use the actual saved actor objective even if a later
+    # environment version changes the nominal maximum reward.
+    if policy_cfg.value_clipping:
+      cap = saved["policy"].get("bootstrap_value_cap", learner._v_max)
+      if not isinstance(cap, (int, float)) or not math.isfinite(cap) or cap <= 0:
+        raise ValueError("Invalid saved bootstrap value cap")
+      learner._v_max = float(cap)
+    generator = torch.Generator(device=device).manual_seed(seed)
+    with torch.no_grad(), imagined.readonly_policy_motion():
+      starts = BeliefRolloutStart.cat(
+        [_head(ep, imagined, estimator, digest) for ep in selected]
+      )
+      parameter = next(actor.parameters())
+      noises = [
+        torch.randn(
+          policy_cfg.horizon,
+          len(starts),
+          policy_cfg.num_samples,
+          width,
+          dtype=parameter.dtype,
+          device=device,
+          generator=generator,
+        )
+        for width in (70, 64)
+      ]
+    result = actor_objective_gradients(learner, starts, *noises)
+  return {
+    "seed": seed,
+    "start_source": "independent_recorded_episode_heads",
+    "episode_ids": [ep["env_id"] for ep in selected],
+    "start_frames": [ep["start_frame"] for ep in selected],
+    "actor_state_source": "truth" if cfg.estimator_inputs.group == "A" else "posterior",
+    **result,
+  }

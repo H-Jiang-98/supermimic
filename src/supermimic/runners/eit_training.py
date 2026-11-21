@@ -38,6 +38,7 @@ from supermimic.runners.supermimic_runner import (
   build_actor,
   load_actor_checkpoint,
 )
+from supermimic.utils.profiling import PhaseTimer
 
 
 @dataclass(frozen=True)
@@ -115,12 +116,30 @@ class EITTraining(BeliefModelTraining):
   ) -> BeliefRolloutStart | None:
     """Filter each requested episode once, normalizing fresh rows and keeping sampled Q0s."""
     env = self.runner.wm_env
-    if len(frames) == 0:
-      if policy_keys is None:
-        return None
-      return env.prepare_policy_starts(*policy_keys.unbind(dim=1))
+    if len(frames) == 0 and policy_keys is None:
+      return None
     fresh = torch.stack((frames["episode_id"], frames["time_index"]), dim=1)
     requested = fresh if policy_keys is None else torch.cat((fresh, policy_keys))
+    # Rebuilding uses the retained segment head, which may follow a ring overwrite.
+    retained = self.runner.replay_buffer.retained_frames(
+      fields=("episode_id", "time_index")
+    )
+    head_times = {}
+    for episode, time in zip(
+      retained["episode_id"].tolist(), retained["time_index"].tolist(), strict=True
+    ):
+      head_times[episode] = min(head_times.get(episode, time), time)
+    tails = {}
+    for episode, time in requested.tolist():
+      tails[episode] = max(tails.get(episode, time), time)
+    lengths = [time - head_times[episode] + 1 for episode, time in tails.items()]
+    self._prefix_budget = {
+      "posterior_prefix_episodes": len(lengths),
+      "posterior_prefix_frames": sum(lengths),
+      "posterior_prefix_length_min": min(lengths),
+      "posterior_prefix_length_max": max(lengths),
+      "posterior_prefix_length_mean": sum(lengths) / len(lengths),
+    }
     fresh_keys = {tuple(key) for key in fresh.tolist()}
     draw_order = (
       [] if policy_keys is None else [tuple(key) for key in policy_keys.tolist()]
@@ -179,6 +198,8 @@ class EITTraining(BeliefModelTraining):
 
   def _update_policy(self) -> dict:
     runner = self.runner
+    timer = PhaseTimer(runner.device)
+    actor_before, critic_before = self.policy.actor_steps, self.policy.critic_steps
     # A singleton fragment still supplies a policy start.
     policy_ids = [
       episode
@@ -190,9 +211,27 @@ class EITTraining(BeliefModelTraining):
       fresh_train = self._fresh_training_frames(
         self.cfg.collection_steps, ("time_index",)
       )
-      starts = self.update_input_normalization(fresh_train, policy_keys)
+      with timer.measure("posterior_prefix_normalization_seconds"):
+        starts = self.update_input_normalization(fresh_train, policy_keys)
       assert starts is not None
       policy_logs = self.policy.update_prepared(starts)
+    self._policy_profile = {**timer.seconds, **self.policy.last_profile}
+    self._policy_budget = {
+      **getattr(self, "_prefix_budget", {}),
+      "actor_updates": self.policy.actor_steps - actor_before,
+      "critic_updates": self.policy.critic_steps - critic_before,
+      "policy_starts_drawn": len(starts),
+      "imagined_steps": float(policy_logs["Policy/valid_steps"])
+      * self.policy.cfg.num_batches,
+      "survival_weighted_imagined_steps": float(
+        policy_logs["Policy/survival_weighted_steps"]
+      )
+      * self.policy.cfg.num_batches,
+      "policy_n": self.policy.cfg.batch_size,
+      "policy_k": self.policy.cfg.num_samples,
+      "policy_h": self.policy.cfg.horizon,
+      "policy_microbatch": self.policy.cfg.microbatch_size,
+    }
     runner.wm_env.clear_rollout()
     return {
       "critic_version": parameter_digest(self.policy.critic),

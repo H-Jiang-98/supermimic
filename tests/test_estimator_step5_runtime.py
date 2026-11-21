@@ -57,6 +57,53 @@ def test_anisotropic_gaussian_ellipsoids_keep_all_positive_variances(
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_strongly_correlated_gaussian_ellipsoids_keep_positive_modes(dtype):
+  covariance = torch.full((9, 9), 1 - 5e-6, dtype=dtype)
+  covariance.diagonal().fill_(1)
+  factor = torch.linalg.cholesky(covariance.double())
+  noise = torch.randn(
+    10000, 9, dtype=torch.double, generator=torch.Generator().manual_seed(42)
+  )
+  error = (noise @ factor.T).to(dtype)
+  # An independent full-rank solve also accounts for error rounded to float32.
+  white = torch.linalg.solve_triangular(factor, error.double().T, upper=False)
+  expected_distance = white.square().sum(0)
+
+  distance, rank, violation, covered = rpv_ellipsoid(
+    error, covariance.expand(len(error), -1, -1)
+  )
+
+  assert (rank == 9).all()
+  assert not violation.any()
+  torch.testing.assert_close(distance, expected_distance, atol=1e-8, rtol=1e-8)
+  assert torch.equal(covered, expected_distance <= 16.918978)
+  assert covered.double().mean().item() == pytest.approx(0.95, abs=0.015)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_small_positive_modes_and_true_null_directions_in_one_batch(dtype):
+  covariance = torch.full((4, 9, 9), 1 - 5e-6, dtype=dtype)
+  covariance.diagonal(dim1=-2, dim2=-1).fill_(1)
+  covariance[1:3, 8, :] = 0
+  covariance[1:3, :, 8] = 0
+  covariance[3] = 0
+  error = torch.zeros(4, 9, dtype=dtype)
+  error[:3, 0], error[:3, 1] = 0.002, -0.002
+  error[2, 8] = 1e-30
+  # [a, -a, 0, ...] is an eigenvector with eigenvalue 1 - correlation.
+  expected_distance = 2 * error[:, 0].double().square() / (
+    1 - covariance[:, 0, 1].double()
+  )
+
+  distance, rank, violation, covered = rpv_ellipsoid(error, covariance)
+
+  torch.testing.assert_close(distance, expected_distance, atol=1e-8, rtol=1e-8)
+  assert rank.tolist() == [9, 8, 8, 0]
+  assert violation.tolist() == [False, False, True, False]
+  assert covered.tolist() == [True, True, False, True]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_anisotropic_degenerate_support_and_zero_variance_errors(dtype):
   direction = torch.tensor([1.0, 1e-4] + [0.0] * 7, dtype=dtype)
   covariance = torch.outer(direction, direction).expand(4, -1, -1)

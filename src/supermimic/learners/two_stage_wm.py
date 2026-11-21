@@ -15,6 +15,7 @@ from supermimic.models import Dynamics
 from supermimic.replay_buffer import ReplayBuffer
 from supermimic.representations import StateRepresentation
 from supermimic.utils.lie_state import LieState, local_error
+from supermimic.utils.profiling import PhaseTimer
 
 
 @dataclass(frozen=True)
@@ -188,6 +189,9 @@ class TwoStageWorldModelLearner:
     staged_normalizers=None,
   ) -> tuple[dict, dict]:
     cfg, cov = self.mean_cfg, self.cov_cfg
+    timer = PhaseTimer(next(self.dynamics.parameters()).device)
+    self.last_profile = timer.seconds
+    mean_before, cov_before = self.mean_steps, self.cov_steps
     windows, valid_windows, pairs, held_out = replay.model_fit_starts(
       train_ids, valid_ids, cfg.window_frames
     )
@@ -209,35 +213,43 @@ class TwoStageWorldModelLearner:
     if staged_normalizers is not None:
       self._commit_normalization(staged_normalizers)
     try:
-      updates = [
-        self.update_mean(sample(windows, cfg.batch_size))
-        for _ in range(cfg.num_batches)
-      ]
+      with timer.measure("mean_rollout_update_seconds"):
+        updates = [
+          self.update_mean(sample(windows, cfg.batch_size))
+          for _ in range(cfg.num_batches)
+        ]
       train = {
         key: float(torch.stack([u[key] for u in updates]).mean()) for key in updates[0]
       }
       train["mean_windows"] = cfg.num_batches * cfg.batch_size
+      train["available_mean_windows"] = len(windows)
+      train["mean_updates"] = self.mean_steps - mean_before
       self.dynamics.eval().requires_grad_(False)
       self.dynamics.zero_grad(set_to_none=True)
 
       # Only these detached inputs and targets survive the extraction pass.
-      data = torch.cat(
-        [
-          self.residual_data(replay.model_windows(chunk, 2))
-          for chunk in pairs.split(cov.batch_size)
-        ]
-      )
+      with timer.measure("residual_extraction_seconds"):
+        data = torch.cat(
+          [
+            self.residual_data(replay.model_windows(chunk, 2))
+            for chunk in pairs.split(cov.batch_size)
+          ]
+        )
       total = data["residual"].new_zeros((), dtype=torch.float64)
-      for _ in range(cov.epochs):
-        order = torch.randperm(len(data), device=pairs.device)
-        for indices in order.split(cov.batch_size):
-          total += self.update_covariance(data[indices]).double() * len(indices)
+      with timer.measure("covariance_fit_seconds"):
+        for _ in range(cov.epochs):
+          order = torch.randperm(len(data), device=pairs.device)
+          for indices in order.split(cov.batch_size):
+            total += self.update_covariance(data[indices]).double() * len(indices)
       train["cov_pairs"] = len(data)
+      train["cov_pair_draws"] = len(data) * cov.epochs
+      train["cov_updates"] = self.cov_steps - cov_before
       train["Loss/process_nll"] = float(total / (len(data) * cov.epochs))
 
-      with torch.no_grad():
+      with torch.no_grad(), timer.measure("model_validation_seconds"):
         validation = {
-          "mean_windows": validation_batch_size if len(valid_windows) else 0
+          "mean_windows": validation_batch_size if len(valid_windows) else 0,
+          "available_mean_windows": len(valid_windows),
         }
         if len(valid_windows):
           loss, groups = self.mean.batch_loss(

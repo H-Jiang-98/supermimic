@@ -42,10 +42,15 @@ def rpv_ellipsoid(error, covariance):
   matrix = matrix / scale.unsqueeze(-1) / scale.unsqueeze(-2)
   standardized_error = (error.double() / scale).masked_fill(zero_variance, 0)
   values, vectors = torch.linalg.eigh(matrix)
-  tolerance = values.abs().amax(-1, keepdim=True) * (9 * eps)
-  if (values < -tolerance).any():
+  spectral_scale = values.abs().amax(-1, keepdim=True)
+  # Allow negative roundoff from the stored covariance's precision, but resolve
+  # positive modes at the float64 working precision. A small positive variance
+  # is not a deterministic constraint, even for strongly correlated float32 data.
+  negative_tolerance = spectral_scale * (9 * eps)
+  if (values < -negative_tolerance).any():
     raise ValueError("Indefinite RPV covariance")
-  positive = values > tolerance
+  rank_tolerance = spectral_scale * (9 * torch.finfo(values.dtype).eps)
+  positive = values > rank_tolerance
   rank = positive.sum(-1)
   coords = (vectors.mT @ standardized_error.unsqueeze(-1)).squeeze(-1)
   distance = (coords.square() / torch.where(positive, values, 1) * positive).sum(-1)

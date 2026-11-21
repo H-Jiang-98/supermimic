@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import replace
 from pathlib import Path
 
@@ -100,6 +101,7 @@ class EITPolicyAdapter:
     *,
     truth_actor=False,
     actor_backend: Callable[[TensorDict], torch.Tensor] | None = None,
+    phase_timer: Callable[[str], AbstractContextManager] | None = None,
   ):
     if cfg.estimator_inputs is None or cfg.estimator_inputs.mode != "eval":
       raise ValueError("EIT policy adapter requires estimator_inputs.mode='eval'")
@@ -121,6 +123,7 @@ class EITPolicyAdapter:
       else cfg.estimator_inputs
     )
     self.actor_backend = actor_backend if actor_backend is not None else actor
+    self.phase_timer = phase_timer
     self.actor.eval()
     self.wm.dynamics.eval()
     self.command = env.unwrapped.command_manager.get_term("motion")
@@ -148,6 +151,10 @@ class EITPolicyAdapter:
     self._actions: torch.Tensor | None = None
     self._reference_key: tuple[torch.Tensor, ...] | None = None
 
+  def _phase(self, name: str):
+    """Optional benchmark instrumentation; absent in normal control/evaluation."""
+    return nullcontext() if self.phase_timer is None else self.phase_timer(name)
+
   def _observation(self, obs=None) -> TensorDict:
     if obs is None:
       obs = self.env.get_observations()
@@ -170,18 +177,19 @@ class EITPolicyAdapter:
 
   @torch.no_grad()
   def reset(self, obs=None) -> None:
-    current = self._observation(obs)
-    sensor = self.wm.representation.add_proprio_noise(current["actor"])
-    self.provider.clear()
-    self.history = sensor[:, None].repeat(1, self.cfg.history_length, 1)
-    slots = torch.arange(self.num_envs, device=self.device)
-    self.episode_id = (
-      slots if self.episode_id is None else self.episode_id + self.num_envs
-    )
-    self.time_index = torch.zeros_like(slots)
-    self._reset_mask = torch.ones_like(slots, dtype=torch.bool)
-    self._obs, self._actions, self.last_inputs = current, None, None
-    self._reference_key = None
+    with self._phase("measurement_history"):
+      current = self._observation(obs)
+      sensor = self.wm.representation.add_proprio_noise(current["actor"])
+      self.provider.clear()
+      self.history = sensor[:, None].repeat(1, self.cfg.history_length, 1)
+      slots = torch.arange(self.num_envs, device=self.device)
+      self.episode_id = (
+        slots if self.episode_id is None else self.episode_id + self.num_envs
+      )
+      self.time_index = torch.zeros_like(slots)
+      self._reset_mask = torch.ones_like(slots, dtype=torch.bool)
+      self._obs, self._actions, self.last_inputs = current, None, None
+      self._reference_key = None
 
   @torch.no_grad()
   def act(self, obs=None) -> torch.Tensor:
@@ -193,85 +201,94 @@ class EITPolicyAdapter:
         raise ValueError("New observation requires advance() or reset() before act()")
     assert self._obs is not None and self.history is not None
     assert self._reset_mask is not None
-    representation = self.wm.representation
-    context = self.wm.sim_context.read(self.env.unwrapped)
-    # Even a cached action requires the same model and calibrated context.
-    belief = self.provider.lookup(self.episode_id, self.time_index, context)
-    alignment = self.command.reference_alignment
-    reference_key = (
-      self.command.time_steps,
-      alignment.rotation,
-      alignment.translation,
-    )
-    if (
-      self._actions is not None
-      and belief is not None
-      and self._reference_key is not None
-      and all(
-        torch.equal(value, previous)
-        for value, previous in zip(reference_key, self._reference_key, strict=True)
+    with self._phase("filter_and_jacobian"):
+      representation = self.wm.representation
+      context = self.wm.sim_context.read(self.env.unwrapped)
+      # Even a cached action requires the same model and calibrated context.
+      belief = self.provider.lookup(self.episode_id, self.time_index, context)
+      alignment = self.command.reference_alignment
+      reference_key = (
+        self.command.time_steps,
+        alignment.rotation,
+        alignment.translation,
       )
-    ):
-      return self._actions.clone()
-    state = self._obs["full_state"]
-    rep, aux = representation.represent(state), representation.extract_aux_state(state)
-    candidate = None
-    if belief is None:
-      sensor = self.history[:, -1]
-      candidate = self.provider.prepare(
-        measurement=sensor[:, :64],
-        previous_action=sensor[:, 64:],
-        reset_mask=self._reset_mask,
-        context=context,
-        episode_id=self.episode_id,
-        time_index=self.time_index,
-        reset_truth=(
-          LieState.from_rep(aux[self._reset_mask], rep[self._reset_mask])
-          if isinstance(self.provider.prior_factory, GaussianStatePrior)
-          and self._reset_mask.any()
-          else None
-        ),
+      if (
+        self._actions is not None
+        and belief is not None
+        and self._reference_key is not None
+        and all(
+          torch.equal(value, previous)
+          for value, previous in zip(reference_key, self._reference_key, strict=True)
+        )
+      ):
+        return self._actions.clone()
+      state = self._obs["full_state"]
+      rep, aux = (
+        representation.represent(state),
+        representation.extract_aux_state(state),
       )
-      belief = candidate.state.belief
+      candidate = None
+      if belief is None:
+        sensor = self.history[:, -1]
+        candidate = self.provider.prepare(
+          measurement=sensor[:, :64],
+          previous_action=sensor[:, 64:],
+          reset_mask=self._reset_mask,
+          context=context,
+          episode_id=self.episode_id,
+          time_index=self.time_index,
+          reset_truth=(
+            LieState.from_rep(aux[self._reset_mask], rep[self._reset_mask])
+            if isinstance(self.provider.prior_factory, GaussianStatePrior)
+            and self._reset_mask.any()
+            else None
+          ),
+        )
+        belief = candidate.state.belief
     # Scrubbing the reference changes goals, not the physical measured frame.
     # Reuse Q for that frame instead of fusing the same measurement a second time.
-    reference = representation.reference_window(
-      self.command.motion,
-      self.command.time_steps,
-      self.command.reference_alignment,
-    )
-    goal, uncertainty = build_actor_features(
-      self.actor_inputs,
-      representation.true_rpv(aux, rep),
-      belief.to_actor_input(),
-      reference,
-    )
-    inputs = build_actor_obs_td(
-      {"motion": goal}, self.history, task_uncertainty=uncertainty
-    )
-    actions = self.actor_backend(inputs).clamp(min=self._lower, max=self._upper)
-    if not torch.isfinite(actions).all():
-      raise ValueError("EIT actor produced non-finite actions")
-    if candidate is not None:
-      self.provider.commit(candidate)
-    self.last_inputs = inputs.detach().clone()
-    self._actions = actions.detach().clone()
-    self._reference_key = tuple(value.clone() for value in reference_key)
-    return self._actions.clone()
+    with self._phase("features"):
+      reference = representation.reference_window(
+        self.command.motion,
+        self.command.time_steps,
+        self.command.reference_alignment,
+      )
+      goal, uncertainty = build_actor_features(
+        self.actor_inputs,
+        representation.true_rpv(aux, rep),
+        belief.to_actor_input(),
+        reference,
+      )
+      inputs = build_actor_obs_td(
+        {"motion": goal}, self.history, task_uncertainty=uncertainty
+      )
+    with self._phase("actor"):
+      raw_actions = self.actor_backend(inputs)
+    with self._phase("clamp_and_commit"):
+      actions = raw_actions.clamp(min=self._lower, max=self._upper)
+      if not torch.isfinite(actions).all():
+        raise ValueError("EIT actor produced non-finite actions")
+      if candidate is not None:
+        self.provider.commit(candidate)
+      self.last_inputs = inputs.detach().clone()
+      self._actions = actions.detach().clone()
+      self._reference_key = tuple(value.clone() for value in reference_key)
+      return self._actions.clone()
 
   @torch.no_grad()
   def advance(self, obs, dones: torch.Tensor) -> None:
     if self._actions is None or self.history is None:
       raise RuntimeError("advance() requires one act() and physical step first")
-    current = self._observation(obs)
-    if dones.shape != (self.num_envs,) or dones.device != self.device:
-      raise ValueError("dones must match the environment batch and device")
-    reset = dones.bool()
-    sensor = self.wm.representation.add_proprio_noise(current["actor"])
-    shifted = torch.cat((self.history[:, 1:], sensor[:, None]), dim=1)
-    self.history = torch.where(reset[:, None, None], sensor[:, None], shifted)
-    self.episode_id = self.episode_id + self.num_envs * reset.long()
-    self.time_index = torch.where(reset, 0, self.time_index + 1)
-    self._reset_mask = reset.clone()
-    self._obs, self._actions, self.last_inputs = current, None, None
-    self._reference_key = None
+    with self._phase("measurement_history"):
+      current = self._observation(obs)
+      if dones.shape != (self.num_envs,) or dones.device != self.device:
+        raise ValueError("dones must match the environment batch and device")
+      reset = dones.bool()
+      sensor = self.wm.representation.add_proprio_noise(current["actor"])
+      shifted = torch.cat((self.history[:, 1:], sensor[:, None]), dim=1)
+      self.history = torch.where(reset[:, None, None], sensor[:, None], shifted)
+      self.episode_id = self.episode_id + self.num_envs * reset.long()
+      self.time_index = torch.where(reset, 0, self.time_index + 1)
+      self._reset_mask = reset.clone()
+      self._obs, self._actions, self.last_inputs = current, None, None
+      self._reference_key = None

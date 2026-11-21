@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -33,6 +34,7 @@ from supermimic.runners.supermimic_runner import (
   actor_checkpoint,
   load_actor_checkpoint,
 )
+from supermimic.utils.profiling import PhaseTimer, runtime_metadata
 
 
 @dataclass(frozen=True)
@@ -87,6 +89,7 @@ class BeliefModelTraining:
       for path in (Path(f).resolve() for f in runner.motion.files)
     ]
     self._ready = False
+    self.before_checkpoint_commit: Callable[[Path, dict], None] | None = None
     # This entry point does not optimize the policy or change its normalizers.
     runner.policy_learner.actor.eval().requires_grad_(False)
 
@@ -127,23 +130,43 @@ class BeliefModelTraining:
 
   def run_round(self, checkpoint_path: Path | None = None) -> dict:
     runner, learner = self.runner, self.learner
+    timer = PhaseTimer(runner.device)
+    round_start = timer.now()
+    runtime_metadata(next(self.actor.parameters()), reset_peak=True)
     if not self._ready:
-      self.refresh_collection()
+      with timer.measure("initial_reset_seconds"):
+        self.refresh_collection()
     version_before = runner._dynamics.model_version
     actor_before = parameter_digest(self.actor)
     replay = runner.replay_buffer
     # Fold each chunk into private statistics before the next ring overwrite.
     staged = None
     steps = self.cfg.collection_steps
+    terminated = truncated = completed = 0
+
+    def count_endings(count):
+      nonlocal terminated, truncated, completed
+      flags = replay.retained_frames(
+        newest_count=count, fields=("terminated", "truncated")
+      )
+      terminated += int(flags["terminated"].sum())
+      truncated += int(flags["truncated"].sum())
+      completed += int((flags["terminated"] | flags["truncated"]).sum())
+
+    collect_start = timer.now()
     for step in range(1, steps + 1):
       runner.step(record_episode_stats=False)
       if step % replay.buffer_size == 0 and step < steps:
+        count_endings(replay.buffer_size)
         frames = self._fresh_training_frames(replay.buffer_size, ("state", "action"))
         if len(frames):
           staged = learner.stage_normalization(
             frames["state"], frames["action"], staged
           )
         del frames
+    remaining = (steps - 1) % replay.buffer_size + 1
+    count_endings(remaining)
+    timer.seconds["physical_collection_seconds"] = timer.now() - collect_start
     if (
       runner._dynamics.model_version != version_before
       or parameter_digest(self.actor) != actor_before
@@ -152,7 +175,6 @@ class BeliefModelTraining:
     runner.finish_collection_round()
     self._ready = False
     train_ids, valid_ids = self.episode_split()
-    remaining = (steps - 1) % replay.buffer_size + 1
     train, validation = learner.fit(
       replay,
       train_ids,
@@ -180,14 +202,70 @@ class BeliefModelTraining:
       "train": train,
       "validation": validation,
       **policy,
+      "budget": {
+        "collected_frames": steps * runner.env.num_envs,
+        "available_training_windows": train["available_mean_windows"],
+        "sampled_training_windows": train["mean_windows"],
+        "available_validation_windows": validation["available_mean_windows"],
+        "sampled_validation_windows": validation["mean_windows"],
+        "training_pairs": train["cov_pairs"],
+        "validation_pairs": validation["cov_pairs"],
+        "covariance_pair_draws": train["cov_pair_draws"],
+        "mean_updates": train["mean_updates"],
+        "covariance_updates": train["cov_updates"],
+        "covariance_batch_size": learner.cov_cfg.batch_size,
+        "covariance_epochs": learner.cov_cfg.epochs,
+        "physical_terminations": terminated,
+        "physical_truncations": truncated,
+        "physical_episode_endings": completed,
+        "physical_termination_frequency": terminated / (steps * runner.env.num_envs),
+        "physical_episode_ending_frequency": completed / (steps * runner.env.num_envs),
+        **getattr(self, "_policy_budget", {}),
+      },
+    }
+    metrics["profiling"] = {
+      "version": "eit_training_profile_v1",
+      "runtime": runtime_metadata(next(self.actor.parameters())),
+      "warmup_rounds_in_process": getattr(self, "_profiled_rounds", 0),
+      "seconds": {
+        **timer.seconds,
+        **learner.last_profile,
+        **getattr(self, "_policy_profile", {}),
+      },
     }
     # Verify the entire row before advancing the round or replacing its checkpoint.
     json.dumps(metrics, allow_nan=False)
     self.rounds = metrics["round"]
     self.collected_frames = metrics["collected_frames"]
     if checkpoint_path is not None:
-      self.save(checkpoint_path, metrics=metrics)
-    self.refresh_collection()
+      with timer.measure("checkpoint_save_seconds"):
+        self.save(checkpoint_path, metrics=metrics)
+      reference_seconds = getattr(self, "_last_checkpoint_hook_seconds", 0.0)
+      if reference_seconds:
+        timer.seconds["checkpoint_save_seconds"] -= reference_seconds
+        timer.seconds["resume_reference_seconds"] = reference_seconds
+    with timer.measure("refresh_reset_seconds"):
+      self.refresh_collection()
+    after_save = runtime_metadata(next(self.actor.parameters()))
+    before_hook = getattr(self, "_checkpoint_hook_runtime_before", None)
+    if before_hook is not None:
+      for key in ("cuda_peak_allocated_bytes", "cuda_peak_reserved_bytes"):
+        if before_hook.get(key) is not None:
+          after_save[key] = max(before_hook[key], after_save[key])
+    self.last_profile = {
+      "round": self.rounds,
+      "collected_frames": self.collected_frames,
+      **metrics["profiling"],
+      "runtime_after_save": after_save,
+      "seconds": {**metrics["profiling"]["seconds"], **timer.seconds},
+    }
+    elapsed = timer.now() - round_start
+    reference_seconds = timer.seconds.get("resume_reference_seconds", 0.0)
+    self.last_profile["seconds"]["round_seconds"] = elapsed - reference_seconds
+    if reference_seconds:
+      self.last_profile["seconds"]["round_seconds_including_resume_reference"] = elapsed
+      self.last_profile["resume_reference_runtime"] = self._checkpoint_hook_runtime
+    self._profiled_rounds = getattr(self, "_profiled_rounds", 0) + 1
     return metrics
 
   def state_dict(self) -> dict:
@@ -332,16 +410,155 @@ class BeliefModelTraining:
     path.parent.mkdir(parents=True, exist_ok=True)
     state = self.state_dict()
     state["last_metrics"] = metrics
+    self._last_checkpoint_hook_seconds = 0.0
+    self._checkpoint_hook_runtime_before = None
     temporary = NamedTemporaryFile(dir=path.parent, delete=False)
     temporary_path = Path(temporary.name)
     try:
       with temporary:
         torch.save(state, temporary)
+      if self.before_checkpoint_commit is not None:
+        self._checkpoint_hook_runtime_before = runtime_metadata(
+          next(self.actor.parameters())
+        )
+        timer = PhaseTimer(self.runner.device)
+        with timer.measure("reference"):
+          self.before_checkpoint_commit(temporary_path, state)
+        self._last_checkpoint_hook_seconds = timer.seconds["reference"]
+        self._checkpoint_hook_runtime = runtime_metadata(next(self.actor.parameters()))
+        # The disposable reference clone is a separate acceptance workload. Keep
+        # its peak separately, then combine pre-hook and post-hook training peaks.
+        runtime_metadata(next(self.actor.parameters()), reset_peak=True)
       temporary_path.replace(path)
     finally:
       temporary_path.unlink(missing_ok=True)
 
   _output_checkpoint: Path | None = None
+
+  @staticmethod
+  def _repair_profile_tail(path: Path, state: dict) -> dict:
+    """Seal a complete last row or archive a torn append, never invent timings.
+
+    Call only while holding the output directory's training lock. Complete but
+    malformed rows are rejected; only the final unterminated JSON fragment can
+    be removed, after its exact bytes have been preserved separately.
+    """
+    content = path.read_bytes() if path.exists() else b""
+    lines = content.splitlines(keepends=True)
+    prefix, rounds = b"", []
+    fragment = None
+    repaired = False
+    for index, line in enumerate(lines):
+      tail = index == len(lines) - 1 and not line.endswith(b"\n")
+      try:
+        row = json.loads(line)
+      except (ValueError, UnicodeDecodeError):
+        if not tail:
+          raise ValueError("Malformed complete profiling row") from None
+        fragment = line
+        repaired = True
+        break
+      if (
+        not isinstance(row, dict)
+        or type(row.get("round")) is not int
+        or row["round"] < 1
+        or row["round"] > state["rounds"]
+        or (rounds and row["round"] <= rounds[-1])
+      ):
+        raise ValueError("Profiling rounds disagree with the current checkpoint")
+      rounds.append(row["round"])
+      prefix += line + (b"\n" if tail else b"")
+      repaired |= tail
+    archive = None
+    if fragment is not None:
+      digest = hashlib.sha256(fragment).hexdigest()
+      archive = path.with_name(f"profiling.interrupted.{digest}.fragment")
+      if archive.is_symlink():
+        raise ValueError("Profiling recovery archive must be local")
+      if archive.exists():
+        if archive.read_bytes() != fragment:
+          raise ValueError("Profiling recovery archive content conflict")
+      else:
+        with NamedTemporaryFile(dir=path.parent, delete_on_close=False) as stream:
+          stream.write(fragment)
+          stream.flush()
+          stream.close()
+          os.link(stream.name, archive)
+    if repaired:
+      with NamedTemporaryFile(dir=path.parent, delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+          stream.write(prefix)
+          stream.close()
+          temporary.replace(path)
+        finally:
+          temporary.unlink(missing_ok=True)
+    result = {
+      "profiling_tail_repaired": repaired,
+      "archived_profile_fragment": str(archive) if archive is not None else None,
+      "missing_profile_rounds": sorted(
+        set(range(1, state["rounds"] + 1)) - set(rounds)
+      ),
+      "missing_timing_policy": "Unavailable post-commit timings remain missing; no zero or reconstructed duration is substituted.",
+    }
+    if repaired or result["missing_profile_rounds"]:
+      note = path.with_name("profiling_recovery.json")
+      if note.is_symlink():
+        raise ValueError("Profiling recovery note must be local")
+      evidence = {
+        "version": "eit_profiling_recovery_v1",
+        "checkpoint_round": state["rounds"],
+        **result,
+        "preserved_fragments": [
+          item.name
+          for item in sorted(path.parent.glob("profiling.interrupted.*.fragment"))
+        ],
+      }
+      with NamedTemporaryFile(dir=path.parent, mode="w", delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+          json.dump(evidence, stream, indent=2, allow_nan=False)
+          stream.write("\n")
+          stream.close()
+          temporary.replace(note)
+        finally:
+          temporary.unlink(missing_ok=True)
+    return result
+
+  @classmethod
+  def reconcile_output(
+    cls, output: Path, *, validate_state: Callable[[dict], object] | None = None
+  ) -> dict:
+    """Validate and repair one locked checkpoint without taking a training step.
+
+    The optional caller preflight runs on the same loaded state before any
+    snapshot or log mutation, allowing pilot identity/budget checks to be atomic
+    with recovery rather than reopening a potentially different checkpoint.
+    """
+    output = Path(output).resolve()
+    checkpoint, metrics = output / "training.pt", output / "metrics.jsonl"
+    profiles, lock = output / "profiling.jsonl", output / ".belief-training.lock"
+    if any(path.is_symlink() for path in (checkpoint, metrics, profiles, lock)):
+      raise ValueError("Training recovery requires local output files")
+    with FileLock(lock, timeout=0):
+      state = torch.load(checkpoint, map_location="cpu", mmap=True, weights_only=True)
+      cls._check_checkpoint_version(state)
+      if validate_state is not None:
+        validate_state(state)
+      missing = cls._missing_metric_bytes(metrics, state)
+      profile = cls._repair_profile_tail(profiles, state)
+      publish_snapshot(checkpoint, state)
+      if missing:
+        with metrics.open("ab") as stream:
+          stream.write(missing)
+      return {
+        "version": "eit_output_recovery_v1",
+        "round": state["rounds"],
+        "collected_frames": state["collected_frames"],
+        "checkpoint_sha256": file_sha256(checkpoint),
+        "repaired_metric_bytes": len(missing),
+        **profile,
+      }
 
   def run(self, rounds: int, output: Path, *, resume: Path | None = None) -> list[dict]:
     if type(rounds) is not int or rounds < 1:
@@ -350,6 +567,7 @@ class BeliefModelTraining:
     output.mkdir(parents=True, exist_ok=True)
     checkpoint = output / "training.pt"
     metrics_path = output / "metrics.jsonl"
+    profile_path = output / "profiling.jsonl"
     lock_path = output / ".belief-training.lock"
 
     def check_destination():
@@ -362,6 +580,7 @@ class BeliefModelTraining:
         or not checkpoint.is_file()
         or checkpoint.is_symlink()
         or metrics_path.is_symlink()
+        or profile_path.is_symlink()
       ):
         raise ValueError(
           "Nonempty output requires resuming its own current training.pt"
@@ -392,6 +611,7 @@ class BeliefModelTraining:
               temporary.close()
               os.link(temporary.name, checkpoint)
         publish_snapshot(checkpoint, state)
+        self._repair_profile_tail(profile_path, state)
         if missing:
           with metrics_path.open("ab") as stream:
             stream.write(missing)
@@ -403,10 +623,26 @@ class BeliefModelTraining:
       logs = []
       for _ in range(rounds):
         metrics = self.run_round(checkpoint)
+        timer = PhaseTimer(self.runner.device)
+        publication_start = timer.now()
         publish_snapshot(checkpoint)
         row = json.dumps(metrics, sort_keys=True, allow_nan=False)
         with metrics_path.open("ab") as stream:
           stream.write((row + "\n").encode())
+        publication_seconds = timer.now() - publication_start
+        self.last_profile["seconds"]["snapshot_and_metrics_seconds"] = (
+          publication_seconds
+        )
+        self.last_profile["seconds"]["round_seconds"] += publication_seconds
+        if "round_seconds_including_resume_reference" in self.last_profile["seconds"]:
+          self.last_profile["seconds"]["round_seconds_including_resume_reference"] += (
+            publication_seconds
+          )
+        # Post-commit timings cannot live inside the checkpoint they measure.
+        # A missing row after interruption means missing profiling, not zero cost.
+        with profile_path.open("a") as stream:
+          stream.write(json.dumps(self.last_profile, sort_keys=True, allow_nan=False))
+          stream.write("\n")
         print("BELIEF_TRAINING " + row)
         logs.append(metrics)
       return logs

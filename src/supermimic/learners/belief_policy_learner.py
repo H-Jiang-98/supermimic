@@ -15,6 +15,7 @@ import torch
 from torch import nn
 
 from supermimic.learners.learner_utils import validate_optimizer_state
+from supermimic.utils.profiling import PhaseTimer
 
 
 @dataclass(frozen=True)
@@ -160,10 +161,15 @@ class BeliefActorCriticPolicyLearner:
     if len(starts) != self.cfg.num_batches * self.cfg.batch_size:
       raise ValueError("Expected one batch of prepared starts per actor update")
     logs = []
+    profiles = []
     with self.wm_env.readonly_policy_motion():
       for offset in range(0, len(starts), self.cfg.batch_size):
         batch = starts.index(slice(offset, offset + self.cfg.batch_size))
         logs.append(self.update_from(batch, *self.draw_noises(batch)))
+        profiles.append(self.last_profile)
+    self.last_profile = {
+      name: sum(profile[name] for profile in profiles) for name in profiles[0]
+    }
     means = {}
     for name in logs[0]:
       values = torch.stack([log[name] for log in logs])
@@ -188,7 +194,9 @@ class BeliefActorCriticPolicyLearner:
       ):
         raise ValueError(f"Invalid policy {name} noise")
 
-  def _rollout(self, starts, process_noise, measurement_noise, horizon):
+  def _rollout(
+    self, starts, process_noise, measurement_noise, horizon, *, return_components=False
+  ):
     """One equal-length subset; returns live returns and detached regression data."""
     cfg, env = self.cfg, self.wm_env
     obs = env.reset_prepared(starts)
@@ -215,6 +223,7 @@ class BeliefActorCriticPolicyLearner:
       rewards.append(reward.detach())
       continuations.append(continuation.detach())
     bootstrap = cfg.gamma**horizon * survival * self._value(obs["critic"])
+    reward_return = returns
     returns = returns + bootstrap
     observations.append(obs["critic"].detach())
     observations = torch.stack(observations)
@@ -237,10 +246,13 @@ class BeliefActorCriticPolicyLearner:
       "bootstrap": bootstrap.detach().sum(),
       "final_survival": survival.detach().sum(),
       "valid_steps": returns.new_tensor(horizon * len(starts)),
+      "survival_weighted_steps": torch.stack(weights).sum(),
       "action_saturation": saturation * len(starts),
       "film_scale": film_scale * len(starts),
       "value_clamp_fraction": (raw_values > self._v_max).float().mean() * len(starts),
     }
+    if return_components:
+      return returns, data, metrics, (reward_return, bootstrap)
     return returns, data, metrics
 
   @staticmethod
@@ -252,6 +264,8 @@ class BeliefActorCriticPolicyLearner:
   def update_from(self, starts, process_noise, measurement_noise):
     """One actor step and configured critic epochs, with fixed caller-owned noise."""
     self._validate_noises(starts, process_noise, measurement_noise)
+    timer = PhaseTimer(next(self.actor.parameters()).device)
+    self.last_profile = timer.seconds
     cfg, env = self.cfg, self.wm_env
     starts = starts.repeat_interleave(cfg.num_samples)
     process_noise = process_noise.detach().flatten(1, 2)
@@ -269,6 +283,7 @@ class BeliefActorCriticPolicyLearner:
         module.eval().requires_grad_(False)
         module.zero_grad(set_to_none=True)
       self.actor_optimizer.zero_grad(set_to_none=True)
+      actor_start = timer.now()
       try:
         for horizon in lengths.unique(sorted=True).tolist():
           indices = (lengths == horizon).nonzero().flatten()
@@ -296,6 +311,8 @@ class BeliefActorCriticPolicyLearner:
         )
         self.actor_optimizer.step()
         self.actor_steps += 1
+        timer.seconds["policy_rollout_backward_seconds"] = timer.now() - actor_start
+        critic_start = timer.now()
         self.actor.requires_grad_(False)
         self.critic.requires_grad_(True)
         features, targets, weights = (
@@ -335,6 +352,7 @@ class BeliefActorCriticPolicyLearner:
             if variance > 0
             else targets.new_tensor(float("nan"))
           )
+        timer.seconds["critic_regression_seconds"] = timer.now() - critic_start
         return {
           "Policy/return": totals["return"] / count,
           "Policy/raw_reward": totals["raw_reward_sum"] / totals["valid_steps"],
@@ -343,6 +361,7 @@ class BeliefActorCriticPolicyLearner:
           / totals["return"].abs().clamp_min(1e-8),
           "Policy/final_survival": totals["final_survival"] / count,
           "Policy/valid_steps": totals["valid_steps"],
+          "Policy/survival_weighted_steps": totals["survival_weighted_steps"],
           "Policy/action_saturation": totals["action_saturation"]
           / totals["valid_steps"],
           "Policy/film_gamma": totals["film_scale"][0] / totals["valid_steps"],

@@ -6,6 +6,9 @@
 旧输入布局继续使用 W&B 模型和原有 viewer。`eit_rpv_v1` 的 A/B/C 现在支持本地
 `eit_training_v3` 格式的 `training.pt` 定量评估与播放，共用 `EITPolicyAdapter`。同一适配器可执行 PyTorch 或导出的 ONNX actor。训练及梯度 smoke 仍使用 README 中的 `check_estimator` / `check_eit_training`。
 
+Step 6 的真实 walking 单 seed A/B/C、固定输入恢复、逐快照诊断、预算审计与在线
+batch=1 性能测量见 [pilot 操作说明](docs/eit_pilot.md)。
+
 ## EIT 定量评估和播放
 
 评估沿用 mjlab `tasks/tracking/scripts/evaluate.py` 的首个 episode 循环，直接调用其

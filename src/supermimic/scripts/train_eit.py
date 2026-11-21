@@ -6,6 +6,7 @@ import argparse
 import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from typing import cast
 
 import mjlab.tasks  # noqa: F401
 import torch
@@ -16,6 +17,7 @@ from supermimic.critic_inputs import CRITIC_INPUT_VERSION
 from supermimic.estimator import FilterConfig
 from supermimic.learners.belief_policy_learner import BeliefPolicyLearnerCfg
 from supermimic.models import ProcessNoiseConfig
+from supermimic.motion_command import MotionCommandCfg
 from supermimic.runners.eit_training import (
   EITTraining,
   EITTrainingCfg,
@@ -29,6 +31,25 @@ from supermimic.scripts.train_utils import (
   model_fit_configs,
 )
 from supermimic.tasks.env_cfgs import configure_estimator_env_cfg
+
+
+def _reference_path(reference: Path, output: Path, *inputs: Path | None) -> Path:
+  path = reference.resolve()
+  snapshots = (output / "snapshots").resolve()
+  reserved = (
+    "training.pt",
+    "metrics.jsonl",
+    "profiling.jsonl",
+    "profiling_recovery.json",
+    ".belief-training.lock",
+  )
+  protected = {item.resolve() for item in inputs if item is not None}
+  protected.update((output / name).resolve() for name in reserved)
+  if path in protected or path.is_relative_to(snapshots):
+    raise ValueError(
+      "--resume-reference must be separate from training inputs, logs and snapshots"
+    )
+  return path
 
 
 def main():
@@ -45,6 +66,11 @@ def main():
     help="Publish the shared initialization at --initialization and exit before training",
   )
   parser.add_argument("--resume", type=Path)
+  parser.add_argument(
+    "--resume-reference",
+    type=Path,
+    help="Publish live next-update evidence before committing the final round checkpoint",
+  )
   parser.add_argument(
     "--initialization",
     type=Path,
@@ -81,8 +107,28 @@ def main():
     parser.error("resume and initialization are mutually exclusive")
   if args.prepare_initialization and not args.initialization:
     parser.error("--prepare-initialization requires an explicit --initialization path")
+  if args.prepare_initialization and args.resume_reference:
+    parser.error("--resume-reference requires actual training rounds")
   if not args.prepare_initialization and not args.output:
     parser.error("training requires --output")
+  initialization = args.initialization
+  if initialization is None and args.resume is None:
+    initialization = (
+      args.output.parent
+      / f"{EIT_INITIALIZATION_VERSION}_{CRITIC_INPUT_VERSION}_seed{args.seed}.pt"
+    )
+  reference_path = None
+  if args.resume_reference:
+    try:
+      reference_path = _reference_path(
+        args.resume_reference,
+        args.output,
+        Path(args.motion_file),
+        initialization,
+        args.resume,
+      )
+    except ValueError as error:
+      parser.error(str(error))
   if (
     args.initialization
     and not args.prepare_initialization
@@ -96,8 +142,9 @@ def main():
   task_id = "SuperMimic-GenCoord-G1"
   env_cfg = load_env_cfg(task_id)
   env_cfg.seed = args.seed
-  env_cfg.commands["motion"].motion_file = str(Path(args.motion_file).expanduser())
-  env_cfg.commands["motion"].sampling_mode = "uniform"
+  motion = cast(MotionCommandCfg, env_cfg.commands["motion"])
+  motion.motion_file = str(Path(args.motion_file).expanduser())
+  motion.sampling_mode = "uniform"
   configure_estimator_env_cfg(env_cfg)
   if args.resume:
     saved = torch.load(args.resume, map_location=args.device, weights_only=True)
@@ -106,10 +153,12 @@ def main():
     loop_cfg = EITTrainingCfg(**saved["loop_config"])
     policy_cfg = BeliefPolicyLearnerCfg(**saved["policy_config"])
     num_envs = saved["num_envs"]
+    starting_round = saved["rounds"]
     if saved.get("training_seed") is not None:
       env_cfg.seed = saved["training_seed"]
     del saved
   else:
+    starting_round = 0
     mean, cov = model_fit_configs(args)
     runner_cfg = SuperMimicRunnerCfg.for_estimator_inputs(
       args.group,
@@ -138,19 +187,25 @@ def main():
       noise=args.exploration,
     )
     num_envs = args.num_envs
-  env_cfg.commands["motion"].sampling_mode = (
+  motion.sampling_mode = (
     "external" if runner_cfg.sampling_mode == "return" else runner_cfg.sampling_mode
   )
   env = create_env(env_cfg, num_envs, args.device)
   try:
     runner = SuperMimicRunner(env, runner_cfg, task_id, device=args.device)
     training = EITTraining(runner, loop_cfg, policy_cfg)
+    if reference_path is not None:
+      from supermimic.runners.eit_resume_reference import write_live_reference
+
+      target_round = starting_round + args.rounds
+
+      def capture_live_reference(pending_checkpoint, state):
+        if state["rounds"] == target_round:
+          write_live_reference(training, pending_checkpoint, state, reference_path)
+
+      training.before_checkpoint_commit = capture_live_reference
     if not args.resume:
-      initialization = (
-        args.initialization
-        or args.output.parent
-        / f"{EIT_INITIALIZATION_VERSION}_{CRITIC_INPUT_VERSION}_seed{args.seed}.pt"
-      )
+      assert initialization is not None
       expected = None
       if args.prepare_initialization or not initialization.exists():
         initial = training.initialization_bundle()
