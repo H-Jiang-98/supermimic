@@ -17,11 +17,13 @@
 | B | 后验均值 → 后验均值 | 无 | 共同输入 + 12 维相对均值 + 45 维 R/p/v 边缘 covariance |
 | C | 后验均值 → 后验均值 | 每个参考帧 45 维，共 450 维，经 FiLM | 与 B 相同的 1291 + dim(ξ) 维输入和网络结构 |
 
-共同输入包括真实状态表征、基于真值的参考目标、5 帧实测历史、clip 剩余时间与 ξ。B/C 相对均值用真值机身系下的旋转 rot6d、位置差、线速度差编码。45 维是后验右局部切空间 [δθ, δρ, δν] 的 **9×9 边缘块**，包含 9 个 log std 和 36 个相关系数。C 将同一个块按 10 个参考帧分别投影为任务误差 covariance。滤波、策略起点重建及想象继续传播完整的 70×70 covariance。这个投影与跟踪目标一致，代价是 critic 无法直接区分 R/p/v 边缘相同、其他状态不确定性不同的后验。是否影响 bootstrap，要看独立回报上的误差。[critic 特征](src/supermimic/critic_inputs.py) · [actor 特征](src/supermimic/estimator_inputs.py) · [策略目标](src/supermimic/learners/belief_policy_learner.py)
+共同输入包括真实状态表征、基于真值的参考目标、5 帧实测历史、clip 剩余时间与 ξ。B/C 相对均值用真值机身系下的旋转 rot6d、位置差、线速度差编码。45 维是后验右局部切空间 [δθ, δρ, δν] 的 **9×9 边缘块**，包含 9 个 log std 和 36 个相关系数。C 将同一个块按 10 个参考帧分别投影为任务误差 covariance。在线滤波和想象均传播完整的 70×70 covariance，策略起点从缓存中读取该矩阵。这个投影与跟踪目标一致，代价是 critic 无法直接区分 R/p/v 边缘相同、其他状态不确定性不同的后验。是否影响 bootstrap，要看独立回报上的误差。[critic 特征](src/supermimic/critic_inputs.py) · [actor 特征](src/supermimic/estimator_inputs.py) · [策略目标](src/supermimic/learners/belief_policy_learner.py)
 
 每个训练 seed 固定相同的初始世界模型和 actor 共同参数。B/C critic 初值相同，C 的 FiLM 输出层从零开始。三组随后独立采集并逐轮做两阶段拟合。先用连续真值窗口和实际动作自由滚动均值模型，默认 8 帧、评分 7 个后继，优化根位置、根朝向、关节位置和关节速度的加权 MSE。再冻结均值与归一化，用训练集中全部有效真实相邻帧计算 70 维右局部一步残差，以过程 NLL 单独训练完整 Cholesky 噪声头。该设计省去了模型拟合时反传穿过整段滤波器的开销，策略梯度仍穿过冻结模型和滤波器。均值存在系统误差时，零均值噪声头会吸收残差偏差的二阶矩。一步 NLL 的下降需要和长时后验校准分别验证。[两阶段实现](src/supermimic/learners/two_stage_wm.py) · [模型拟合与 replay](plan_step3.md)
 
-`train_belief` 默认用七字段 model replay，`train_eit` 要求 full replay，以录下的动作、测量和片段先验重建后验。当前格式为 `eit_training_v3`、`eit_initialization_v3`，策略存档使用 `eit_rpv_belief_critic_v2`。v3 已有两个入口各两轮并恢复第三轮的 CPU 记录、RTX 5090 上默认均值网络的模型拟合记录及 757 项历史回归。v3 记录中两个入口各有一次四步评估，两次均在预算处截断，成功率为空。较早 v2 有 B 组默认 GPU 联合训练从第 10 轮恢复到第 11 轮的记录。当前单 clip evaluator、共享在线推理和无窗口播放可以直接复用。[版本校验](src/supermimic/runners/run_config.py) · [v3 验收](docs/validation/model_replay_v3.json) · [两阶段历史验收](docs/validation/two_stage_world_model.json) · [现有命令](README_eval.md#eit-定量评估和播放)
+`train_belief` 默认用七字段 model replay。`train_eit` 使用 full replay，按 episode 和帧号读取已保存的后验和观测历史。策略存档为 `eit_training_v4`，共享初始化包为 `eit_initialization_v3`，critic 契约为 `eit_rpv_belief_critic_v2`。[训练与存档](README.md#estimator-第四步完整策略与模型交替训练) · [评估与播放](README_eval.md#eit-定量评估和播放)
+
+v3 验收记录包含两个入口各两轮并恢复第三轮的 CPU 记录、RTX 5090 上默认均值网络的模型拟合记录及 757 项回归。两个入口各有一次四步评估，两次均在预算处截断，成功率为空。v2 记录包含 B 组默认 GPU 联合训练从第 10 轮恢复到第 11 轮的结果。[v3 验收](docs/validation/model_replay_v3.json) · [两阶段历史验收](docs/validation/two_stage_world_model.json)
 
 实验解释沿用既定分组。B−A 包含训练 actor 改用估计状态及 critic 获得 RPV belief 两项变化。C−B 衡量相同 critic 设计下，显式任务 covariance、参考信息路径及额外 FiLM 参数的整体增益。各组独立学习后，采集分布与模型权重也会分化。这三组可回答控制方案比较。判定“两阶段优于联合后验 NLL”或“RPV 优于完整 critic”需要单独的对照实验。
 

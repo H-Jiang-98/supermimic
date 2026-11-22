@@ -2,9 +2,9 @@
 
 本文使用估计器在环训练入口 `supermimic.scripts.train_eit`，将 A、B、C 分别放在 GPU 0、1、2 上训练。每张卡依次运行 seed 2027–2031，共 15 条训练线；同一 seed 的三组读取同一份初始化包，随后独立采集和更新。每条训练线运行 100 轮，在第 50 轮保存现场更新参考、验证恢复，再继续 50 轮。
 
-默认参数与 [Step 6 锁定预算](validation/eit_step6_budget.json) 一致，任务为 `SuperMimic-GenCoord-G1`，motion 为 `walk1_subject1.npz`。这是进入正式多 seed 比较的起始预算，尚未验证训练收敛；原 pilot 的闭环完成率为 0。这里的验证和测试使用同一 motion、不同评估 seed，不代表未见动作或受试者的泛化测试。
+本次使用 v4 EIT 策略训练协议，每个物理控制步保存一次后验（`--posterior-save-stride 1`）。任务为 `SuperMimic-GenCoord-G1`，motion 为 `walk1_subject1.npz`。实采帧数、模型及策略更新预算沿用 Step 6。验证和测试使用同一 motion、不同评估 seed。Step 6 pilot 在这项任务上的闭环完成率为 0，v4 的正式多 seed 结果需通过第 8 节评估取得。[Step 6 锁定预算](validation/eit_step6_budget.json) · [Step 6 pilot 验收](validation/eit_step6_pilot.json)
 
-存储规则在原预算上调整为：每轮覆盖最新 `training.pt`，历史快照只保留第 0 轮及每 10 轮的状态。间隔由 `--snapshot-interval` 配置，不改变实采帧数和学习更新预算。原预算 JSON 作为历史依据保留，新存储设置单独记录到实验目录的 `storage_policy.json`。
+每轮更新磁盘上的 `training.pt`，第 0 轮及此后每 10 轮另存历史快照。`--snapshot-interval` 控制快照轮次，`--posterior-save-stride` 控制训练进程内后验的保存步距。两项设置均记录在实验目录的 `storage_policy.json`。
 
 **本入口不读取根目录 `train_config.toml`，也不接受 `--config` 或 `--runner.*`。** 那些配置属于另一套 `train.py` 训练入口。下面通过一个 Bash 配置文件统一管理当前 EIT 命令行参数。
 
@@ -65,7 +65,7 @@ done
 
 GPU 编号 0、1、2 是示例，可改为分配给你的卡或 GPU UUID。若通过作业调度器获得 GPU，沿用调度器给出的可见设备映射，不覆盖成未分配的物理卡。
 
-默认间隔 10 时，每条训练线有 11 份历史快照和 1 份最新 checkpoint，15 条共 180 份。按 pilot 文件体积粗估约 30 GiB，加上共享初始化、恢复参考和日志，训练工件建议预留 **40–60 GiB**；诊断、备份及更大配置另计。原 260–300 GiB 估计对应逐轮保留。原 RTX 5090 的约 8.8 小时是 15 条训练线的纯训练累计估计，不能作为 PRO 6000 三卡并发的完工时间；在服务器记录实际轮次耗时后再估算。
+默认间隔 10 时，每条训练线有 11 份历史快照和 1 份最新 checkpoint，15 条共 180 份。按 Step 6 pilot 的文件体积粗估约 30 GiB。加上共享初始化、恢复参考和日志，训练工件建议预留 **40–60 GiB**，诊断、备份及更大配置另计。Step 6 预算中的 260–300 GiB 对应逐轮保留快照，RTX 5090 上的约 8.8 小时是当时对 15 条训练线纯训练累计耗时的估算。v4 在 PRO 6000 上的完工时间应以服务器实测轮次耗时和并发安排估算。[Step 6 资源估算](validation/eit_step6_budget.json)
 
 ## 3 创建统一超参数配置
 
@@ -83,6 +83,7 @@ EIT_SEEDS=(2027 2028 2029 2030 2031)
 EIT_FIRST_ROUNDS=50
 EIT_SECOND_ROUNDS=50
 EIT_SNAPSHOT_INTERVAL=10
+EIT_POSTERIOR_SAVE_STRIDE=1
 
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
@@ -105,6 +106,7 @@ EIT_ARGS=(
   --num-envs 8
   --collection-steps 64
   --buffer-size 128
+  --posterior-save-stride "$EIT_POSTERIOR_SAVE_STRIDE"
   --snapshot-interval "$EIT_SNAPSHOT_INTERVAL"
   --mean-lr 2e-4
   --mean-updates 10
@@ -171,14 +173,15 @@ BASH
 (
   set -euo pipefail
   source artifacts/eit_pro6000_v1/launch/config.sh
-  "$EIT_PYTHON" - "$EIT_ROOT" "$EIT_MOTION" "$EIT_SNAPSHOT_INTERVAL" "${EIT_SEEDS[@]}" <<'PY'
+  "$EIT_PYTHON" - "$EIT_ROOT" "$EIT_MOTION" "$EIT_SNAPSHOT_INTERVAL" "$EIT_POSTERIOR_SAVE_STRIDE" "${EIT_SEEDS[@]}" <<'PY'
 import hashlib
 import json
 import sys
 from pathlib import Path
 root, motion = map(Path, sys.argv[1:3])
 interval = int(sys.argv[3])
-seeds = list(map(int, sys.argv[4:]))
+posterior_stride = int(sys.argv[4])
+seeds = list(map(int, sys.argv[5:]))
 budget = json.loads((root / "budget_source.json").read_text())
 assert seeds == budget["training_seeds"], "Changed seeds require a new protocol"
 assert hashlib.sha256(motion.read_bytes()).hexdigest() == budget["scenes"]["training"][0]["sha256"], "Motion differs from locked budget"
@@ -207,6 +210,8 @@ with (root / "evaluation_spec.json").open("x") as f:
     json.dump(spec, f, indent=2)
 with (root / "storage_policy.json").open("x") as f:
     json.dump({"source_budget_digest": budget["budget_digest"],
+               "policy_checkpoint_version": "eit_training_v4",
+               "posterior_save_stride": posterior_stride,
                "latest_checkpoint_interval_rounds": 1,
                "snapshot_interval_rounds": interval,
                "snapshot_interval_frames": frames_per_round * interval,
@@ -300,11 +305,11 @@ nohup bash artifacts/eit_pro6000_v1/launch/run_group.sh C 2 \
 | `--motion-file` | walking NPZ | 参考动作文件；本次按单文件配置，数据须匹配 50 Hz 控制频率 |
 | `--output` | 每组每 seed 独立 | 训练 checkpoint、快照和指标的输出目录 |
 
-每轮依次执行物理采集、均值模型拟合、过程协方差拟合、缓存后验读取、actor/critic 更新，然后保存。训练使用 uniform reset 选择真实 episode 的起点；进程内跨轮保持环境、posterior 和历史连续，只在真实结束时 reset。模型更新后下一帧用新模型继续递推，不重算旧 posterior。64 步是轮次预算，不是 episode 长度上限。
+每轮先采集 64 个控制步，再拟合均值模型、过程协方差，更新 actor/critic 并保存。使用 uniform reset 选择真实 episode 的参考动作起点。轮次切换时保留环境、后验和观测历史，各环境在自身 episode 结束后独立 reset。模型更新后的下一帧用新模型从当前后验继续滤波。
 
-新策略 checkpoint 为 v4；stride、缓存协议和 revision 随模型/优化器保存。跨进程恢复清空 replay 和边界历史，开启新 episode，保存周期从第 0 步重启。旧 v3 策略 checkpoint 可评估/导出，不能直接续训为该协议；共享初始化仍使用 v3。
+每个环境逐帧记录物理转移。在进程的全局采集步 0、S、2S……，滤波器融合当前测量后、执行动作前保存后验 `Q[t|t]` 和来源模型 revision。轮次切换或单环境 reset 时保存周期连续。读取起点时，从原始单帧观测和最近淘汰的 `history_length - 1` 帧拼出观测历史，只在真实 episode 开头用首帧补齐。
 
-profiling 用 `posterior_cache_normalization_seconds` 记录缓存读取及归一化，用 `posterior_cache_read_seconds` 单列其中的读取时间。CUDA 计时在当前 stream 上记录事件，阶段结束时统一读取。budget 包含有效 posterior 数、可用策略起点数、归一化样本数、来源版本差距与实际存储字节数，`episode_head_storage_bytes` 单列保留的真实首帧先验。GPU 对比固定 N/K/H 等其余预算，依次测 S=1、2、4 的完整轮次耗时、峰值显存及起点覆盖率。
+续训入口读取 `eit_training_v4` 策略 checkpoint，其中保存模型、优化器、随机数状态、累计计数、后验保存步距和模型 revision。启动新进程时，replay 和边界历史为空，真实环境开启新 episode，全局采集步从 0 重新计数。v3 策略 checkpoint 可用于评估和导出。A/B/C 共享初始化包采用 `eit_initialization_v3`。
 
 ### 6.2 世界模型
 
@@ -319,14 +324,14 @@ profiling 用 `posterior_cache_normalization_seconds` 记录缓存读取及归�
 | `--cov-epochs` | 1 | 每轮对全部保留的有效训练对完整遍历次数 |
 | `--hidden-dims` | 2048 2048 2048 | 均值动力学网络三层隐藏宽度；噪声头另有默认宽度 128、64 |
 
-协方差更新数为每轮 `cov_epochs × ceil(valid_training_pairs / cov_batch_size)`。三组失败时间和保留轨迹不同，有效对数可能不同，因此不要求实际 covariance 更新次数完全相等；要求 batch/epoch 规则相同并报告实际次数。
+世界模型从全部保留的有效训练转移中构造均值窗口和协方差转移对，包含未保存后验的帧。协方差更新数为每轮 `cov_epochs × ceil(valid_training_pairs / cov_batch_size)`。三组失败时间和保留轨迹不同，有效对数可能不同，因此按同一 batch/epoch 规则报告各组实际次数。
 
 ### 6.3 actor 和 critic
 
 | 参数 | 本次值 | 含义与影响 |
 | --- | --- | --- |
 | `--policy-updates` | 1 | 每轮 actor 优化次数，每次同时产生供 critic 回归的想象数据 |
-| `--policy-batch-size` | 4 | N，每次 actor 更新从 replay 选择的起点数 |
+| `--policy-batch-size` | 4 | N，每次 actor 更新从原始帧与后验均保留的训练帧中均匀有放回抽取的起点数 |
 | `--samples` | 2 | K，每个起点的独立过程及测量噪声轨迹数；共有 N×K＝8 条想象轨迹 |
 | `--policy-horizon` | 4 | H，每条想象轨迹最多前进 4 个控制步，即 0.08 秒；普通 horizon 结束使用价值 bootstrap，clip 结束按片尾规则截短 |
 | `--policy-microbatch-size` | 2 | 对展开后的 N×K 条轨迹分块执行前向和反传，并累积梯度后更新；也用于 critic 数据分块。它不是起点总数 N |
@@ -335,6 +340,8 @@ profiling 用 `posterior_cache_normalization_seconds` 记录缓存读取及归�
 | `--critic-hidden-dims` | 256 128 | critic 隐藏层宽度，B/C 输入及结构相同 |
 
 名义上每次 actor 更新最多计算 `N × K × H = 32` 个想象转移。片尾截短和 soft survival 会改变有效步数及权重，这些都不是物理采集帧数。增加 H 会增加通过动力学、滤波和协方差的反传深度；增加 N 或 K 则增加采样量，不能将三者看作可互换的 batch。
+
+actor/critic 输入归一化只使用本轮新采、仍保留且已保存后验的训练帧。若本轮这类帧为零，保留已有统计，策略仍可从之前保留的训练帧抽取起点。整个 replay 都没有可用起点时，策略更新报错。每个想象起点直接使用采集时的后验，后续步用当前模型执行完整可微滤波。
 
 ### 6.4 当前未开放命令行的参数
 
@@ -350,14 +357,14 @@ profiling 用 `posterior_cache_normalization_seconds` 记录缓存读取及归�
 | `value_clipping` | `True` | 将使用的价值限制在 `max_step_reward / (1 - gamma)` 上界；不是 PPO 的策略比率裁剪，同上 |
 | `BeliefTrainingCfg.validation_stride` | 5 | 按 episode ID 每 5 个留出一个用于模型验证，不是每 5 轮做闭环评估，见 [belief_training.py](../src/supermimic/runners/belief_training.py) |
 | `validation_batch_size` | 4 | 内部世界模型验证的批大小，同上 |
-| `EITTrainingCfg.normalization_batch_size` | 16 | 后验前缀准备和输入归一化的处理批大小，见 [eit_training.py](../src/supermimic/runners/eit_training.py) |
+| `EITTrainingCfg.normalization_batch_size` | 16 | actor/critic 输入归一化时，每批读取的已保存训练帧数，见 [eit_training.py](../src/supermimic/runners/eit_training.py) |
 | `ProcessNoiseConfig.hidden_dims` | 128 64 | 过程噪声头隐藏层，见 [models.py](../src/supermimic/models.py) |
 
 例如，要另开 actor 学习率为 `1e-4` 的实验，修改 `BeliefPolicyLearnerCfg` 中 `lr: float = 1e-4`，保留 `critic_lr` 或另行明确修改，然后保存新代码版本、重新生成初始化并新建输出目录。当前没有可直接使用的 `--policy-lr`、`--critic-lr`、`--gamma` 或 `--lam` 选项。
 
-**恢复配置以 checkpoint 为准。** `--resume` 会读取保存的 runner、loop、policy、组别、训练 seed、环境数及优化器状态。恢复命令附加新的 `--mean-lr`、`--policy-horizon`、`--num-envs` 等参数不会覆盖已保存配置；恢复时不能同时传 `--initialization`。想修改训练方案，应建立新的实验协议和明确的迁移流程。
+**恢复配置以 checkpoint 为准。** `--resume` 会读取保存的 runner、loop、policy、组别、训练 seed、环境数及优化器状态，包括原有的 `posterior_save_stride`。续训命令按第 5 节指定输出目录、motion、设备和新增轮数即可。更改 `--posterior-save-stride`、学习率或想象预算时，另建实验并从共享初始化启动。
 
-`--snapshot-interval` 属于存储设置，可以在恢复时显式覆盖；省略时继承 checkpoint 中的间隔，旧 checkpoint 没有此字段时继承 1。间隔按累计轮数计算，例如在第 23 轮恢复、间隔为 10，下一份历史快照在第 30 轮。已有快照不删除，也不补造已经错过的轮次。若结束在第 103 轮，最新 `training.pt` 为第 103 轮，最后一份按间隔保存的快照仍是第 100 轮。正式实验改变间隔时要同步记录 `storage_policy.json`，并确保冻结的评估候选仍全部可用。
+`--snapshot-interval` 属于存储设置，可以在恢复时显式覆盖；省略时继承 v4 checkpoint 的间隔。间隔按累计轮数计算，例如在第 23 轮恢复、间隔为 10，下一份历史快照在第 30 轮。已有快照不删除，也不补造已经错过的轮次。若结束在第 103 轮，最新 `training.pt` 为第 103 轮，最后一份按间隔保存的快照仍是第 100 轮。正式实验改变间隔时要同步记录 `storage_policy.json`，并确保冻结的评估候选仍全部可用。
 
 ### 6.5 显存相关参数
 
@@ -368,7 +375,9 @@ profiling 用 `posterior_cache_normalization_seconds` 记录缓存读取及归�
 
 出现显存不足时，可以在独立排错配置里先减小 policy microbatch，或给上述两个分块参数设置较小正整数，再核对结果及完整轮次耗时。分块和梯度累积可能改变浮点运算次序；不要假定它们与原配置逐位一致。正式比较中三组统一设置，重新记录配置与恢复验收。
 
-当前 EIT 使用 float32、eager 路径，均值训练关闭 CUDA graphs 和编译内核；CLI 没有 AMP/BF16、DDP 或启用编译的开关。大显存本身不会消除逐段后验重建和 Jacobian 的计算成本。
+每条缓存后验保存 76 个 float32 均值分量、2,485 个 float32 协方差下三角分量和一个 int64 模型 revision，共 10,252 字节。设环境数为 E，单环境缓存容量为 C＝ceil(buffer_size / S)，含全局保存序号的后验存储为 `E × C × 10252 + C × 8` 字节。按本说明的 E＝8、buffer_size＝128，S＝1、2、4 分别约占 **10.01、5.01、2.50 MiB**。基础 replay、边界历史、保留的真实首帧先验、模型和想象反传另计。调大 S 会同时减少策略可选起点和归一化样本。
+
+本入口采用 float32、eager 执行。在线滤波逐帧运行，想象阶段的状态转移 Jacobian 和策略反向传播会影响峰值显存。缓存的张量字节数与训练进程的峰值显存应分别查看。
 
 ## 7 日志 预算核对与异常恢复
 
@@ -388,7 +397,7 @@ artifacts/eit_pro6000_v1/
 ├── launch/                       # 固定配置和工作脚本
 ├── init/seed2027.pt               # 每个 seed 的公共初始化
 ├── manifest.json                 # 冻结的评估场景和候选清单
-├── storage_policy.json           # 本次历史快照保存间隔
+├── storage_policy.json           # 策略 checkpoint 版本、后验步距和快照间隔
 ├── logs/                         # 工作脚本及各 Python 进程日志
 ├── resume/seed2027/               # A/B/C 第 50 轮现场参考和恢复验收 JSON
 ├── seed2027/
@@ -415,7 +424,9 @@ artifacts/eit_pro6000_v1/
 | critic 更新 | 1×2＝2 | 200 |
 | covariance 更新 | 按有效对数计算 | 汇总实际值，不预设三组相等 |
 
-除了 loss，还应查看物理失败频率、有效窗口/转移对、实际想象步数、独立验证进度和完成率。`metrics.jsonl` 的训练想象回报与从片头开始的独立闭环回报具有不同起点分布，不宜直接相减解释模型误差。`profiling.jsonl` 用于检查后验重建、优化和保存的实际成本。
+在 `metrics.jsonl` 的 `budget` 中，`effective_posterior_count` 是全部有效后验数，`available_policy_starts` 只计训练帧，`normalization_samples` 再限于本轮新采的保存帧。`posterior_revision_gap_min/mean/max` 表示当前模型与保存后验来源相差的 revision 数。`posterior_storage_bytes`、`boundary_history_storage_bytes`、`replay_sequence_storage_bytes`、`episode_head_storage_bytes`、`main_replay_storage_bytes` 分列各部分张量的存储量。
+
+`profiling.jsonl` 的 `seconds.posterior_cache_normalization_seconds` 包含缓存读取和输入归一化。`posterior_cache_read_seconds` 已包含在这段时间内。按 `seconds.round_seconds` 和 `runtime_after_save.cuda_peak_allocated_bytes` 核对整轮耗时与训练峰值显存。物理失败频率、有效模型窗口、实际想象步数、独立闭环进度和完成率用于判断这些开销对应的训练效果。
 
 15 条训练线对应 15 个独立 W&B run，共用 `eit_pro6000_v1` 实验分组。第 50 轮续训沿用各自 run ID 和累计轮数；离线片段需按先后顺序同步才能在同一 run 中查看完整曲线。默认横轴为 `Counters/collected_frames`。`ModelValidation/*` 是训练期间的世界模型留出指标，独立闭环验证/测试结果仍由第 8 节的评估流程生成，当前不会自动导入 W&B。`profiling.jsonl` 和 W&B 的 `Perf/*` 不包含 W&B 记录与退出刷盘开销。
 
@@ -452,7 +463,7 @@ CUDA_VISIBLE_DEVICES=1 "$EIT_PYTHON" -m supermimic.scripts.train_eit \
   > "$EIT_ROOT/logs/B_2027_recovery_from73.log" 2>&1
 ```
 
-恢复会清空 replay、重置真实环境并采集新轨迹。固定输入下的下一次模型和策略更新可以验收一致性，但真实物理轨迹不承诺接续未中断运行。除预定第 50 轮恢复外，任何意外恢复都应记录轮次和原因；它改变 replay 留存和后续数据，不能隐藏。若因此统一调整恢复日程，应重新锁定协议并重跑受影响的配对比较。
+第 50 轮生成的 `eit_live_update_reference_v2` 固定模型训练窗口和转移对、策略起点、后验来源 revision、当前想象模型身份及噪声。`check_eit_resume` 对照现场参考核验恢复后的下一次模型、actor 和 critic 更新。恢复训练会开启新物理 episode，因此意外中断的轮次和原因也应随结果记录，供配对比较核对。
 
 ## 8 训练结束后的验证和测试
 
@@ -516,13 +527,14 @@ PY
 
 | 目标 | 可考察的参数 | 需要同时核对的影响 |
 | --- | --- | --- |
-| 增加真实经验 | 总轮数、`num-envs`、`collection-steps` | 重新计算实采帧数和每帧更新量；改变采集长度也改变连续后验历史 |
-| 增加想象起点覆盖 | `policy-batch-size`，如试 4→8 | 起点准备、后验重建、显存和整轮耗时；不能只计 actor 反传 |
-| 增加同一起点的噪声样本 | `samples`，如试 2→4 | N×K 轨迹数增加，检查梯度方差和模型误差影响 |
-| 增加想象时间范围 | `policy-horizon`，如试 4→8 | 反传深度、模型误差累积、真实控制改善及 bootstrap 梯度贡献 |
-| 提高 GPU 并行度 | `policy-microbatch-size`，如试 2→4 | N/K/H 保持不变，测完整轮次及显存峰值，复验数值与恢复行为 |
+| 增加真实经验 | 总轮数、`--num-envs`、`--collection-steps` | 重新计算实采帧数和每帧更新量。改变采集长度也改变两次世界模型更新之间的实采步数 |
+| 减少后验存储 | `--posterior-save-stride`，依次测试 1、2、4 | 固定 N/K/H、更新次数和模型窗口预算，比较有效后验数、可用策略起点、归一化样本、峰值显存和完整轮次耗时 |
+| 增加每次更新抽取的想象起点数 | `--policy-batch-size`，如试 4→8 | 增加起点抽样和想象反传量，核对缓存读取耗时、显存和整轮耗时 |
+| 增加同一起点的噪声样本 | `--samples`，如试 2→4 | N×K 轨迹数增加，检查梯度方差和模型误差影响 |
+| 增加想象时间范围 | `--policy-horizon`，如试 4→8 | 反传深度、模型误差累积、真实控制改善及 bootstrap 梯度贡献 |
+| 提高 GPU 并行度 | `--policy-microbatch-size`，如试 2→4 | N/K/H 保持不变，测完整轮次及显存峰值，复验数值与恢复行为 |
 | 改进均值或协方差拟合 | 对应 lr、batch、更新数或 epochs | 留出均值误差、一步 NLL、残差白化与后验覆盖率；不要只看训练 loss |
 
-这些是单因素试验方向，不是已经验证适合 PRO 6000 的最佳参数。每次改动应在三组中保持统一规则，保留默认配置作对照。采集、replay 后验重建和完整滤波 Jacobian 可能限制吞吐，显存未用满并不直接说明需要放大所有 batch。
+小网络 CPU 验收使用 2 个环境、每环境 12 帧。S＝1、2、4 时，实际后验存储依次为 246,144、123,072、61,536 字节，第三轮可用训练起点为 12、6、3，归一化样本为 8、4、2。三组步距均通过固定输入恢复检查。该记录没有 GPU 实测。比较 PRO 6000 性能时，应使用同一 seed 和其余配置分别启动新实验，将首次运行的轮次与后续轮次分开报告。[增量后验 CPU 验收记录](validation/incremental_posterior_replay.json)
 
 本说明对应的关键入口为 [train_eit](../src/supermimic/scripts/train_eit.py)、[世界模型参数](../src/supermimic/scripts/train_utils.py)、[策略参数](../src/supermimic/learners/belief_policy_learner.py)、[恢复验证](../src/supermimic/scripts/check_eit_resume.py) 和 [批量评估](../src/supermimic/scripts/batch_eval_eit.py)。实际启动前用服务器当前代码的 `--help` 核对接口，保留源码快照、初始化包、冻结清单和运行日志。

@@ -3,8 +3,7 @@
 先完成 [环境安装](README.md#setup)，以下命令均在仓库根目录执行。
 `play.py` 加载已有模型，在单个仿真环境中观察策略跟踪效果和世界模型预测，不更新权重。
 
-旧输入布局继续使用 W&B 模型和原有 viewer。`eit_rpv_v1` 的 A/B/C 现在支持本地
-`eit_training_v3` 格式的 `training.pt` 定量评估与播放，共用 `EITPolicyAdapter`。同一适配器可执行 PyTorch 或导出的 ONNX actor。训练及梯度 smoke 仍使用 README 中的 `check_estimator` / `check_eit_training`。
+`eit_rpv_v1` 的 A/B/C 组使用本地 `training.pt` 做定量评估、播放和 ONNX actor 导出。评估与播放共用 `EITPolicyAdapter`，支持 PyTorch actor 和对应快照导出的 ONNX actor。
 
 Step 6 的真实 walking 单 seed A/B/C、固定输入恢复、逐快照诊断、预算审计与在线
 batch=1 性能测量见 [pilot 操作说明](docs/eit_pilot.md)。
@@ -17,23 +16,24 @@ MPKPE、root-relative MPKPE、关节速度 RMS 和末端位姿误差函数。每
 
 ```bash
 OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.eval_eit \
-  --checkpoint logs/eit-v3/B/training.pt \
+  --checkpoint logs/eit-v4/B/training.pt \
   --motion-file data/motions/walk1_subject1.npz --device cpu \
-  --num-envs 8 --output logs/eit-v3/B/evaluation.json
+  --num-envs 8 --output logs/eit-v4/B/evaluation.json
 
 .venv/bin/python -m supermimic.scripts.play SuperMimic-GenCoord-G1 \
-  --eit-checkpoint logs/eit-v3/B/training.pt \
+  --eit-checkpoint logs/eit-v4/B/training.pt \
   --motion-file data/motions/walk1_subject1.npz --viewer viser
 ```
 
-本地 EIT 播放不需要 W&B；不要同时传 `--wandb-path`。三组均以 eval 模式使用在线后验
-均值，C 额外读取任务 covariance，动作探索关闭，传感噪声和在线滤波保留。
-归一化固定，不创建 replay、critic 或 optimizer。每次真实 reset 按 checkpoint 的带噪
-真值先验初始化；这是仿真的初始化知识假设，不能解释为已经支持无真值的实机初始化。
+评估和播放在每个真实 episode 开始时按 checkpoint 的带噪真值先验初始化，随后每帧用实际执行的动作和传感测量更新后验。三组的评估目标均使用在线后验均值，C 组还读取任务 covariance。推理使用固定的归一化统计，关闭动作探索。训练参数 `--posterior-save-stride` 只控制训练 replay，评估时无需设置。
 
-评估和播放均可加载 v3 的固定 actor 模型训练快照及策略训练快照。两种入口都拒绝 v1、v2 轮次存档。模型训练快照可来自 model 或 full replay。策略训练快照须声明 full replay，并包含本组的 `eit_rpv_belief_critic_v2` 契约。
-加载器在创建推理模型前校验契约版本，并将声明的 context 宽度与世界模型的 context 宽度、声明的输入宽度与 critic 首层权重逐一核对。
-三组训练和初始化包的用法见 [训练说明](README.md#estimator-第四步完整策略与模型交替训练)。
+| 本地训练快照 | 支持的用途 |
+|---|---|
+| `eit_training_v4`，`stage=policy` | `train_eit` 续训、评估、播放和 ONNX actor 导出 |
+| `eit_training_v3`，`stage=policy` | 评估、播放和 ONNX actor 导出 |
+| `eit_training_v3`，`stage=model` | `train_belief` 续训、固定 actor 的评估、播放和 ONNX actor 导出 |
+
+策略快照须声明 full replay 并包含本组的 `eit_rpv_belief_critic_v2` 契约。推理加载器核对契约与世界模型的 context 宽度及 critic 首层的输入宽度。启动训练、生成共享初始化包及继续训练的命令见[训练说明](README.md#estimator-第四步完整策略与模型交替训练)。
 
 `eval_eit` 允许不同于训练数据的兼容 motion，记录训练和评估两份内容指纹；这不改变
 续训的严格 motion 校验。末端名单由 `--ee-body-names` 指定，默认使用 G1 的左右

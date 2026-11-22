@@ -412,7 +412,7 @@ CUDA_VISIBLE_DEVICES=<GPU_ID> uv run src/supermimic/scripts/train.py \
 
 `eit_rpv_v1` 实现 [plan_step1.md](plan_step1.md) 的输入与网络阶段：默认
 5×93 本体历史、700 维 motion 目标、C 组 450 维任务 covariance 编码及
-decoder 首层 LayerNorm 后的 FiLM。A/B 完全旁路 FiLM。旧配置保持原有行为。
+decoder 首层 LayerNorm 后的 FiLM。A/B 完全旁路 FiLM。
 
 奖励保留全局骨盆跟踪与相对身体形态跟踪的混合定义。actor 和全局奖励使用
 固定 episode 参考；刚体位姿奖励在评分时按当前真值根位姿的水平位置和 yaw
@@ -431,20 +431,9 @@ decoder 首层 LayerNorm 后的 FiLM。A/B 完全旁路 FiLM。旧配置保持�
 9×9 `covariance_rpv`。A 训练使用真值，A 评估与 B/C 必须提供后验均值。
 `EITInputConfig(mode="eval")` 控制信息来源；`actor.eval()` 仅控制网络模式。
 
-真实采集入口为 `runner.reset_collection()`、`runner.step(posterior=...)`。
-再次调用 `reset_collection()` 会将 replay 中尚未结束的 episode 标记为截断，
-保留已有数据，同时防止恢复历史或采样训练序列时跨越手动 reset。
-也可在构造 runner 时提供 legacy `posterior_provider`，成功采集时每个时间点调用一次，
-关键字参数是 `measurement`（64 维）、`previous_action`（29 维）和
-`reset_mask`。actor 和 provider 共用同一次高斯测量，完整 replay 保存这份测量用于重建策略历史。
-`imagined_posterior_provider` 应为独立实例；想象入口
-`runner.wm_env.reset(batch, posterior=...)` 和 `step(action, posterior=...)`
-支持逐步注入，不会沿用上一时刻的注入后验。reset 的 batch 可由
-`sample_initial_states()` 从 replay 生成，其中保存原测量历史及 episode 对齐。最早保留帧和保留区内各次真实 reset 都是训练片段起点，起点以前的 actor 历史用该帧同一次测量和实际上一动作填充。
-想象环境先校验后验和下一帧输入，再提交时间、状态与历史；校验失败时保留
-原环境状态，补齐后验后可重试。直接注入无效后验不会消耗测量噪声；外部
-provider 自身的状态更新及其调用前的噪声采样不在环境回滚范围内。
-这一节的逐步注入接口使用 RPV 视图。完整滤波后验的初始化和恢复见下方第二步。
+输入测试可通过 `runner.step(posterior=...)` 注入一帧 RPV 后验，也可向想象环境的 `reset(batch, posterior=...)` 和 `step(action, posterior=...)` 传入测试样本。外部回调 `posterior_provider` 接收 `measurement`（64 维）、`previous_action`（29 维）和 `reset_mask`。手动调用 `runner.reset_collection()` 会将未结束的 episode 标记为截断，保留已采集的帧。
+
+EIT 训练使用独立的采集和想象 provider，actor 和滤波器共用同一帧测量。初始化、采集和想象起点的用法见下节。
 
 `build_ablation_actors(cfg, wm, device)` 显式复制三组共同网络权重及归一化状态，
 各组参数存储独立。用 `actor_checkpoint(actor, cfg)` 保存包含输入版本、
@@ -452,8 +441,7 @@ provider 自身的状态更新及其调用前的噪声采样不在环境回滚�
 从训练配置切换到 `mode="eval"` 时显式传入 `for_evaluation=True`；其余配置
 仍严格匹配。世界模型和估计器后续也须从相同初始权重建立独立实例。
 
-输入阶段可运行采集和短序列计算图验证，`run()` / policy learner `update()` 明确拒绝
-完整策略训练。第二步接入真实滤波器，第三步通过 `train_belief` 先拟合预测均值，再拟合过程 covariance。第四步通过 `train_eit` 接通 belief critic、策略优化和短程闭环评估。
+固定 actor 拟合动力学使用 `train_belief`，联合更新世界模型、actor 和 critic 使用 `train_eit`。
 play/viewer 已通过共享 EIT 适配层支持本地 `training.pt`，用法见
 [EIT 评估与播放](README_eval.md#eit-定量评估和播放)，其中包含 EIT ONNX 导出与共享运行时的命令。
 
@@ -490,20 +478,19 @@ OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
 reset Jacobian、effective_rank 和 jitter。增益求解使用的 jitter 同时进入 Joseph 更新的测量 covariance。
 满秩 innovation 求解默认从 `1e-8` 开始尝试 jitter，每次乘 10，最多 5 次，上限 `1e-4`。
 
-真实采集可通过 runner 绑定同一个模型及独立的两个 provider：
+下面以已创建的 G1 EIT 并行训练环境 `env` 为例，参考动作采用 `uniform` 采样。示例执行一轮训练，每隔两个采集步保存一次后验。
 
 ```python
 from supermimic.models import ProcessNoiseConfig
+from supermimic.runners.eit_training import EITTraining, EITTrainingCfg
+from supermimic.runners.supermimic_runner import SuperMimicRunner, SuperMimicRunnerCfg
 
 cfg = SuperMimicRunnerCfg.for_estimator_inputs(
-    "C", process_noise=ProcessNoiseConfig(),
+    "C", process_noise=ProcessNoiseConfig(), sampling_mode="uniform", buffer_size=128,
 )
-# 用上面的 cfg 创建 env 和 runner。
-real, imagined = runner.configure_belief_filter()
-runner.reset_collection()
-for _ in range(collection_steps):
-    runner.step()
-runner.finish_collection_round()
+runner = SuperMimicRunner(env, cfg, "SuperMimic-GenCoord-G1", device=str(env.device))
+training = EITTraining(runner, EITTrainingCfg(posterior_save_stride=2))
+training.run_round()
 ```
 
 默认在真实首帧状态右侧施加独立高斯小扰动，以扰动后的完整状态作先验均值，
@@ -512,36 +499,34 @@ runner.finish_collection_round()
 `(0.01, 0.01, 0.05, 0.05, 0.005, 0.05)`，单位依次为 rad、m、m/s、rad/s、rad、rad/s。
 首帧融合 o₀ 一次，之后使用实际执行动作和记录的测量逐帧预测、修正。
 真实采集可通过 `configure_belief_filter(prior_factory=...)` 注入其他已知先验。
-部分 reset 只初始化对应槽位。默认 EIT 策略回放直接读取在线保存的 Q[t|t]；下面的前缀重建接口仅用于显式诊断和非缓存调用。
+部分 reset 只初始化对应槽位。
 
 provider 持有当前完整后验及其 `episode_id`、`time_index`、`model_version`。
 同一 replay 生命周期内，各并行环境的 episode 编号唯一；每个 episode 的
 `time_index` 从 0 开始，与参考片段的 `motion_time` 分别计数。runner 每次构建
 actor 输入都以当前帧标识向 provider 查询，同帧 restore 后立即使用恢复的后验。
 
-真实 provider 的 v3 快照记录实际使用的在线首帧先验。完整 replay 另外记录这份先验，在物理首帧仍保留时可通过 `episode_prefix` 核对实际前缀。
-完整 replay 在 `finish_collection_round()` 时为每个保留片段建立策略先验。重复读取或更新模型时复用同一份抽样，覆盖片段首帧后才为新的起点抽样。首次按键重放也会自动完成本轮分段。
-想象 reset 接收标量或每个槽位各自的索引。`time_index` 定位物理 episode 中的帧，`segment_time` 定位保留片段中的帧。
+想象起点使用物理帧的 `(episode_id, time_index)` 定位。可用 `sample_policy_starts` 从训练 episode 中抽样，也可用 `prepare_policy_starts(episode_ids, time_indices)` 按指定顺序读取已保存的帧。起点包含该帧动作前的后验、实测历史、潜在状态、参考对齐和 ξ。
 
 ```python
-obs = runner.wm_env.reset(episode_id=episode_ids, segment_time=0)
-obs, reward, termination_probability, _ = runner.wm_env.step(
-    action, process_noise=epsilon70, measurement_noise=eta64,
-)
-saved = runner.wm_env.snapshot()
-obs = runner.wm_env.restore(saved)
+wm_env = runner.wm_env
+starts = wm_env.sample_policy_starts(4, training.policy_episode_ids())
+obs = wm_env.reset_prepared(starts)
+obs, reward, termination_probability, _ = wm_env.step(training.actor(obs))
+saved = wm_env.snapshot()
+obs = wm_env.restore(saved)
 ```
 
-reset 在当前模型版本上重建从片段起点到目标帧的完整后验，以及同一目标帧的 actor 历史、潜在状态、参考和 ξ。该重建不保留历史模型学习图，返回的后验作为策略想象的初始条件。均值拟合直接从窗口首帧真值开始。所选物理帧已被覆盖或片段内部断开时，reset 报错并保留原 rollout。
-想象环境的 `snapshot()/restore()` 保存和恢复已提交帧的潜在状态、历史、动作、参考时间与对齐、ξ 及完整后验。可在相同模型和参考运动上直接从纯想象帧继续，恢复时不抽样、不重复融合测量。后续两个噪声参数均为标准正态样本，省略时各采样一次。奖励使用潜在真值。
+`reset_prepared` 直接使用保存的后验。之后的每个想象步传播后验、融合新测量，并按潜在真值计算奖励。固定噪声实验可向 `step` 传入标准正态样本 `process_noise` 和 `measurement_noise`。需要核对真实采集记录时，只要物理首帧仍在 replay 中，`episode_prefix(episode_id, t)` 就能取出该 episode 实际使用的首帧先验和到 t 为止的记录。
+
+想象环境的 `snapshot()/restore()` 保存和恢复已提交帧的潜在状态、历史、动作、参考时间与对齐、ξ 及完整后验。恢复后可在相同模型和参考运动上从该帧继续。
 
 想象环境快照使用 `version=2`，与 provider 的 v3 是不同的版本标识。
 `motion_digest` 是实际加载参考的 SHA-256 指纹，包含 clip 边界、关节和根状态、
 FK 刚体位姿与速度，以及各张量的 shape/dtype。保存和恢复时重新计算，
 相同长度但内容不同的 clip、clip 顺序变化或原地修改均会被拒绝，校验发生在恢复
 provider 与环境状态之前。文件路径和设备不参与指纹；数据相同的文件可迁移位置。
-计算按帧分块传回 CPU，仅在快照边界执行。旧 v1 或缺少指纹的快照无法验证参考身份，
-必须从保留 replay 重新 reset 并生成新快照，不能仅改版本号后加载。
+计算指纹时按帧分块传回 CPU。策略更新在只读阶段入口计算一次参考指纹，在准备起点和整个 rollout 中校验同一参考。
 
 `BeliefProvider.prepare/commit` 将滤波更新分成候选与提交；环境完成目标和
 后验校验后再提交。想象步先校验动作和显式噪声，并为噪声保留快照。
@@ -553,14 +538,9 @@ provider 的 `prepare()` 和 `prepare_restore()` 仅在 `differentiable=True` �
 provider 也尊重调用方的 `inference_mode()`，在内部转换为普通张量后求局部导数。
 从评估切回可微调用后，动作与模型梯度继续正常传播。
 
-`Dynamics.model_version` 在 provider 校验时根据当前权重、归一化和过程配置计算内容指纹，
-因此 fused Adam 更新后，恢复、推进及查询旧后验都会触发版本检查。真实 provider 默认使用
-`freeze_estimator_normalization=True` 固定本阶段采集的模型和 actor 归一化
-快照。后续模型更新需要重建活动采集器后验。模型参数
-固定时使用 `requires_grad_(False)`，保留预测对动作的梯度。`Dynamics.checkpoint()`
-和 `load_checkpoint()` 对保存的权重快照计算并核对相同的内容指纹。随机模型的 `world_model.pt` 一并保存滤波数值设置、测量标定及首帧高斯配置。在线状态另外通过
-`BeliefProvider.state_dict()/load_state_dict()` 保存完整 belief、context、episode 序号、帧序号、模型版本
-和滤波配置。
+EIT 用整数 `model_revision` 检查采集、准备起点和想象期间的模型身份。真实 provider 的快照分别记录当前模型的修订号和最后一次滤波使用的 `posterior_revision`。世界模型拟合完成后，真实采集从已提交的后验继续，用更新后的模型处理下一帧。策略想象期间固定模型参数，保留预测对动作的梯度。
+
+`Dynamics.checkpoint()` 和 `load_checkpoint()` 使用 SHA-256 内容指纹 `model_version` 校验模型权重与配置。随机模型的 `world_model.pt` 还保存滤波数值设置、测量标定及首帧高斯配置。`BeliefProvider.state_dict()/load_state_dict()` 可单独保存和恢复在线 belief、context、物理帧标识及滤波配置。
 
 第三步的滤波器要求动力学实现 `mean_lie` 和 `distribution_lie`。矩阵积分在每次
 姿态乘法后执行一次 Newton–Schulz 正交化，控制 float32 长序列中的旋转漂移。传播 Jacobian 默认使用
@@ -578,13 +558,13 @@ OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-step2-mpl \
   .venv/bin/python -m supermimic.scripts.check_estimator
 ```
 
-MuJoCo smoke 自动生成四帧静止参考，使用 2 个环境、容量为 2 的环形 buffer、8 步真实采集和两步随机想象。脚本独立核对从保留片段重建的完整均值和 covariance，再检查想象回报对 actor 的梯度和纯想象帧快照恢复，输出 JSON 诊断。使用 `--device cuda:0` 可运行 GPU 验收。策略/模型联合调度和 belief critic 见第四步。
+MuJoCo smoke 自动生成四帧静止参考，使用 2 个环境、容量为 2 的环形 buffer、8 步真实采集和两步随机想象。脚本核对后验均值和 covariance、想象回报对 actor 的梯度以及想象帧快照恢复，输出 JSON 诊断。使用 `--device cuda:0` 可运行 GPU 验收。策略/模型联合调度和 belief critic 见第四步。
 
 ## Estimator 第三步：拟合预测均值和过程 covariance
 
 `train_belief` 固定 actor。每轮采集结束后，用新训练帧更新模型归一化，然后完成两次拟合。验证 episode 默认满足 `episode_id % 5 == 0`。采样只使用同一 episode 中时间连续的真实后继帧。
 
-`train_belief` 在创建 runner 时选择 `replay_mode="model"`。每帧保存 `state`、`action`、`sim_ctx`、`episode_id`、`time_index`、`terminated` 和 `truncated`。采集端继续用实测历史和在线滤波产生动作，在执行下一步前核对上一执行动作。模型 replay 封存和建立窗口索引均不消耗随机数。均值窗口抽样和 covariance 批次洗牌仍使用训练 RNG，旧版本与新版在相同 seed 下可能产生不同的训练轨迹。
+`train_belief` 在创建 runner 时选择 `replay_mode="model"`。每帧保存 `state`、`action`、`sim_ctx`、`episode_id`、`time_index`、`terminated` 和 `truncated`。采集端用实测历史和在线滤波产生动作，在执行下一步前核对上一执行动作。训练 RNG 用于均值窗口抽样和 covariance 批次洗牌。
 
 | 阶段 | 数据与目标 | 默认配置 |
 |---|---|---|
@@ -624,23 +604,19 @@ critic 特征入口，保留 R/p/v 均值和边缘 covariance 的梯度。它是
 动作穿过滤波、covariance、FiLM、soft survival 和价值 bootstrap 的导数。
 clip 最后一个评分动作后停止回报，普通策略 horizon 截断保留 bootstrap。
 
-每轮模型更新完毕后，从仍有原始帧且保存了 posterior 的训练帧均匀有放回抽取策略起点，单帧片段也可入选。
-`--posterior-save-stride S`（默认 1，要求 1 ≤ S ≤ buffer_size）按全局采集步 0、S、2S… 保存；轮次切换或单环境 reset 不重启周期，也不强制保存 episode 首尾。
-保存动作执行前的 Q[t|t]：76 个 float32 均值（旋转矩阵、位置、速度、角速度、关节位置、关节速度）、2,485 个 float32 对称 covariance 下三角元素及来源 revision。读取时镜像非对角元素，不是 Cholesky 分解。
-posterior 独立容量为每环境 ceil(buffer_size / S)。主 replay 仍逐帧保存转移，均值和 covariance 拟合使用所有有效转移。
-仅从已有单帧 actor_obs 和最近被淘汰的 history_length−1 帧恢复控制历史，不逐帧保存完整 sensor_window；只在真实 episode 起点重复首帧，无法解释的缺口报错。
+真实环境每帧执行在线滤波，并将转移写入主 replay。`--posterior-save-stride S` 控制后验的保存间隔，默认 1，取值范围为 1 到 `buffer_size`。在全局采集步 0、S、2S…，缓存写入已融合当前测量、尚未执行当前动作的后验。采集步跨轮次和单环境 reset 连续计数。
 
-本轮新采、仍保留且保存了 posterior 的训练帧参与 actor/critic 归一化，每帧计一次；没有符合条件的新帧时统计不变。
-起点准备和归一化不调用滤波 predict/correct，不补算未保存帧；没有可用策略起点时报错。
-模型更新后在线 belief 保留，下一帧使用新模型递推；已经融合的测量不会重复融合。起点可混合不同来源 revision，想象后续每步仍完整可微。
-S 改变策略起点覆盖率和归一化采样密度，不改变在线滤波频率、N/K/H、优化次数或梯度传播深度。
-训练计算使用轻量 model_revision，采集及完整策略更新期间模型只读；SHA256 model_version 保留给 checkpoint、导出和显式诊断。
-起点准备和策略更新期间参考 motion 张量及底层存储也只读，内容摘要在阶段入口计算一次。
+每个环境的后验容量为 ⌈buffer_size / S⌉。每条记录保存 76 个 float32 均值分量、70×70 对称 covariance 的 2,485 个 float32 下三角元素，以及滤波时的整数修订号。控制历史由主 replay 的 `actor_obs` 和最近淘汰的 `history_length−1` 帧观测拼成。真实 episode 开头以首帧补齐，环形覆盖处使用保留的边界观测。
 
-归一化直接按设备上的缓存位置读取本轮训练帧。每轮 budget 记录 posterior_save_stride、effective_posterior_count、available_policy_starts、normalization_samples、posterior_revision_gap_* 以及 posterior、边界历史和主 replay 的存储字节数。episode_head_storage_bytes 单列仍可用于前缀诊断的真实首帧先验。
-profiling 的 posterior_cache_normalization_seconds 包含缓存读取与归一化，posterior_cache_read_seconds 单列其中的读取耗时。CUDA 在当前 stream 上记录事件，在归一化阶段结束时统一读取计时结果。旧 posterior_prefix_normalization_seconds 只代表历史前缀重建，报告分别汇总。
-[CPU 增量回放验收记录](docs/validation/incremental_posterior_replay.json) 包含 S=1/2/4 的三轮真实训练、固定输入恢复、实际存储字节数和耗时。该环境无可用 CUDA，记录不包含 GPU 加速结论。
-默认 history_length=5、4096 环境的边界观测额外占约 5.81 MiB，另加索引。GPU 完整轮次对比应先通过 S=1 正确性验收，再固定其他配置测量 S=2/4；不要把存储容量比例当作速度提升。
+| 训练步骤 | 使用的帧 |
+|---|---|
+| 世界模型拟合 | 从主 replay 的训练 episode 取有效窗口和相邻转移，包括未保存后验的帧。 |
+| actor/critic 归一化 | 直接按设备上的缓存位置读取本轮新采、仍保留且已保存后验的训练帧，每帧计一次。本轮样本数为零时沿用已有统计。 |
+| 策略想象 | 从全部仍保留且已保存后验的训练帧均匀有放回抽样，单帧片段也可入选。样本可来自不同模型修订号。若无可用起点则报错。 |
+
+每轮 `budget` 中，`effective_posterior_count` 是全部有效后验数，`available_policy_starts` 是其中属于训练 episode 的数量，`normalization_samples` 是本轮归一化的帧数。`posterior_revision_gap_*` 汇总当前模型与缓存来源的修订号差距。主 replay、后验、边界历史、序号索引和真实首帧先验分别统计存储字节数。
+
+`posterior_cache_normalization_seconds` 计入缓存读取和归一化的总耗时，`posterior_cache_read_seconds` 是其中的读取耗时。CUDA 计时在当前 stream 上记录事件，归一化结束时统一读取。默认 5 帧历史、4,096 个环境下，边界观测占约 5.81 MiB，另加索引。S=1、2、4 的实际缓存大小和三轮 CPU 耗时见[增量回放验收记录](docs/validation/incremental_posterior_replay.json)。
 
 A/B/C 的训练、评估和播放均要求联合 checkpoint 内嵌 `eit_rpv_belief_critic_v2` critic 契约。
 加载时校验组别、输入维度和 `rpv9_log_std_corr_v1` 编码。A 组也执行同一版本检查。
@@ -688,9 +664,9 @@ OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.eval_eit \
   --num-envs 8 --output logs/eit-v4/B/evaluation.json
 ```
 
-新策略训练使用 `eit_training_v4`，保存 stride、posterior 缓存协议和 model_revision，以及模型、actor、critic、优化器、归一化、RNG 和计数；不保存 replay、边界历史或模拟器现场。恢复时 stride 由 checkpoint 决定，命令行不能覆盖，空 replay 保存周期重新从 0 开始。v3 策略 checkpoint 仍可评估、播放和导出，但不能直接作为 v4 同协议续训。model-only 格式和 `eit_initialization_v3` 共享初始化包保持兼容。
-恢复前在私有副本上校验全部组件。恢复后清空 replay 并重置真实环境；固定相同
-原始输入和噪声可以验证优化器续训一致，但不承诺恢复物理模拟轨迹。固定输入参考 v2 同时保存起点缓存来源 revision 和当前 rollout 的模型 revision/内容摘要。
+策略续训使用 `eit_training_v4`。checkpoint 保存模型、actor、critic、优化器、归一化、RNG、训练计数，以及后验保存间隔、缓存协议和模型修订号。新进程从空 replay 和新物理 episode 开始，使用 checkpoint 中的间隔，从采集步 0 重新保存后验。训练对象再次向同一目录追加轮次时，会核对轮次、模型权重的 SHA-256 和修订号。
+
+用 `--resume-reference PATH` 可在本次训练的最后一轮提交 checkpoint 前，保存固定模型输入、策略起点、噪声和预期更新结果。参考文件同时记录缓存后验的来源修订号和本次想象模型的身份，用于复验恢复后的下一次模型和策略更新。模型专用训练和共享初始化包使用 v3 格式。各版本的评估与导出适用范围见[评估说明](README_eval.md#eit-定量评估和播放)。
 `eval_eit` 复用 mjlab tracking 的首 episode 评估循环和跟踪指标，从 clip 头开始，
 等待所有环境首个 episode 结束。它关闭动作探索，保留传感噪声及在线滤波，三组均使用
 后验均值。可用 `--steps` 限制 smoke 预算，未结束轨迹标记截断，成功率记为 null。
@@ -698,16 +674,17 @@ OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.eval_eit \
 本地 playback 使用 `play --eit-checkpoint ... --motion-file ...`，详见
 [评估统计口径及 viewer 说明](README_eval.md#eit-定量评估和播放)。
 
-可复现两轮真实训练、固定输入恢复和独立评估验收：
+`check_eit_training` 默认对 A/B/C 各训练三轮。以下命令在 B 组复验三个保存间隔，每次都核对固定输入下的下一次模型和策略更新，并在独立进程运行 4 步评估。
 
 ```bash
-OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
-  .venv/bin/python -m supermimic.scripts.check_eit_training --device cpu
-OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
-  .venv/bin/python -m supermimic.scripts.check_eit_training --device cuda:0 --full-width
+for stride in 1 2 4; do
+  OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
+    .venv/bin/python -m supermimic.scripts.check_eit_training \
+    --device cpu --groups B --rounds 3 --posterior-save-stride "$stride"
+done
 ```
 
-实测的训练规模、恢复检查和推理验证见[第三步验收记录](plan_step3.md#实测验收)。
+GPU 验收可将设备设为 `--device cuda:0` 并加上 `--full-width` 使用完整网络宽度。
 
 ## Acknowledgements
 

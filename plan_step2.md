@@ -2,7 +2,7 @@
 
 本计划承接已完成的 [plan_step1.md](plan_step1.md)，将第一步使用的合成或外部注入后验替换为可传播、可更新、可微分的完整 belief。分为三个可独立验收的实现阶段：完整 belief 与几何工具 → 随机动力学与滤波核心 → provider 集成与短序列梯度验证。文末列有几何、滤波和真实采集的验收命令。
 
-**当前实现状态。** 三个阶段的实现已接通：可用真实滤波器运行短序列采集，按保留片段以当前模型重建 replay 后验，并在小规模随机想象序列中验证模型、滤波和 actor 的计算图。第一步主体提交为 `c22a8af`；此后的奖励修正、几何和滤波核心分别独立提交，本记录与 provider 集成同批提交。完整模型训练调度、belief critic 和策略优化循环仍由后续阶段完成。
+**实现状态。** 三个阶段已接通，覆盖真实在线滤波、完整后验的保存与恢复，以及随机想象中模型、滤波和 actor 的计算图。第一步主体提交为 `c22a8af`，奖励修正、几何和滤波核心分别独立提交。完整训练使用 `train_eit`。[当前训练说明](README.md#estimator-第四步完整策略与模型交替训练)
 
 **第一步审阅结论与实施起点。** 第一阶段的输入布局、任务误差 covariance、FiLM 和采集接口作为本步基础。相关接口检查覆盖 replay 采样、想象入口和动作梯度。
 
@@ -174,9 +174,9 @@ actor 使用第一步的 `eit_rpv_v1`、5×93 历史和 700 维目标，每帧�
 
    想象验证需要分别维护潜在真值 s 和 belief Q：潜在状态按随机模型采样，测量从该潜在状态生成一次，滤波在自己的后验均值上预测和更新。最小接口应允许显式传入过程 ε 与测量 η，方便固定随机数进行数值梯度检查。奖励使用潜在真值及既定参考规则，B/C actor 使用后验构造目标。
 
-   使用完整 replay 时，每轮在各环境最早保留的帧和其后真实 reset 处分段。封存时在每个新片段首帧按配置采样完整 70 维右局部扰动，保存实际先验均值和 covariance。重建时，以该帧记录的测量与上一动作填充 actor 历史，融合首帧测量一次，再以当前模型按记录的动作和测量推进到所选帧。保留物理 episode 帧号用于定位，策略片段单独从 0 计时。已在想象中推进的帧也可通过完整环境快照恢复。
+   EIT 完整 replay 逐帧保存实测 `actor_obs`、动作和参考信息。按 `--posterior-save-stride` 指定的间隔，在执行动作前保存已融合当前测量的 Qₜ|ₜ 和来源 `model_revision`。按 episode 和帧号批量读取仍保留的起点，从单帧观测和环形边界历史组成 actor 窗口。只有真实 episode 首帧用于重复填充。
 
-   当前入口为 `finish_collection_round()` 与 `training_prefix(episode, t, relative=...)`。想象环境 `reset(episode_id=..., time_index=...)` 或 `reset(episode_id=..., segment_time=...)` 从该前缀重建；同一起点保留已抽样先验，模型变化只重新传播。此重建不保留历史模型学习图，后验作为想象初始条件。模型拟合独立读取真实状态、动作和 context。
+   策略通过 `prepare_policy_starts()` 取出完整后验，`reset_prepared()` 装入想象环境。K 条轨迹共享起点，从后继帧开始各自预测和校正。已推进的想象状态可通过完整环境快照恢复。
 
 4. 明确自动微分与归一化边界。
 
@@ -184,7 +184,7 @@ actor 使用第一步的 `eit_rpv_v1`、5×93 历史和 700 维目标，每帧�
 
    想象路径保留从动作、模型预测、A、L、covariance 更新、目标构造到 actor 输出的计算图。A、G 对模型、动作或状态的外层导数涉及混合二阶导数，应使用支持这些导数的实现，并分别验证模型学习与模型参数固定时的策略梯度。参数固定不能通过整个预测调用的 `no_grad` 实现，否则会阻断动作梯度。
 
-   原 runner 会在采集后更新归一化状态；真实 provider 默认通过 `freeze_estimator_normalization=True` 冻结模型及 actor 的归一化更新，第二步短序列不更新模型参数。`Dynamics.model_version` 对当前权重、buffer、过程噪声与积分配置计算内容指纹，包含归一化变化和 fused optimizer 写入。provider 的查询、restore、连续推进与 commit 检查版本；新 episode 可用当前版本重新初始化。每轮拟合后，策略起点和下一轮采集器按当前模型版本重建。
+   EIT 在真实采集和完整策略更新期间固定世界模型。归一化提交、模型拟合或加载权重时更新 `model_revision`。一次 prepare/commit 和一次想象 rollout 内校验当前模型身份；起点单独记录最后一次在线滤波的来源修订号。下一轮的第一个新测量在保留的 belief 上按新模型递推。`Dynamics.model_version` 的内容指纹用于存档、导出及显式诊断。
 
 5. 保存完整配置与完成运行记录。
 
@@ -192,7 +192,7 @@ actor 使用第一步的 `eit_rpv_v1`、5×93 历史和 700 维目标，每帧�
 
    `Dynamics.checkpoint/load_checkpoint` 校验模型内容与配置；runner 的 `WorldModel.bundle/load_bundle` 另外保存测量、滤波、初始先验配置及关节标定。provider 的 `right_local_provider_v3` 快照记录完整后验与实际采样的在线首帧先验。
 
-   `WorldModelEnv.snapshot/restore` 的想象快照使用独立的 `version=2`，额外保存参考数据的 `motion_digest`。SHA-256 覆盖 clip 边界、关节/根状态及 FK 刚体位姿与速度的 shape、dtype 和实际值，不依赖文件路径或设备。保存/恢复时分块重新计算；同长度不同内容、clip 重排及原地修改均拒绝恢复，且不提交 provider 或环境状态。旧 v1 或缺少指纹的快照明确报错，需要从保留 replay 重建，不能通过手改版本号迁移。
+   `WorldModelEnv.snapshot/restore` 的想象快照使用独立的 `version=2`，额外保存参考数据的 `motion_digest`。SHA-256 覆盖 clip 边界、关节/根状态及 FK 刚体位姿与速度的 shape、dtype 和实际值。保存和恢复时按块计算，同长度不同内容、clip 重排或原地修改都会使恢复校验失败。
 
    记录短序列设备、dtype、batch、horizon、耗时、covariance 范围、jitter 次数、失败原因、创新量和梯度结果。控制完成率、跟踪误差和校准曲线可作为后续诊断，不作为本步启动后续训练的门槛。
 
@@ -222,13 +222,13 @@ actor 使用第一步的 `eit_rpv_v1`、5×93 历史和 700 维目标，每帧�
 | `src/supermimic/models.py` | 二 | 可选噪声头、分布/采样接口、配置与 checkpoint 兼容性 |
 | `src/supermimic/estimator.py` | 二 | 纯函数 predict/correct、观测更新、innovation 与 jitter 诊断 |
 | `src/supermimic/belief_provider.py` | 三 | 完整后验的 prepare/commit、时序、版本与恢复 |
-| `src/supermimic/replay_buffer.py` | 三 | 幂等插入。完整 replay 还保留在线首帧先验、策略片段先验及按键前缀 |
+| `src/supermimic/replay_buffer.py`、`src/supermimic/posterior_replay.py` | 三 | 幂等插入、完整后验的稀疏存储和按帧键读取、观测历史恢复 |
 | `src/supermimic/runners/supermimic_runner.py` | 三 | 采集模式、独立 provider、reset/restore、版本及保存恢复 |
 | `src/supermimic/envs/world_model_env.py` | 三 | 想象双状态最小路径、随机数注入、原子提交和图边界 |
 | `src/supermimic/envs/multi_task_world_model_env.py` | 三 | 实际 runner 入口的必要接线与一致性检查 |
 | `src/supermimic/motion_loader.py` | 三 | 想象快照所用参考内容指纹 |
 | `src/supermimic/tasks/env_cfgs.py` | 第一步修正 | 真实物理步之后重新构建刚体位姿奖励的对齐参考 |
-| `src/supermimic/scripts/check_estimator.py` | 三 | CPU/GPU 可选的真实采集、重建、随机想象及快照 smoke |
+| `src/supermimic/scripts/check_estimator.py` | 三 | CPU/GPU 可选的真实采集、滤波诊断、随机想象及快照 smoke |
 | 新增及受影响的测试 | 一至三 | 几何、滤波、数值梯度、生命周期与集成验收 |
 | `README.md`、`README_eval.md`、两份计划 | 三 | 运行方式、初始化/恢复契约、可用范围、验收记录与提交安排 |
 
@@ -240,7 +240,7 @@ actor 使用第一步的 `eit_rpv_v1`、5×93 历史和 700 维目标，每帧�
 
 几何和数值导数检查优先使用 float64；实际运行 dtype 另设合理容差。Monte Carlo 使用固定种子和统计容差，梯度有限差分固定所有随机样本。每个提交均应有可单独执行的验收命令和结果记录；单元测试通过后再进入依赖环境的烟雾验证。
 
-**后续接口。** 策略起点按当前模型从保留片段的先验重建完整后验。两个模型拟合阶段直接使用真实 replay 帧，在线采集和策略想象共用更新后的动力学模型。[训练与验收](plan_step3.md)
+**训练接口。** 两阶段模型拟合读取真实 replay 转移，策略想象从缓存的在线后验启动。[模型拟合](plan_step3.md) · [策略起点与训练](plan_step4.md)
 
 ```bash
 OMP_NUM_THREADS=1 .venv/bin/python -m pytest -q tests/test_estimator_lie_state.py tests/test_estimator_matrix_dynamics.py tests/test_estimator_belief_filter.py

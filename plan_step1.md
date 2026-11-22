@@ -1,8 +1,8 @@
 **第一步实施计划：策略输入、任务误差协方差与 FiLM 调制**
 
-**实现状态。** 第一步输入与网络主体已提交为 `c22a8af`（`feat: implement step-1 estimator-aware policy inputs`）。本文保留第一步的设计与验收边界；[第二步](plan_step2.md) 已接通完整滤波、保留片段后验重建和随机想象。实际 Git 提交拆分及各批验收记录见第二步文档末尾，完整 EIT 训练尚未开放。
+**实现状态。** 第一步输入与网络主体已提交为 `c22a8af`（`feat: implement step-1 estimator-aware policy inputs`）。第二步接通完整在线滤波和随机想象，联合训练使用 `train_eit`。[第二步验收](plan_step2.md) · [当前训练说明](README.md#estimator-第四步完整策略与模型交替训练)
 
-本次聚焦 G1 GenCoord motion tracking 的策略输入与网络接口。actor 使用三条路径：本体感知及动作短历史提供即时反馈，参考目标承载 R、p、v 的真值或后验均值，不确定性分支使用任务误差协方差调制 decoder。第一步通过可控的后验输入完成实现与验证，真实滤波器和完整 estimator-in-the-loop 训练在后续接入。
+本步聚焦 G1 GenCoord motion tracking 的策略输入与网络接口。本体感知及动作短历史提供即时反馈，参考目标承载 R、p、v 的真值或后验均值，不确定性分支使用任务误差协方差调制 decoder。第一步的接口验证使用可控的后验输入。
 
 **实验定义与共同配置。** 三组使用相同的世界模型和估计器实现、配置及初始权重，各组独立采集数据、独立更新参数。每轮从真实窗口拟合预测均值，再用独立优化器拟合一步过程 covariance。第一步测试可以共用固定模型、输入样本及合成后验。
 
@@ -56,7 +56,7 @@ V = diag(σ_g² I₃, σ_ω² I₃, σ_q² I₂₉, σ_qdot² I₂₉)
 
 episode 初始化用同一份首帧 (o₀, a₋₁) 填充历史，a₋₁ 使用环境 reset 后定义的初始动作。填充不会产生额外滤波更新。自动 reset 后的首帧必须与上一 episode 的末帧区分。想象起点复用 replay 中的历史和当前测量，后续新时间点再各自生成一次新测量。
 
-完整 replay 每轮封存后，各环境最早保留的帧作为策略片段第 0 帧。保留区内每次真实 episode 重置也开启新片段。即使环形 buffer 已覆盖 episode 开头，片段首帧仍使用当时记录的上一执行动作和带噪测量，重复填充 actor 历史。完整滤波器在同一帧从加小噪声的真实状态初始化。采集端继续原有的在线历史。
+策略起点按物理 episode 和帧号定位。读取起点时，从主 replay 和最近淘汰的边界观测中取出同一 episode 的连续历史。环形 buffer 覆盖后仍能还原采集时使用的观测窗口。
 
 **700 维参考目标。** 沿用当前至未来 0.9 秒的 10 帧参考窗口，控制频率 50 Hz、参考 stride=5。所有参考帧共用当前时刻所选的 Rₜ、pₜ、vₜ。下式用后验均值表示 B/C 和测试阶段，A 训练时替换为潜在真值。
 
@@ -68,7 +68,7 @@ episode 初始化用同一份首帧 (o₀, a₋₁) 填充历史，a₋₁ 使�
 | 相对基座线速度 | 30 | e_v,j = R̂ₜᵀ(v参考,j − v̂ₜ) |
 | 合计 | 700 | [关节参考，相对位置，相对朝向，相对线速度] |
 
-目标 builder 显式接受所选 R、p、v 及已对齐的参考窗口。实现位于 `estimator_inputs.build_motion_goal`，线速度由 `RpvState` 显式提供，不从真值环境中隐式补取。采集与想象共用该 builder，评估模式的输入可调用同一接口；独立 play/viewer 入口仍拒绝新输入版本。B/C 不继续使用读取机器人真值姿态的旧目标入口。
+目标 builder 显式接受所选 R、p、v 及已对齐的参考窗口。实现位于 `estimator_inputs.build_motion_goal`，线速度由 `RpvState` 显式提供。采集、想象与评估按组使用相同的特征定义。[评估与播放](README_eval.md)
 
 每个 episode 在初始化时确定一次水平旋转和平移对齐变换，并保存该变换。参考位置应用旋转和平移，参考朝向左乘该旋转，参考线速度只旋转。轨迹随后按固定对齐推进，不随当前机器人或估计器的位置、朝向重新对齐。每个并行环境独立持有其变换，不修改共享 motion 原始数据。
 
@@ -173,11 +173,11 @@ FiLM 不施加“uncertainty 增大时特征必然减弱”的单调约束，其
 | [envs/multi_task_world_model_env.py](src/supermimic/envs/multi_task_world_model_env.py) | runner 实际使用的目标与 actor 输入出口 |
 | [tasks/env_cfgs.py](src/supermimic/tasks/env_cfgs.py) | 关闭重复 corruption，核对测量单位、bias 和真值目标入口 |
 | [motion_loader.py](src/supermimic/motion_loader.py)、[motion_command.py](src/supermimic/motion_command.py) | 复用参考线速度和 clip 索引，支持 episode 固定对齐状态 |
-| [replay_buffer.py](src/supermimic/replay_buffer.py) 及调用方 schema | 实际测量、执行动作和对齐信息的保存与历史恢复；本步不实现完整后验重建 |
+| [replay_buffer.py](src/supermimic/replay_buffer.py) 及调用方 schema | 实际测量、执行动作和对齐信息的保存与历史恢复 |
 | 相关现有测试与新增几何、FiLM 测试 | 覆盖上述验收，运行受影响的 representation、history、task、model 和 replay 回归测试 |
 
-现有 play/viewer 和 exporter 存在独立构造目标或直接调用 decoder 的路径。第一步审计这些入口，对新输入版本显式适配或明确拒绝尚不支持的模式，避免静默漏掉位置、速度或 FiLM。完整 ONNX 部署适配与独立批量评估工具留到后续阶段。新输入版本与旧 checkpoint 的兼容性必须显式检查，不强行加载不同目标维度的权重。
+评估、播放与导出入口按 checkpoint 的输入契约选择目标和 FiLM 分支，并校验输入维度及权重。[评估与部署说明](README_eval.md)
 
 **第一步完成条件。** 以上输入、历史、几何、调制、信息权限和短序列接口测试全部通过，实际采集与想象入口共用相同特征构建逻辑，配置及权重可保存恢复。短序列验证仅证明接口和计算图可用，不宣称 estimator-in-the-loop 已完整实现或获得控制性能收益。
 
-真实滤波传播与更新、按当前模型版本从保留片段恢复后验及小 batch 随机想象已由第二步接入，均不是第一步的验收前置条件。模型拟合和策略更新分别见[第三步](plan_step3.md)和[第四步](plan_step4.md)。
+后续阶段接入了真实滤波、缓存后验读取和小 batch 随机想象。模型拟合和策略更新分别见[第三步](plan_step3.md)和[第四步](plan_step4.md)。

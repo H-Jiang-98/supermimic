@@ -6,6 +6,9 @@
 [小网络验收命令](../README_eval.md#共同初始化快照与批量选模)。`train_eit` 新训练默认每 10 轮
 发布历史快照；清单中的候选必须与保存间隔匹配。缺失的历史轮次不能从最新 `training.pt` 补造。
 
+批量评估接受 v4 和 v3 策略快照。`frames` 按累计实采帧数填写；训练中的
+`posterior_save_stride` 决定各环境后验的保存频率，并影响策略可选起点数。评估时每个控制步都运行滤波。
+
 ```json
 {
   "design": "seen",
@@ -30,9 +33,9 @@
 冻结清单时会在指定设备上加载各文件，登记原始文件 SHA-256、参考张量摘要、完整评估环境配置（含 reset 扰动、域随机化、终止阈值、奖励、物理求解、动作和观察配置）、prior、测量噪声、控制周期及实际超时步数。显示设置不参与冻结，seed 和环境数量单独登记。每个场景从第 0 帧运行，每个环境贡献一个首 episode。使用自定义 prior 或测量噪声时，将存档中的配置填入顶层 `initial_prior` 和 `measurement_noise`。
 
 ```bash
-python -m supermimic.scripts.batch_eval_eit freeze --spec study.json --manifest logs/step5/manifest.json
-python -m supermimic.scripts.batch_eval_eit run --manifest logs/step5/manifest.json --output logs/step5/eval --split validation
-python -m supermimic.scripts.batch_eval_eit run --manifest logs/step5/manifest.json --output logs/step5/eval --split test
+.venv/bin/python -m supermimic.scripts.batch_eval_eit freeze --spec study.json --manifest logs/step5/manifest.json
+.venv/bin/python -m supermimic.scripts.batch_eval_eit run --manifest logs/step5/manifest.json --output logs/step5/eval --split validation
+.venv/bin/python -m supermimic.scripts.batch_eval_eit run --manifest logs/step5/manifest.json --output logs/step5/eval --split test
 ```
 
 `run` 为每项评估启动独立子进程，输出 `tasks/<任务摘要>.json`，保留场景、快照摘要及逐环境的原始 episode。用 `report` 替换 `run` 可重新汇总已有结果。任务缺失、失败或仍有截断时，命令返回非零退出码，报告列出受影响的组别、训练 seed、候选帧数和场景。再次 `run` 会补跑缺失、失败或缓存损坏的任务，并复用已完成的任务。

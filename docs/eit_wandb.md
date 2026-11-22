@@ -35,11 +35,21 @@ OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.train_eit \
 | `Train/*` | 世界模型训练损失、过程 NLL、窗口与转移样本量 |
 | `ModelValidation/*` | 世界模型留出数据上的损失和样本量 |
 | `Policy/*`、`Grad/*` | 想象回报、critic loss、explained variance、动作饱和、FiLM 与梯度范数等 |
-| `Budget/*` | 当轮采集、训练更新、想象步数、终止频率及有效样本统计 |
-| `Perf/*` | 采集、后验重建、训练、保存等阶段耗时 |
+| `Budget/*` | 当轮采集、训练更新、想象步数、终止频率、后验缓存与策略起点统计 |
+| `Perf/*` | 采集、后验缓存读取、输入归一化、训练、保存等阶段耗时 |
 | `Runtime/*`、`RuntimeAfterSave/*` | 线程数和可用时的 CUDA 显存统计 |
 
 默认横轴为累计实采帧数 `Counters/collected_frames`，也可在 W&B 页面选择累计轮数 `Counters/round`。`None` 和非有限数值不绘制。config 保存组别、seed、motion 摘要、共享初始化摘要、环境数、runner/loop/policy 参数和快照间隔。
+
+比较保存间隔时，从 config 的 `loop_config.posterior_save_stride` 或每轮的 `Budget/posterior_save_stride` 读取实际设置。以下指标均可在同一轮的本地 JSONL 中核对。
+
+| 指标 | 读法 |
+| --- | --- |
+| `Budget/effective_posterior_count`、`Budget/available_policy_starts` | 前者统计仍有原始帧的全部缓存后验，后者只统计可采样的训练帧 |
+| `Budget/normalization_samples`、`Budget/policy_starts_drawn` | 前者是本轮实际参与归一化的新采训练后验数，可以为 0；后者按有放回的策略抽样计数 |
+| `Budget/posterior_revision_gap_min`、`Budget/posterior_revision_gap_mean`、`Budget/posterior_revision_gap_max` | 当前模型与有效缓存后验来源的修订号差 |
+| `Budget/posterior_storage_bytes`、`Budget/boundary_history_storage_bytes` | 后验存储与边界观测历史各自占用的张量字节数 |
+| `Perf/posterior_cache_read_seconds`、`Perf/posterior_cache_normalization_seconds` | 缓存读取耗时已计入归一化阶段总耗时，两项有重叠 |
 
 `ModelValidation/*` 不代表独立整段闭环测试；`Policy/return` 是训练想象回报。现有独立验证/测试结果、视频和旧 JSONL 历史不会自动导入。每轮耗时不包含 W&B 回调及退出刷盘时间。
 
