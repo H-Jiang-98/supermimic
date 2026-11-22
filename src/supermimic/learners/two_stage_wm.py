@@ -118,9 +118,11 @@ class TwoStageWorldModelLearner:
     return staged
 
   def _commit_normalization(self, staged) -> None:
+    self.dynamics.begin_write()
     for live, candidate in zip(self.dynamics.normalizers(), staged, strict=True):
       live.load_state_dict(candidate.state_dict())
       live.eval()
+    self.dynamics.finish_write()
 
   def update_normalization(self, states: torch.Tensor, actions: torch.Tensor) -> None:
     self._commit_normalization(self.stage_normalization(states, actions))
@@ -158,6 +160,7 @@ class TwoStageWorldModelLearner:
     return process_nll(batch["residual"], self.dynamics.noise_factor(batch["inputs"]))
 
   def update_covariance(self, batch: TensorDict) -> torch.Tensor:
+    self.dynamics.begin_write()
     self.dynamics.eval()
     self.dynamics.mlp.requires_grad_(False)
     self.dynamics.mlp.zero_grad(set_to_none=True)
@@ -175,6 +178,7 @@ class TwoStageWorldModelLearner:
       self.cov_optimizer.zero_grad(set_to_none=True)
       raise FloatingPointError("Non-finite squared process covariance gradient")
     self.cov_optimizer.step()
+    self.dynamics.finish_write()
     self.cov_steps += 1
     return loss.detach()
 

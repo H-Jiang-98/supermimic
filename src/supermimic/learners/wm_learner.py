@@ -104,7 +104,9 @@ class WorldModelLearner:
 
     # EmpiricalNormalization.update is a no-op in eval mode; toggle to train
     # for the updates and restore afterward.
-    if normalizers is None:
+    live = normalizers is None
+    if live:
+      self.dynamics.begin_write()
       normalizers = self.dynamics.normalizers()
     for n in normalizers:
       n.train()
@@ -115,15 +117,21 @@ class WorldModelLearner:
     finally:
       for n in normalizers:
         n.eval()
+      if live:
+        self.dynamics.finish_write()
 
   def update(self, data: Iterable[TensorDict]) -> dict[str, torch.Tensor]:
+    self.dynamics.begin_write()
     self.dynamics.train()
     for normalizer in self.dynamics.normalizers():
       normalizer.eval()
     for p in self._all_params:
       p.requires_grad_(True)
     batches = torch.stack([td.select("state", "action", "sim_ctx") for td in data])
-    return self._captured_update(batches)
+    try:
+      return self._captured_update(batches)
+    finally:
+      self.dynamics.finish_write()
 
   def _update_from(self, batches: TensorDict) -> dict[str, torch.Tensor]:
     stats = []

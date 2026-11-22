@@ -3,15 +3,16 @@
 import json
 import math
 from dataclasses import replace
+from unittest.mock import Mock
 
 import torch
 
-from supermimic.utils.profiling import PhaseTimer, runtime_metadata
+from supermimic.utils.profiling import PhaseTimer, StreamTimer, runtime_metadata
 from tests.test_estimator_belief_training import training as model_training
 from tests.test_estimator_eit_training import training
 
 
-def test_round_budget_counts_actual_updates_and_prefix_reconstruction(tmp_path):
+def test_round_budget_counts_actual_updates_and_cache_reads(tmp_path):
   loop = training()
   loop.policy.cfg = replace(loop.policy.cfg, num_batches=2)
   [row] = loop.run(1, tmp_path)
@@ -27,9 +28,11 @@ def test_round_budget_counts_actual_updates_and_prefix_reconstruction(tmp_path):
   assert budget["policy_starts_drawn"] == 4
   assert budget["imagined_steps"] == 16
   assert 0 < budget["survival_weighted_imagined_steps"] <= 16
-  assert budget["posterior_prefix_episodes"] == 1
-  assert budget["posterior_prefix_frames"] == 4
-  assert budget["posterior_prefix_length_max"] == 4
+  assert budget["effective_posterior_count"] == 8
+  assert budget["normalization_samples"] == 4
+  assert budget["available_policy_starts"] == 4
+  assert budget["posterior_storage_bytes"] > 0
+  assert budget["episode_head_storage_bytes"] > 0
   assert budget["physical_episode_endings"] == 0
   state = torch.load(tmp_path / "training.pt", weights_only=True)
   assert state["last_metrics"] == row
@@ -37,12 +40,17 @@ def test_round_budget_counts_actual_updates_and_prefix_reconstruction(tmp_path):
     json.loads(line) for line in (tmp_path / "profiling.jsonl").read_text().splitlines()
   ]
   seconds = profile["seconds"]
+  assert (
+    0
+    < seconds["posterior_cache_read_seconds"]
+    <= seconds["posterior_cache_normalization_seconds"]
+  )
   for name in (
     "physical_collection_seconds",
     "mean_rollout_update_seconds",
     "residual_extraction_seconds",
     "covariance_fit_seconds",
-    "posterior_prefix_normalization_seconds",
+    "posterior_cache_normalization_seconds",
     "policy_rollout_backward_seconds",
     "critic_regression_seconds",
     "checkpoint_save_seconds",
@@ -51,7 +59,9 @@ def test_round_budget_counts_actual_updates_and_prefix_reconstruction(tmp_path):
   ):
     assert math.isfinite(seconds[name]) and seconds[name] > 0
   assert seconds["round_seconds"] >= sum(
-    value for name, value in seconds.items() if name != "round_seconds"
+    value
+    for name, value in seconds.items()
+    if name not in ("round_seconds", "posterior_cache_read_seconds")
   )
   assert profile["runtime"]["dtype"] == "torch.float64"
   assert profile["runtime"]["cuda_peak_allocated_bytes"] is None
@@ -81,3 +91,24 @@ def test_cpu_profiling_does_not_consume_randomness_or_touch_cuda(monkeypatch):
     runtime_metadata(torch.zeros(1), reset_peak=True)
   torch.testing.assert_close(torch.random.get_rng_state(), rng, rtol=0, atol=0)
   assert timer.seconds["work"] > 0
+
+
+def test_cache_timing_waits_only_for_the_final_stream_event(monkeypatch):
+  stream = object()
+  monkeypatch.setattr(torch.cuda, "current_stream", lambda device: stream)
+  monkeypatch.setattr(torch.cuda, "synchronize", Mock(side_effect=AssertionError))
+  events = [Mock() for _ in range(6)]
+  for event in events:
+    event.elapsed_time.return_value = 2.0
+  monkeypatch.setattr(torch.cuda, "Event", Mock(side_effect=events))
+  timer = StreamTimer("cuda:0")
+  with timer.measure("normalization"):
+    for _ in range(2):
+      with timer.measure("read"):
+        pass
+  for event in events:
+    event.record.assert_called_once_with(stream)
+    event.synchronize.assert_not_called()
+  assert timer.seconds() == {"normalization": 0.002, "read": 0.004}
+  events[1].synchronize.assert_called_once_with()
+  assert sum(event.synchronize.call_count for event in events) == 1

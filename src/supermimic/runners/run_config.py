@@ -14,12 +14,16 @@ from supermimic.runners.eit_snapshots import checkpoint_snapshot_interval
 from supermimic.runners.supermimic_runner import SuperMimicRunnerCfg
 
 EIT_TRAINING_VERSION = "eit_training_v3"
+EIT_POLICY_TRAINING_VERSION = "eit_training_v4"
 EIT_INITIALIZATION_VERSION = "eit_initialization_v3"
 
 
 def validate_eit_checkpoint_contract(saved: dict, *, stage: str | None = None) -> None:
   """Validate the EIT format and the joint trainer's critic layout before loading."""
-  if not isinstance(saved, dict) or saved.get("version") != EIT_TRAINING_VERSION:
+  if not isinstance(saved, dict) or saved.get("version") not in (
+    EIT_TRAINING_VERSION,
+    EIT_POLICY_TRAINING_VERSION,
+  ):
     raise ValueError(f"Expected {EIT_TRAINING_VERSION} checkpoint")
   checkpoint_snapshot_interval(saved)
   kind = saved.get("stage")
@@ -30,6 +34,26 @@ def validate_eit_checkpoint_contract(saved: dict, *, stage: str | None = None) -
     kind == "policy" and replay_mode != "full"
   ):
     raise ValueError(f"Invalid replay mode {replay_mode!r} for {kind} checkpoint")
+  if saved["version"] == EIT_POLICY_TRAINING_VERSION:
+    from supermimic.posterior_replay import POSTERIOR_REPLAY_VERSION
+
+    error = "Invalid incremental posterior replay checkpoint contract"
+    try:
+      stride = saved["loop_config"]["posterior_save_stride"]
+      revision = saved["model_revision"]
+      compatible = (
+        kind == "policy"
+        and saved.get("posterior_replay_protocol") == POSTERIOR_REPLAY_VERSION
+        and type(stride) is int
+        and 1 <= stride <= saved["runner_config"]["buffer_size"]
+        and type(revision) is int
+        and revision >= 0
+        and revision == saved["world_model"]["dynamics"].get("model_revision")
+      )
+    except (KeyError, TypeError, AttributeError) as exc:
+      raise ValueError(error) from exc
+    if not compatible:
+      raise ValueError(error)
   if kind == "model":
     if "critic" in saved or "policy" in saved:
       raise ValueError("Model-stage checkpoint contains policy training state")

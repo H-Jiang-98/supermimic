@@ -41,7 +41,9 @@ def test_creating_and_reusing_shared_initialization_leave_same_training_rng():
 def test_resume_rejects_prior_replay_contract_without_changing_rng(make_loop):
   loop = make_loop()
   checkpoint = loop.state_dict()
-  assert checkpoint["version"] == "eit_training_v3"
+  assert checkpoint["version"] == (
+    "eit_training_v4" if checkpoint["stage"] == "policy" else "eit_training_v3"
+  )
   checkpoint["version"] = "eit_training_v2"
   rng = torch.random.get_rng_state()
   with pytest.raises(ValueError, match=EIT_TRAINING_VERSION):

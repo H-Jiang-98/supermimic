@@ -19,9 +19,15 @@ from pathlib import Path
 import torch
 from filelock import FileLock
 
-from supermimic.runners.eit_resume_contract import resume_execution_matches
+from supermimic.runners.eit_resume_contract import (
+  SUPPORTED_REFERENCE_VERSIONS,
+  resume_execution_matches,
+)
 from supermimic.runners.eit_snapshots import file_sha256
-from supermimic.runners.run_config import validate_eit_checkpoint_contract
+from supermimic.runners.run_config import (
+  EIT_POLICY_TRAINING_VERSION,
+  validate_eit_checkpoint_contract,
+)
 from supermimic.scripts.pilot_report_diagnostics import diagnostic_structure_errors
 
 
@@ -60,6 +66,8 @@ def resume_result_matches(
   try:
     result = json.loads(path.read_text())
     live = torch.load(reference, weights_only=True, mmap=True, map_location="cpu")
+    if live.get("version") not in SUPPORTED_REFERENCE_VERSIONS:
+      return False
     return resume_execution_matches(result, live, process_environment) and all(
       result.get(key) == expected
       for key, expected in {
@@ -73,7 +81,7 @@ def resume_result_matches(
         "fixed_input_model_resume_exact": True,
         "live_optimizer_reference": True,
         "expected_source": "live_training_before_checkpoint_commit",
-        "reference_version": "eit_live_update_reference_v1",
+        "reference_version": live["version"],
         "reference_sha256": file_sha256(Path(reference)),
       }.items()
     )
@@ -107,9 +115,20 @@ def checkpoint_progress(saved, p, group):
   return rounds
 
 
+def _has_incremental_checkpoints(output, protocol):
+  """Identify pilots recorded under v2 metadata after incremental training shipped."""
+  checkpoints = sorted(output.glob("[ABC]/training.pt"))
+  for checkpoint in checkpoints:
+    saved = torch.load(checkpoint, map_location="cpu", weights_only=True, mmap=True)
+    if saved.get("version") != EIT_POLICY_TRAINING_VERSION:
+      return False
+    checkpoint_progress(saved, protocol, checkpoint.parent.name)
+  return bool(checkpoints)
+
+
 def protocol(motion, seed, device, online_device):
   return {
-    "version": "eit_pilot_v2",
+    "version": "eit_pilot_v3",
     "training_process_environment": {
       "PYTORCH_JIT": "0",
       **(
@@ -158,7 +177,7 @@ def protocol(motion, seed, device, online_device):
       "critic_updates": 20,
     },
     "covariance_rule": "epochs * ceil(valid_training_pairs / batch_size), each round",
-    "continuous_collection_limit_s": 1.28,
+    "collection_continues_across_rounds": True,
   }
 
 
@@ -674,11 +693,21 @@ def main():
     if path.exists():
       previous = json.loads(path.read_text())
       # Historical snapshots can still be rescored under their frozen protocol.
-      legacy = {k: v for k, v in p.items() if k != "training_process_environment"}
-      legacy["version"] = "eit_pilot_v1"
-      if previous != p and not (args.phase == "evaluate" and previous == legacy):
-        raise ValueError("Pilot configuration changed; use a new output directory")
-      p = previous
+      if previous != p:
+        legacy_v2 = {
+          k: v for k, v in p.items() if k != "collection_continues_across_rounds"
+        }
+        legacy_v2.update(version="eit_pilot_v2", continuous_collection_limit_s=1.28)
+        legacy_v1 = {
+          k: v for k, v in legacy_v2.items() if k != "training_process_environment"
+        }
+        legacy_v1["version"] = "eit_pilot_v1"
+        if args.phase == "evaluate" and previous in (legacy_v2, legacy_v1):
+          p = previous
+        elif previous == legacy_v2 and _has_incremental_checkpoints(output, p):
+          write_json(path, p)
+        else:
+          raise ValueError("Pilot configuration changed; use a new output directory")
     else:
       write_json(path, p)
     pilot = Pilot(output, p)

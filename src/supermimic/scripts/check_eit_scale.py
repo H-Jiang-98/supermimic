@@ -119,6 +119,7 @@ def main():
       runner = SuperMimicRunner(
         env, runner_cfg, "SuperMimic-GenCoord-G1", device=args.device
       )
+      runner.replay_buffer.enable_posterior_cache(1, runner.cfg.history_length)
       runner.configure_belief_filter()
       runner.reset_collection()
       for _ in range(4):
@@ -158,7 +159,7 @@ def main():
       begin = time.perf_counter()
       starts = runner.wm_env.prepare_policy_starts(*keys)
       sync()
-      prefix_seconds = time.perf_counter() - begin
+      cache_read_seconds = time.perf_counter() - begin
 
       # Full production derivative, with fixed process and measurement noises.
       numeric_cfg = replace(base_cfg, num_samples=1, horizon=2)
@@ -316,7 +317,7 @@ def main():
     "repeats": args.repeats,
     "scope": "Fixed model C policy: stochastic rollout, full belief filter, RPV critic, actor backward and two critic epochs; excludes collection and prefix replay",
     "model_unchanged": True,
-    "prefix_reconstruction_seconds": prefix_seconds,
+    "posterior_cache_read_seconds": cache_read_seconds,
     "numerical": numerical,
     "configurations": reports,
     "source_commit": subprocess.check_output(

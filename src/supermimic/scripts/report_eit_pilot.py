@@ -19,6 +19,7 @@ import torch
 
 from supermimic.runners.eit_resume_contract import (
   RESUME_EXECUTION_FIELDS,
+  SUPPORTED_REFERENCE_VERSIONS,
   resume_execution_matches,
 )
 from supermimic.runners.eit_snapshots import file_sha256
@@ -38,6 +39,8 @@ PHASES = (
   "residual_extraction_seconds",
   "covariance_fit_seconds",
   "posterior_prefix_normalization_seconds",
+  "posterior_cache_normalization_seconds",
+  "posterior_cache_read_seconds",
   "policy_rollout_backward_seconds",
   "critic_regression_seconds",
   "checkpoint_save_seconds",
@@ -209,7 +212,8 @@ def _initialization_identity(audit, p):
         (state["critic"], bundle["critics"][group]),
       ):
         audit.require(
-          initialization_fingerprint(saved) == initialization_fingerprint(original),
+          initialization_fingerprint(saved, include_model_revision=False)
+          == initialization_fingerprint(original, include_model_revision=False),
           f"{group}: baseline weights differ from actual common initialization",
         )
       final_frames = p["rounds"] * p["num_envs"] * p["collection_steps"]
@@ -692,7 +696,20 @@ def _audit_group(audit, group, p, validation, commands):
   )
   for row in profiles:
     for phase in PHASES:
-      value = row.get("seconds", {}).get(phase)
+      seconds = row.get("seconds", {})
+      # Prefix rebuilding and incremental cache reading are distinct protocols.
+      if (
+        phase == "posterior_prefix_normalization_seconds"
+        and "posterior_cache_normalization_seconds" in seconds
+      ):
+        continue
+      if (
+        phase
+        in ("posterior_cache_normalization_seconds", "posterior_cache_read_seconds")
+        and phase not in seconds
+      ):
+        continue
+      value = seconds.get(phase)
       audit.data(
         _finite(value) and value >= 0,
         f"{group}/{row.get('round')}: missing timing {phase}",
@@ -719,7 +736,7 @@ def _audit_group(audit, group, p, validation, commands):
     and resume.get("status") == "passed"
     and resume.get("live_optimizer_reference") is True
     and resume.get("expected_source") == "live_training_before_checkpoint_commit"
-    and resume.get("reference_version") == "eit_live_update_reference_v1"
+    and resume.get("reference_version") in SUPPORTED_REFERENCE_VERSIONS
     and resume.get("fixed_input_policy_resume_exact") is True
     and resume.get("fixed_input_model_resume_exact") is True,
     f"{group}: fixed-input next-update restore verification pending",
@@ -748,7 +765,8 @@ def _audit_group(audit, group, p, validation, commands):
           if not isinstance(live, dict):
             raise ValueError("Live update reference must be a dictionary")
           audit.require(
-            live.get("version") == "eit_live_update_reference_v1"
+            live.get("version") in SUPPORTED_REFERENCE_VERSIONS
+            and live["version"] == resume.get("reference_version")
             and live.get("source") == "live_training_before_checkpoint_commit"
             and live.get("checkpoint_sha256") == mid.get("sha256")
             and live.get("round") == p["resume_after_round"]

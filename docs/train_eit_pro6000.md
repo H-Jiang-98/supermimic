@@ -292,14 +292,19 @@ nohup bash artifacts/eit_pro6000_v1/launch/run_group.sh C 2 \
 | `--seed` | 2027–2031 | 训练随机种子及初始化包身份。五组配对 seed 不包含 pilot 的 2026 |
 | `--rounds` | 每段 50 | 本次调用新增的训练轮数。新训练 50，再恢复 50，累计才是 100 |
 | `--snapshot-interval` | 10 | 历史快照保存间隔，单位为累计轮数；第 0 轮始终保留，最新 `training.pt` 每轮更新。必须为正整数 |
-| `--num-envs` | 8 | 并行 MuJoCo 环境数。增大会改变每轮实采帧数、replay 和后验重建开销 |
+| `--num-envs` | 8 | 并行 MuJoCo 环境数。增大会改变每轮实采帧数、replay 和缓存后验开销 |
 | `--collection-steps` | 64 | 每轮每个环境采集的控制步数；每轮实采帧数为 `num_envs × collection_steps` |
-| `--buffer-size` | 128 | 每个环境的 replay 容量，单位为帧；总基础容量为 `num_envs × buffer_size`，还要考虑后验前缀等存储 |
+| `--buffer-size` | 128 | 每个环境的 replay 容量，单位为帧；总基础容量为 `num_envs × buffer_size`，另有每环境 ceil(buffer_size / S) 条 posterior 存储及少量边界历史 |
+| `--posterior-save-stride` | 1 | 每隔 S 个全局采集步保存 posterior；范围 1 到 buffer_size；恢复采用 checkpoint 的值。增大 S 减少实际分配与策略起点/归一化覆盖率，不降低逐帧在线滤波频率 |
 | `--exploration` | 0.1 | 真实采集时 actor 动作上的高斯探索噪声标准差，按策略动作单位计；不是传感器噪声或过程协方差 |
 | `--motion-file` | walking NPZ | 参考动作文件；本次按单文件配置，数据须匹配 50 Hz 控制频率 |
 | `--output` | 每组每 seed 独立 | 训练 checkpoint、快照和指标的输出目录 |
 
-每轮依次执行物理采集、均值模型拟合、过程协方差拟合、当前模型下的后验重建、actor/critic 更新，然后保存。训练使用 uniform reset；每轮刷新物理采集环境，64 步对应最多 1.28 秒连续在线历史，失败会更早 reset。增大总轮数不会自动延长每段连续历史。
+每轮依次执行物理采集、均值模型拟合、过程协方差拟合、缓存后验读取、actor/critic 更新，然后保存。训练使用 uniform reset 选择真实 episode 的起点；进程内跨轮保持环境、posterior 和历史连续，只在真实结束时 reset。模型更新后下一帧用新模型继续递推，不重算旧 posterior。64 步是轮次预算，不是 episode 长度上限。
+
+新策略 checkpoint 为 v4；stride、缓存协议和 revision 随模型/优化器保存。跨进程恢复清空 replay 和边界历史，开启新 episode，保存周期从第 0 步重启。旧 v3 策略 checkpoint 可评估/导出，不能直接续训为该协议；共享初始化仍使用 v3。
+
+profiling 用 `posterior_cache_normalization_seconds` 记录缓存读取及归一化，用 `posterior_cache_read_seconds` 单列其中的读取时间。CUDA 计时在当前 stream 上记录事件，阶段结束时统一读取。budget 包含有效 posterior 数、可用策略起点数、归一化样本数、来源版本差距与实际存储字节数，`episode_head_storage_bytes` 单列保留的真实首帧先验。GPU 对比固定 N/K/H 等其余预算，依次测 S=1、2、4 的完整轮次耗时、峰值显存及起点覆盖率。
 
 ### 6.2 世界模型
 

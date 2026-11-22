@@ -25,7 +25,8 @@ class ProviderState:
   context: torch.Tensor
   episode_id: torch.Tensor
   time_index: torch.Tensor
-  model_version: str
+  # Legacy content SHA; incremental providers use the lightweight model revision.
+  model_version: str | int
   # Realized pre-observation priors for the rows currently at frame zero.
   head_priors: tuple[torch.Tensor, BeliefState] | None = None
 
@@ -39,6 +40,8 @@ class PreparedBelief:
   state: ProviderState
   generation: int
   owner: object
+  model_version: str | int
+  model_write_generation: int
   diagnostics: dict[str, torch.Tensor] | None = None
 
   @property
@@ -75,18 +78,22 @@ class BeliefProvider:
     prior_factory: Callable[..., BeliefState] | GaussianStatePrior | None = None,
     *,
     differentiable: bool = False,
+    incremental: bool = False,
   ):
     self.estimator = estimator
     self.prior_factory = prior_factory
     self.differentiable = differentiable
+    self.incremental = incremental
     self.state: ProviderState | None = None
     self.diagnostics: dict[str, torch.Tensor] | None = None
     self._generation = 0
     self._pending_prior: tuple[torch.Tensor, torch.Tensor, BeliefState] | None = None
 
   @property
-  def model_version(self) -> str:
-    return self.estimator.dynamics.model_version
+  def model_version(self) -> str | int:
+    # The hash remains available for legacy callers and explicit snapshots.
+    model = self.estimator.dynamics
+    return model.model_revision if self.incremental else model.model_version
 
   def clear(self) -> None:
     """Release an active graph and invalidate outstanding transactions."""
@@ -141,9 +148,10 @@ class BeliefProvider:
       and torch.equal(state.time_index, time_index)
     ):
       return None
-    if state.model_version != self.model_version or not torch.equal(
-      state.context, context
-    ):
+    if (
+      (not self.incremental or self.differentiable)
+      and state.model_version != self.model_version
+    ) or not torch.equal(state.context, context):
       raise ValueError(
         "Cached posterior model version or context changed; rebuild or reset"
       )
@@ -197,6 +205,7 @@ class BeliefProvider:
         raise ValueError("Previous action must match measurement dtype and device")
       keep = ~reset_mask
       version = self.model_version
+      model_write_generation = self.estimator.dynamics.write_generation
       slots = torch.arange(batch, device=measurement.device)
       if self.state is None or self.state.time_index.shape != (batch,):
         next_episode = slots
@@ -220,7 +229,9 @@ class BeliefProvider:
       if keep.any():
         if self.state is None or self.state.time.shape != (batch,):
           raise ValueError("Non-reset slots require a matching initialized provider")
-        if self.state.model_version != version:
+        if self.state.model_version != version and (
+          not self.incremental or self.differentiable
+        ):
           raise ValueError(
             "Model/normalization version changed; restore a rebuilt belief"
           )
@@ -304,6 +315,8 @@ class BeliefProvider:
         ProviderState(belief, context, episode_id, time_index, version, head_priors),
         self._generation,
         self,
+        version,
+        model_write_generation,
         summary,
       )
 
@@ -312,7 +325,7 @@ class BeliefProvider:
     belief: BeliefState,
     context: torch.Tensor,
     *,
-    model_version: str,
+    model_version: str | int,
     time_index: torch.Tensor | None = None,
     episode_id: torch.Tensor | None = None,
     head_priors: tuple[torch.Tensor, BeliefState] | None = None,
@@ -327,6 +340,7 @@ class BeliefProvider:
       raise TypeError("Restore requires a complete BeliefState, not an RPV view")
     track_grad = self.differentiable and torch.is_grad_enabled()
     with torch.inference_mode(False), torch.set_grad_enabled(track_grad):
+      model_write_generation = self.estimator.dynamics.write_generation
       if model_version != self.model_version:
         raise ValueError(
           "Cannot restore belief from a different model/normalization version"
@@ -369,12 +383,17 @@ class BeliefProvider:
         ),
         self._generation,
         self,
+        model_version,
+        model_write_generation,
       )
 
   def commit(self, candidate: PreparedBelief) -> None:
     if candidate.owner is not self or candidate.generation != self._generation:
       raise ValueError("Stale or foreign provider candidate")
-    if candidate.state.model_version != self.model_version:
+    if (
+      candidate.model_version != self.model_version
+      or candidate.model_write_generation != self.estimator.dynamics.write_generation
+    ):
       raise ValueError("Model changed before committing posterior")
     self.state = candidate.state
     self.diagnostics = candidate.diagnostics
@@ -424,7 +443,11 @@ class BeliefProvider:
       "version": PROVIDER_VERSION,
       "state_layout_version": state.belief.state_layout_version,
       "tangent_version": state.belief.tangent_version,
-      "model_version": state.model_version,
+      "model_version": self.estimator.dynamics.model_version
+      if self.incremental
+      else state.model_version,
+      "model_revision": self.estimator.dynamics.model_revision,
+      "posterior_revision": state.model_version if self.incremental else None,
       "filter_config": asdict(self.estimator.config),
       "measurement_config": asdict(self.estimator.measurement_config),
       "default_joint_pos": self.estimator.default_joint_pos.detach().clone(),
@@ -472,14 +495,34 @@ class BeliefProvider:
         BeliefState(LieState.from_full(heads["mean"]), heads["covariance"]),
       )
     )
-    return self.prepare_restore(
+    if data["model_version"] != self.estimator.dynamics.model_version:
+      raise ValueError("Provider snapshot model version mismatch")
+    version = self.model_version
+    source = data.get("posterior_revision")
+    if source is not None:
+      revision = data.get("model_revision")
+      if (
+        type(revision) is not int
+        or type(source) is not int
+        or not 0 <= source <= revision
+      ):
+        raise ValueError("Invalid provider snapshot revision")
+      if self.incremental and revision != version:
+        raise ValueError("Provider snapshot model revision mismatch")
+      if source != revision and (not self.incremental or self.differentiable):
+        raise ValueError("Historical posterior requires an incremental real provider")
+    candidate = self.prepare_restore(
       belief,
       data["context"],
-      model_version=data["model_version"],
+      model_version=version,
       episode_id=data["episode_id"],
       time_index=data["time_index"],
       head_priors=head_priors,
     )
+    if self.incremental and source is not None:
+      # Preserve the last filter revision while committing against today's model.
+      return replace(candidate, state=replace(candidate.state, model_version=source))
+    return candidate
 
   def load_state_dict(self, data: dict) -> None:
     self.commit(self.prepare_load_state_dict(data))

@@ -1,6 +1,7 @@
 """A damaged loader must not be able to manufacture both sides of resume proof."""
 
 from copy import deepcopy
+from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
@@ -53,6 +54,31 @@ def test_live_reference_is_generated_without_any_loader_and_preserves_live_state
   details = compare_reference_update(target, reference)
   assert details["mean_windows"] == 2
   assert len(details["policy_starts"]) == 2
+
+
+def test_sparse_reference_can_use_a_singleton_as_its_only_saved_training_start(
+  tmp_path,
+):
+  loop = training()
+  runner = loop.runner
+  loop.cfg = replace(loop.cfg, posterior_save_stride=8)
+  runner.posterior_save_stride = 8
+  runner.replay_buffer.enable_posterior_cache(8, runner.cfg.history_length)
+  loop.refresh_collection()
+  runner.step(record_episode_stats=False)
+  loop.refresh_collection()
+
+  checkpoint, evidence = tmp_path / "training.pt", tmp_path / "reference.pt"
+  loop.before_checkpoint_commit = lambda path, state: write_live_reference(
+    loop, path, state, evidence
+  )
+  loop.run_round(checkpoint)
+  reference = torch.load(evidence, weights_only=True)
+  assert loop.episode_split()[0] == [3]
+  assert reference["inputs"]["policy_keys"].tolist() == [[1, 0], [1, 0]]
+  restored = training()
+  restored.load_state_dict(torch.load(checkpoint, weights_only=True))
+  compare_reference_update(restored, reference)
 
 
 @pytest.mark.parametrize("optimizer", ["actor", "critic", "covariance", "mean"])
@@ -168,8 +194,6 @@ def test_reference_output_cannot_replace_training_artifacts(tmp_path, relative):
 
 
 def test_real_cpu_checkpoint_live_reference_and_independent_restore(tmp_path):
-  from dataclasses import replace
-
   from supermimic.learners.belief_policy_learner import BeliefPolicyLearnerCfg
   from supermimic.learners.two_stage_wm import (
     CovarianceFitCfg,

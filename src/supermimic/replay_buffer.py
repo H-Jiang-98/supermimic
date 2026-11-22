@@ -5,6 +5,12 @@ import torch
 from tensordict import TensorDict
 
 from supermimic.belief import BeliefState, GaussianStatePrior
+from supermimic.posterior_replay import (
+  PosteriorReplay,
+  pack_mean,
+  unpack_belief,
+  unpack_mean,
+)
 from supermimic.utils.lie_state import LieState
 from supermimic.utils.validation import validate_rotation
 
@@ -22,6 +28,69 @@ class FieldSpec:
     if isinstance(self.dim, tuple):
       return (num_envs, buffer_size, *self.dim)
     return (num_envs, buffer_size, self.dim) if self.dim else (num_envs, buffer_size)
+
+
+@dataclass(frozen=True)
+class _RecordedHeadPrior:
+  """Lossless native-precision physical reset seed for explicit diagnostics."""
+
+  mean: torch.Tensor
+  covariance: torch.Tensor
+  upper_indices: torch.Tensor | None = None
+  upper_values: torch.Tensor | None = None
+
+  @staticmethod
+  def capture(priors):
+    means = pack_mean(priors.mean).detach()
+    cov = priors.covariance.detach()
+    diagonals = cov.diagonal(dim1=-2, dim2=-1)
+    if torch.count_nonzero(cov) == torch.count_nonzero(diagonals):
+      # All heads in this batch expire together when this physical slot wraps.
+      # The standard Gaussian requires only 70 variances per sampled head.
+      return [
+        _RecordedHeadPrior(mean, diagonal)
+        for mean, diagonal in zip(means, diagonals.clone(), strict=True)
+      ]
+    rows, cols = torch.tril_indices(70, 70, device=cov.device)
+    lower = cov[:, rows, cols]
+    upper = cov[:, cols, rows]
+    records = []
+    for mean, lo, hi in zip(means, lower, upper, strict=True):
+      # Validation tolerates roundoff-level asymmetry in custom priors. Preserve
+      # just the differing entries so diagnostics reproduce the actual draw.
+      changed = (hi != lo).nonzero().flatten()
+      if len(changed):
+        records.append(
+          _RecordedHeadPrior(mean, lo, cols[changed] * 70 + rows[changed], hi[changed])
+        )
+      else:
+        records.append(_RecordedHeadPrior(mean, lo))
+    return records
+
+  def restore(self):
+    mean = self.mean.clone()
+    if self.covariance.numel() == 70:
+      return BeliefState(unpack_mean(mean), self.covariance.diag())
+    prior = unpack_belief(mean, self.covariance, dtype=mean.dtype)
+    if self.upper_indices is not None:
+      prior.covariance.view(-1)[self.upper_indices] = self.upper_values
+    return prior
+
+  @property
+  def nbytes(self):
+    return sum(
+      t.nbytes
+      for t in (self.mean, self.covariance, self.upper_indices, self.upper_values)
+      if t is not None
+    )
+
+
+@dataclass(frozen=True)
+class RecordedEpisodeHeads:
+  replay: "ReplayBuffer"
+  insert_count: int
+  episode_ids: torch.Tensor
+  priors: list[_RecordedHeadPrior]
 
 
 @dataclass(frozen=True)
@@ -72,8 +141,10 @@ class ReplayBuffer:
       raise ValueError("Model replay requires the seven model transition fields")
     if not {"terminated", "truncated"} <= schema.keys():
       raise ValueError("schema needs 'terminated' and 'truncated'")
+    self.posterior_cache: PosteriorReplay | None = None
     self.replay_mode = replay_mode
-    self._episode_heads: dict[int, tuple[int, int, BeliefState]] = {}
+    self._episode_heads: dict[int, tuple[int, int, _RecordedHeadPrior]] = {}
+    self.episode_head_storage_bytes = 0
     self.initial_prior = (
       (initial_prior or GaussianStatePrior()) if replay_mode == "full" else None
     )
@@ -95,6 +166,29 @@ class ReplayBuffer:
       },
       batch_size=[num_envs, buffer_size],
     )
+
+  def enable_posterior_cache(self, stride: int, history_length: int) -> None:
+    self.posterior_cache = self.prepare_posterior_cache(stride, history_length)
+
+  def prepare_posterior_cache(
+    self, stride: int, history_length: int
+  ) -> PosteriorReplay:
+    """Prepare an empty ring layout without mutating replay during preflight."""
+    if self.replay_mode != "full" or self.insert_count:
+      raise ValueError("Enable posterior replay before collecting full replay")
+    PosteriorReplay.validate_config(self.buffer_size, stride, history_length)
+    if self.posterior_cache is not None:
+      if (self.posterior_cache.stride, self.posterior_cache.history_length) == (
+        stride,
+        history_length,
+      ):
+        return self.posterior_cache
+    return PosteriorReplay(self, stride, history_length)
+
+  def posterior_frames(self, *args, **kwargs):
+    if self.posterior_cache is None:
+      raise ValueError("Posterior replay is not enabled")
+    return self.posterior_cache.frames(self, *args, **kwargs)
 
   def validate_head_priors(
     self,
@@ -130,6 +224,16 @@ class ReplayBuffer:
       )
     priors.validate()
 
+  def capture_head_priors(self, episode_id, time_index, head_priors):
+    """Validate and snapshot physical reset seeds before advancing the simulator."""
+    self.validate_head_priors(episode_id, time_index, head_priors)
+    if head_priors is None:
+      return None
+    ids, priors = head_priors
+    return RecordedEpisodeHeads(
+      self, self.insert_count, ids.detach().clone(), _RecordedHeadPrior.capture(priors)
+    )
+
   def validate_previous_action(
     self,
     episode_id: torch.Tensor,
@@ -159,6 +263,7 @@ class ReplayBuffer:
     head_priors=None,
     require_head_priors: bool = False,
     token=None,
+    posterior=None,
   ) -> None:
     """Store a batched step. Optional live priors support exact episode diagnostics."""
     if token is not None and token is self._last_insert_token:
@@ -173,23 +278,44 @@ class ReplayBuffer:
       target = self._storage[name][:, self._step]
       if value.shape != target.shape:
         raise ValueError(f"Invalid replay field shape for {name}")
-    if head_priors is not None or (require_head_priors and "episode_id" in td.keys()):
-      self.validate_head_priors(td["episode_id"], td["time_index"], head_priors)
+    if isinstance(head_priors, RecordedEpisodeHeads):
+      # Contents were validated and detached before env.step. Check the identity
+      # again at commit without another full covariance eigendecomposition.
+      if (
+        head_priors.replay is not self
+        or head_priors.insert_count != self.insert_count
+        or not torch.equal(
+          td["episode_id"][td["time_index"] == 0], head_priors.episode_ids
+        )
+      ):
+        raise ValueError("Captured physical priors disagree with committing frame")
+    elif head_priors is not None or (require_head_priors and "episode_id" in td.keys()):
+      head_priors = self.capture_head_priors(
+        td["episode_id"], td["time_index"], head_priors
+      )
     new_heads = {}
     if head_priors is not None:
-      ids, priors = head_priors
       rows = (td["time_index"] == 0).nonzero().flatten().tolist()
       new_heads = {
-        episode: (env_row, self._step, priors.index(i).detach().clone())
-        for i, (episode, env_row) in enumerate(zip(ids.tolist(), rows, strict=True))
+        episode: (env_row, self._step, prior)
+        for episode, env_row, prior in zip(
+          head_priors.episode_ids.tolist(), rows, head_priors.priors, strict=True
+        )
       }
     expired = []
     if self._episode_heads and self.num_transitions == self.buffer_size:
       oldest = self._storage[:, self._step]
       expired = oldest["episode_id"][oldest["time_index"] == 0].tolist()
+    if self.posterior_cache is not None:
+      self.posterior_cache.insert(self, posterior)
     self._storage[:, self._step] = td
     for episode in expired:
-      self._episode_heads.pop(episode, None)
+      old_head = self._episode_heads.pop(episode, None)
+      if old_head is not None:
+        self.episode_head_storage_bytes -= old_head[2].nbytes
+    self.episode_head_storage_bytes += sum(
+      head[2].nbytes for head in new_heads.values()
+    )
     self._episode_heads.update(new_heads)
     self._step = (self._step + 1) % self.buffer_size
     self.num_transitions = min(self.buffer_size, self.num_transitions + 1)
@@ -250,7 +376,7 @@ class ReplayBuffer:
     offsets = rows * n + ages
     lengths = offsets.diff(append=offsets.new_tensor([self.num_envs * n]))
     episode_lengths = dict(sorted(zip(ids, lengths.tolist(), strict=True)))
-    if self.replay_mode == "full":
+    if self.replay_mode == "full" and self.posterior_cache is None:
       self._realize_training_heads(rows, slots[ages], ids)
     else:
       # Full replay checks these rotations when drawing the segment priors.
@@ -289,6 +415,14 @@ class ReplayBuffer:
     if self.replay_mode == "model":
       raise ValueError("Belief prefix reconstruction requires full replay")
     self.finish_collection_round()
+    if self.posterior_cache is not None:
+      index = self._sealed_round()
+      begins = torch.ones_like(index.episodes, dtype=torch.bool)
+      begins[:, 1:] = index.episodes[:, 1:] != index.episodes[:, :-1]
+      rows, ages = begins.nonzero(as_tuple=True)
+      self._realize_training_heads(
+        rows, index.slots[ages], index.episodes[rows, ages].tolist()
+      )
     head = self._training_heads.get(episode)
     if head is None:
       raise ValueError(f"Episode {episode} unavailable in replay")
@@ -386,7 +520,7 @@ class ReplayBuffer:
     if head is None:
       raise ValueError(f"Episode {episode} head or initial prior unavailable in replay")
     env_row, start_slot, prior = head
-    return prior.clone(), self._gather_prefix(episode, env_row, start_slot, 0, t)
+    return prior.restore(), self._gather_prefix(episode, env_row, start_slot, 0, t)
 
   def _gather_prefix(self, episode, env_row, start_slot, first, length):
     if not 0 <= length < self.num_transitions:

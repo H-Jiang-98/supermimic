@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -108,6 +109,10 @@ class Dynamics(nn.Module):
     self.num_actions = num_actions
     self.dt = representation.dt
     self._apply_prediction = representation.apply_prediction
+    self._model_revision = 0
+    self.write_generation = 0
+    self._readonly_depth = 0
+    self._revision_versions = None
     self.process_noise_config = process_noise
     # Bound methods avoid registering the representation (and its simulator
     # helpers) as a submodule. Deterministic legacy forward stays unchanged.
@@ -297,6 +302,54 @@ class Dynamics(nn.Module):
       },
     }
 
+  def __getstate__(self):
+    state = super().__getstate__().copy()
+    state["_revision_versions"] = None
+    state["_readonly_depth"] = 0
+    return state
+
+  def _tensor_versions(self):
+    return tuple((id(t), t._version) for t in (*self.parameters(), *self.buffers()))
+
+  @property
+  def model_revision(self) -> int:
+    versions = self._tensor_versions()
+    if self._revision_versions is not None and versions != self._revision_versions:
+      if self._readonly_depth:
+        raise ValueError("Model changed during read-only collection or policy update")
+      self._model_revision += 1
+    self._revision_versions = versions
+    return self._model_revision
+
+  def begin_write(self) -> None:
+    if self._readonly_depth:
+      raise ValueError("Model writes forbidden during collection or policy update")
+    # Explicit entry points also cover optimizers that bypass tensor counters.
+    self._model_revision = self.model_revision + 1
+    self.write_generation += 1
+    self._revision_versions = None
+
+  def finish_write(self) -> None:
+    self._revision_versions = self._tensor_versions()
+
+  @contextmanager
+  def readonly(self):
+    revision = self.model_revision
+    self._readonly_depth += 1
+    try:
+      yield revision
+      if self.model_revision != revision:
+        raise ValueError("Model revision changed during read-only phase")
+    finally:
+      self._readonly_depth -= 1
+
+  def load_state_dict(self, *args, **kwargs):
+    self.begin_write()
+    try:
+      return super().load_state_dict(*args, **kwargs)
+    finally:
+      self.finish_write()
+
   @property
   def model_version(self) -> str:
     """Fingerprint the current model at a provider or checkpoint boundary.
@@ -326,12 +379,16 @@ class Dynamics(nn.Module):
       "metadata": metadata,
       "state_dict": state,
       "model_version": self._content_digest(metadata, state),
+      "model_revision": self.model_revision,
     }
 
   def validate_checkpoint(self, checkpoint: dict[str, Any]) -> None:
     """Validate without changing parameters, buffers or the model version."""
     if checkpoint.get("metadata") != self._checkpoint_metadata():
       raise ValueError("Dynamics checkpoint configuration or state layout mismatch")
+    revision = checkpoint.get("model_revision")
+    if revision is not None and (type(revision) is not int or revision < 0):
+      raise ValueError("Invalid checkpoint model revision")
     supplied = checkpoint.get("state_dict")
     validate_state_dict(self, supplied, "Dynamics")
     digest = self._content_digest(checkpoint["metadata"], supplied)
@@ -341,7 +398,11 @@ class Dynamics(nn.Module):
   def load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
     """Validate the complete snapshot before mutating the live model."""
     self.validate_checkpoint(checkpoint)
+    revision = checkpoint.get("model_revision")
     self.load_state_dict(checkpoint["state_dict"], strict=True)
+    if revision is not None:
+      self._model_revision = revision
+      self.finish_write()
 
   def normalizers(self) -> list[_CudaGraphNormalization]:
     return [self.state_normalizer, self.action_normalizer]

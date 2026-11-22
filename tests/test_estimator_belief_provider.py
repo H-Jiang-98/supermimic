@@ -343,3 +343,43 @@ def test_provider_checkpoint_roundtrip_and_configuration_rejection():
   )
   with pytest.raises(ValueError, match="configuration mismatch"):
     BeliefProvider(incompatible).load_state_dict(snapshot)
+
+
+def test_incremental_snapshot_keeps_source_revision_and_checks_model_at_commit():
+  reference, _, measurement, action, context = setup_provider(batch=1)
+  provider = BeliefProvider(
+    reference.estimator, reference.prior_factory, incremental=True
+  )
+  advance(provider, measurement, action, context, [True])
+  model = provider.estimator.dynamics
+  source_revision = model.model_revision
+  model.load_state_dict(model.state_dict())
+  snapshot = provider.state_dict()
+  assert snapshot["posterior_revision"] == source_revision < snapshot["model_revision"]
+
+  restored = BeliefProvider(reference.estimator, incremental=True)
+  candidate = restored.prepare_load_state_dict(snapshot)
+  # Reload identical weights and revision after prepare.
+  model.load_checkpoint(model.checkpoint())
+  with pytest.raises(ValueError, match="Model changed"):
+    restored.commit(candidate)
+  assert restored.state is None
+  restored.load_state_dict(snapshot)
+  assert restored.state_dict()["posterior_revision"] == source_revision
+  assert_same_belief(restored.state.belief, provider.state.belief)
+
+  for changes in (
+    {"posterior_revision": -1},
+    {"posterior_revision": model.model_revision + 1},
+    {"model_revision": model.model_revision + 1},
+  ):
+    with pytest.raises(ValueError, match="revision"):
+      restored.load_state_dict(snapshot | changes)
+  with pytest.raises(ValueError, match="Historical posterior"):
+    BeliefProvider(reference.estimator).load_state_dict(snapshot)
+  with pytest.raises(ValueError, match="Historical posterior"):
+    BeliefProvider(
+      reference.estimator, incremental=True, differentiable=True
+    ).load_state_dict(snapshot)
+  advance(restored, measurement, action, context, [False])
+  assert restored.state.model_version == model.model_revision

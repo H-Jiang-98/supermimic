@@ -94,7 +94,7 @@ class _RoundRunner(SuperMimicRunner):
 
   @torch.no_grad()
   def step(self, *, record_episode_stats=True):
-    frame = self.template[self.index].expand(2).clone()
+    frame = self.template[self.index % len(self.template)].expand(2).clone()
     # Held-out rows differ observably, so leaked normalization is detectable.
     frame["state"][0, 2] = 3.0
     frame["state"][0, 7:36] += 0.4
@@ -135,12 +135,26 @@ class _RoundRunner(SuperMimicRunner):
       self.replay_buffer.insert(frame.select(*MODEL_REPLAY_FIELDS))
     else:
       self.replay_buffer.insert(
-        frame, head_priors=self.posterior_provider.state.head_priors
+        frame,
+        head_priors=self.posterior_provider.state.head_priors,
+        posterior=(
+          self.replay_buffer.posterior_cache.capture(
+            self.replay_buffer,
+            self.posterior_provider.state.belief,
+            self._dynamics.model_revision,
+          )
+          if self.replay_buffer.posterior_cache is not None
+          else None
+        ),
       )
     self._pending_norm_updates.append((frame["state"], action, obs))
     self._flush_normalization()
     self.collected.append(
-      (self._dynamics.model_version, frame.clone(), self.posterior_provider.state)
+      (
+        self.posterior_provider.model_version,
+        frame.clone(),
+        self.posterior_provider.state,
+      )
     )
     self.previous = action.clone()
     self.index += 1

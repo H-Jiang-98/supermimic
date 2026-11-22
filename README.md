@@ -512,7 +512,7 @@ runner.finish_collection_round()
 `(0.01, 0.01, 0.05, 0.05, 0.005, 0.05)`，单位依次为 rad、m、m/s、rad/s、rad、rad/s。
 首帧融合 o₀ 一次，之后使用实际执行动作和记录的测量逐帧预测、修正。
 真实采集可通过 `configure_belief_filter(prior_factory=...)` 注入其他已知先验。
-部分 reset 只初始化对应槽位。EIT 策略回放从保留片段的首帧真值独立抽取配置的高斯先验。
+部分 reset 只初始化对应槽位。默认 EIT 策略回放直接读取在线保存的 Q[t|t]；下面的前缀重建接口仅用于显式诊断和非缓存调用。
 
 provider 持有当前完整后验及其 `episode_id`、`time_index`、`model_version`。
 同一 replay 生命周期内，各并行环境的 episode 编号唯一；每个 episode 的
@@ -604,8 +604,8 @@ OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.train_belief \
 ## Estimator 第四步：完整策略与模型交替训练
 
 [plan_step4.md](plan_step4.md) 的完整训练入口是 `train_eit`。每轮依次采集、
-更新模型归一化、拟合均值、拟合过程 covariance、重建后验并更新 actor/critic 归一化、
-冻结世界模型执行随机想象策略梯度与 critic 回归，然后保存和 reset。
+更新模型归一化、拟合均值、拟合过程 covariance、读取缓存后验并更新 actor/critic 归一化、
+冻结世界模型执行随机想象策略梯度与 critic 回归，然后保存。进程内跨轮保留物理环境、在线 belief 和观测历史，只有真实 episode 结束才 reset。
 `train_belief` 继续用于固定 actor 的模型学习，旧确定性训练仍使用原入口。
 
 A 的 critic 不含 belief；B/C 使用相同结构，额外读取 12 维 R/p/v 后验均值编码和
@@ -624,11 +624,23 @@ critic 特征入口，保留 R/p/v 均值和边缘 covariance 的梯度。它是
 动作穿过滤波、covariance、FiLM、soft survival 和价值 bootstrap 的导数。
 clip 最后一个评分动作后停止回报，普通策略 horizon 截断保留 bootstrap。
 
-每轮模型更新完毕后，先从所有保留的训练帧抽取本轮各次策略更新的起点，单帧片段也可入选。
-`train_eit` 使用默认的完整 replay，按 episode 从片段先验顺序滤波，直到最后一个需要的帧。本轮新采集且仍保留的训练帧
-参与 actor/critic 归一化，每帧计一次。保存抽中起点的后验与控制历史，归一化更新后
-按原抽样顺序启动 rollout。起点准备和策略更新期间，参考 motion 张量及其底层存储只读；
-进入该阶段时计算一次内容摘要，随后各 microbatch 共用。
+每轮模型更新完毕后，从仍有原始帧且保存了 posterior 的训练帧均匀有放回抽取策略起点，单帧片段也可入选。
+`--posterior-save-stride S`（默认 1，要求 1 ≤ S ≤ buffer_size）按全局采集步 0、S、2S… 保存；轮次切换或单环境 reset 不重启周期，也不强制保存 episode 首尾。
+保存动作执行前的 Q[t|t]：76 个 float32 均值（旋转矩阵、位置、速度、角速度、关节位置、关节速度）、2,485 个 float32 对称 covariance 下三角元素及来源 revision。读取时镜像非对角元素，不是 Cholesky 分解。
+posterior 独立容量为每环境 ceil(buffer_size / S)。主 replay 仍逐帧保存转移，均值和 covariance 拟合使用所有有效转移。
+仅从已有单帧 actor_obs 和最近被淘汰的 history_length−1 帧恢复控制历史，不逐帧保存完整 sensor_window；只在真实 episode 起点重复首帧，无法解释的缺口报错。
+
+本轮新采、仍保留且保存了 posterior 的训练帧参与 actor/critic 归一化，每帧计一次；没有符合条件的新帧时统计不变。
+起点准备和归一化不调用滤波 predict/correct，不补算未保存帧；没有可用策略起点时报错。
+模型更新后在线 belief 保留，下一帧使用新模型递推；已经融合的测量不会重复融合。起点可混合不同来源 revision，想象后续每步仍完整可微。
+S 改变策略起点覆盖率和归一化采样密度，不改变在线滤波频率、N/K/H、优化次数或梯度传播深度。
+训练计算使用轻量 model_revision，采集及完整策略更新期间模型只读；SHA256 model_version 保留给 checkpoint、导出和显式诊断。
+起点准备和策略更新期间参考 motion 张量及底层存储也只读，内容摘要在阶段入口计算一次。
+
+归一化直接按设备上的缓存位置读取本轮训练帧。每轮 budget 记录 posterior_save_stride、effective_posterior_count、available_policy_starts、normalization_samples、posterior_revision_gap_* 以及 posterior、边界历史和主 replay 的存储字节数。episode_head_storage_bytes 单列仍可用于前缀诊断的真实首帧先验。
+profiling 的 posterior_cache_normalization_seconds 包含缓存读取与归一化，posterior_cache_read_seconds 单列其中的读取耗时。CUDA 在当前 stream 上记录事件，在归一化阶段结束时统一读取计时结果。旧 posterior_prefix_normalization_seconds 只代表历史前缀重建，报告分别汇总。
+[CPU 增量回放验收记录](docs/validation/incremental_posterior_replay.json) 包含 S=1/2/4 的三轮真实训练、固定输入恢复、实际存储字节数和耗时。该环境无可用 CUDA，记录不包含 GPU 加速结论。
+默认 history_length=5、4096 环境的边界观测额外占约 5.81 MiB，另加索引。GPU 完整轮次对比应先通过 S=1 正确性验收，再固定其他配置测量 S=2/4；不要把存储容量比例当作速度提升。
 
 A/B/C 的训练、评估和播放均要求联合 checkpoint 内嵌 `eit_rpv_belief_critic_v2` critic 契约。
 加载时校验组别、输入维度和 `rpv9_log_std_corr_v1` 编码。A 组也执行同一版本检查。
@@ -640,7 +652,7 @@ A/B/C 的训练、评估和播放均要求联合 checkpoint 内嵌 `eit_rpv_beli
 OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
   .venv/bin/python -m supermimic.scripts.train_eit \
   --motion-file data/motions/walk1_subject1.npz --device cuda:0 \
-  --group B --output logs/eit-v3/B \
+  --group B --output logs/eit-v4/B \
   --num-envs 8 --rounds 10 --wandb-mode offline
 ```
 
@@ -669,16 +681,16 @@ EIT 默认启用离线 W&B；`WANDB_MODE=disabled` 或 `--wandb-mode disabled` �
 ```bash
 OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.train_eit \
   --motion-file data/motions/walk1_subject1.npz --device cuda:0 \
-  --output logs/eit-v3/B --resume logs/eit-v3/B/training.pt --rounds 10
+  --output logs/eit-v4/B --resume logs/eit-v4/B/training.pt --rounds 10
 OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.eval_eit \
-  --checkpoint logs/eit-v3/B/training.pt \
+  --checkpoint logs/eit-v4/B/training.pt \
   --motion-file data/motions/walk1_subject1.npz --device cuda:0 \
-  --num-envs 8 --output logs/eit-v3/B/evaluation.json
+  --num-envs 8 --output logs/eit-v4/B/evaluation.json
 ```
 
-`eit_training_v3` 记录本轮使用的 `replay_mode` 及均值 Muon/Adam、covariance Adam 的状态。续训时核对 replay 模式。策略训练另存 actor、critic 及其优化器、归一化和随机数流。两个训练入口、评估与播放均只接受 v3 轮次存档，初始化包只接受 `eit_initialization_v3`。
+新策略训练使用 `eit_training_v4`，保存 stride、posterior 缓存协议和 model_revision，以及模型、actor、critic、优化器、归一化、RNG 和计数；不保存 replay、边界历史或模拟器现场。恢复时 stride 由 checkpoint 决定，命令行不能覆盖，空 replay 保存周期重新从 0 开始。v3 策略 checkpoint 仍可评估、播放和导出，但不能直接作为 v4 同协议续训。model-only 格式和 `eit_initialization_v3` 共享初始化包保持兼容。
 恢复前在私有副本上校验全部组件。恢复后清空 replay 并重置真实环境；固定相同
-原始输入和噪声可以验证优化器续训一致，但不承诺恢复物理模拟轨迹。
+原始输入和噪声可以验证优化器续训一致，但不承诺恢复物理模拟轨迹。固定输入参考 v2 同时保存起点缓存来源 revision 和当前 rollout 的模型 revision/内容摘要。
 `eval_eit` 复用 mjlab tracking 的首 episode 评估循环和跟踪指标，从 clip 头开始，
 等待所有环境首个 episode 结束。它关闭动作探索，保留传感噪声及在线滤波，三组均使用
 后验均值。可用 `--steps` 限制 smoke 预算，未结束轨迹标记截断，成功率记为 null。

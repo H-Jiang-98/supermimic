@@ -100,6 +100,7 @@ class BeliefModelTraining:
       for path in (Path(f).resolve() for f in runner.motion.files)
     ]
     self._ready = False
+    self.continuous_collection = False
     self.before_checkpoint_commit: Callable[[Path, dict], None] | None = None
     # This entry point does not optimize the policy or change its normalizers.
     runner.policy_learner.actor.eval().requires_grad_(False)
@@ -147,7 +148,7 @@ class BeliefModelTraining:
     if not self._ready:
       with timer.measure("initial_reset_seconds"):
         self.refresh_collection()
-    version_before = runner._dynamics.model_version
+    version_before = self._model_identity()
     actor_before = parameter_digest(self.actor)
     replay = runner.replay_buffer
     # Fold each chunk into private statistics before the next ring overwrite.
@@ -165,26 +166,19 @@ class BeliefModelTraining:
       completed += int((flags["terminated"] | flags["truncated"]).sum())
 
     collect_start = timer.now()
-    for step in range(1, steps + 1):
-      runner.step(record_episode_stats=False)
-      if step % replay.buffer_size == 0 and step < steps:
-        count_endings(replay.buffer_size)
-        frames = self._fresh_training_frames(replay.buffer_size, ("state", "action"))
-        if len(frames):
-          staged = learner.stage_normalization(
-            frames["state"], frames["action"], staged
-          )
-        del frames
+    with runner._dynamics.readonly():
+      staged = self._collect_round_steps(steps, replay, learner, count_endings, staged)
     remaining = (steps - 1) % replay.buffer_size + 1
     count_endings(remaining)
     timer.seconds["physical_collection_seconds"] = timer.now() - collect_start
     if (
-      runner._dynamics.model_version != version_before
+      self._model_identity() != version_before
       or parameter_digest(self.actor) != actor_before
     ):
       raise RuntimeError("Collection model or actor changed within a round")
     runner.finish_collection_round()
-    self._ready = False
+    self._ready = self.continuous_collection
+
     train_ids, valid_ids = self.episode_split()
     train, validation = learner.fit(
       replay,
@@ -194,9 +188,9 @@ class BeliefModelTraining:
       self.cfg.validation_batch_size,
       staged_normalizers=staged,
     )
-    trained_version = runner._dynamics.model_version
+    trained_version = self._model_identity()
     policy = self._update_policy()
-    if runner._dynamics.model_version != trained_version:
+    if self._model_identity() != trained_version:
       raise RuntimeError("Policy update modified the frozen world model")
     metrics = {
       "round": self.rounds + 1,
@@ -206,6 +200,7 @@ class BeliefModelTraining:
       + self.cfg.collection_steps * runner.env.num_envs,
       "training_episodes": train_ids,
       "validation_episodes": valid_ids,
+      "model_identity_kind": "revision" if self.continuous_collection else "sha256",
       "collection_model_version": version_before,
       "trained_model_version": trained_version,
       "collection_actor_version": actor_before,
@@ -255,8 +250,9 @@ class BeliefModelTraining:
       if reference_seconds:
         timer.seconds["checkpoint_save_seconds"] -= reference_seconds
         timer.seconds["resume_reference_seconds"] = reference_seconds
-    with timer.measure("refresh_reset_seconds"):
-      self.refresh_collection()
+    if not self.continuous_collection:
+      with timer.measure("refresh_reset_seconds"):
+        self.refresh_collection()
     after_save = runtime_metadata(next(self.actor.parameters()))
     before_hook = getattr(self, "_checkpoint_hook_runtime_before", None)
     if before_hook is not None:
@@ -278,6 +274,24 @@ class BeliefModelTraining:
       self.last_profile["resume_reference_runtime"] = self._checkpoint_hook_runtime
     self._profiled_rounds = getattr(self, "_profiled_rounds", 0) + 1
     return metrics
+
+  def _model_identity(self):
+    model = self.runner._dynamics
+    return model.model_revision if self.continuous_collection else model.model_version
+
+  def _collect_round_steps(self, steps, replay, learner, count_endings, staged):
+    runner = self.runner
+    for step in range(1, steps + 1):
+      runner.step(record_episode_stats=False)
+      if step % replay.buffer_size == 0 and step < steps:
+        count_endings(replay.buffer_size)
+        frames = self._fresh_training_frames(replay.buffer_size, ("state", "action"))
+        if len(frames):
+          staged = learner.stage_normalization(
+            frames["state"], frames["action"], staged
+          )
+        del frames
+    return staged
 
   def state_dict(self) -> dict:
     runner = self.runner
@@ -390,11 +404,20 @@ class BeliefModelTraining:
     candidate_learner.load_state_dict(state["learner"])
     candidate_actor = deepcopy(self.actor)
     load_actor_checkpoint(candidate_actor, runner.cfg, state["actor"])
-
+    del candidate_learner, candidate_actor, candidate_wm
+    # A fresh EIT process already owns an empty raw ring. Preflight the
+    # checkpoint layout while retaining the active replay if allocation fails.
+    replay = runner.replay_buffer
+    if replay.posterior_cache is not None and not replay.insert_count:
+      cache = replay.prepare_posterior_cache(
+        runner.posterior_save_stride, runner.cfg.history_length
+      )
+    else:
+      replay = runner._make_replay_buffer()
+      cache = replay.posterior_cache
     runner._wm.load_bundle(state["world_model"])
     runner.cfg.filter_config = runner._wm.filter_config
     runner.cfg.initial_prior = runner._wm.initial_prior
-    runner.configure_belief_filter()
     self.learner.load_state_dict(state["learner"])
     load_actor_checkpoint(self.actor, runner.cfg, state["actor"])
     self.rounds, self.collected_frames = state["rounds"], state["collected_frames"]
@@ -405,14 +428,17 @@ class BeliefModelTraining:
       self.training_motion_files = []
     # Existing replay may contain later episodes with reused IDs. Restore begins
     # a fresh replay and physical trajectory, while preserving optimizer state.
-    runner.replay_buffer = runner._make_replay_buffer()
-    runner.wm_env.replay_buffer = runner.replay_buffer
+    replay.posterior_cache = cache
+    if replay.replay_mode == "full":
+      replay.initial_prior = runner._wm.initial_prior
+    runner.replay_buffer = runner.wm_env.replay_buffer = replay
     runner._episode_id = ids.to(runner.device).clone() if ids is not None else None
     runner._pending_norm_updates.clear()
     torch.random.set_rng_state(cpu_rng)
     if torch.device(runner.device).type == "cuda" and cuda_rng is not None:
       torch.cuda.set_rng_state(cuda_rng, runner.device)
     self._output_checkpoint = None
+    self._ready = False
     self.refresh_collection()
 
   def save(self, path: Path, *, metrics: dict | None = None) -> None:
@@ -626,6 +652,10 @@ class BeliefModelTraining:
           elif (
             self.rounds != state["rounds"]
             or self.runner._dynamics.model_version != state["learner"]["model_version"]
+            or (
+              self.continuous_collection
+              and self.runner._dynamics.model_revision != state["model_revision"]
+            )
           ):
             raise ValueError("Active training state differs from the output checkpoint")
           if not occupied:
@@ -699,7 +729,8 @@ class BeliefModelTraining:
     completed = state.get("last_metrics")
     if last is not None and last["round"] == state["rounds"]:
       if (
-        last["trained_model_version"] != state["learner"]["model_version"]
+        last["trained_model_version"]
+        != state.get("model_revision", state["learner"]["model_version"])
         or last["mean_steps"] != state["learner"]["mean"]["steps"]
         or last["cov_steps"] != state["learner"]["cov"]["steps"]
         or last["collected_frames"] != state["collected_frames"]
@@ -714,7 +745,8 @@ class BeliefModelTraining:
       return b""
     if completed is not None and (
       completed["round"] == state["rounds"]
-      and completed["trained_model_version"] == state["learner"]["model_version"]
+      and completed["trained_model_version"]
+      == state.get("model_revision", state["learner"]["model_version"])
       and (
         last is None
         or (

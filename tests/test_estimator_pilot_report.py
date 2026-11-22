@@ -872,7 +872,14 @@ def test_gradient_audit_checks_seed_and_actual_recorded_heads(
 
 
 @pytest.mark.parametrize(
-  "damage", ["old_version", "missing_reference", "wrong_digest", "wrong_header"]
+  "damage",
+  [
+    "old_version",
+    "missing_reference",
+    "wrong_digest",
+    "wrong_header",
+    "wrong_reference_version",
+  ],
 )
 def test_restore_audit_requires_live_pre_checkpoint_reference(
   tmp_path, monkeypatch, damage
@@ -886,6 +893,8 @@ def test_restore_audit_requires_live_pre_checkpoint_reference(
     del value["reference_path"]
   elif damage == "wrong_digest":
     value["reference_sha256"] = "0" * 64
+  elif damage == "wrong_reference_version":
+    value["reference_version"] = "eit_live_update_reference_v2"
   else:
     reference = tmp_path / "resume/A-reference.pt"
     live = torch.load(reference, weights_only=True)

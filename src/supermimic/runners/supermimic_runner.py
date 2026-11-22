@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
 from copy import copy
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime
@@ -15,7 +16,7 @@ import wandb
 from rsl_rl.models import MLPModel
 from tensordict import TensorDict
 
-from supermimic.belief import BeliefState, GaussianStatePrior
+from supermimic.belief import GaussianStatePrior
 from supermimic.belief_provider import BeliefProvider
 from supermimic.envs.motion_tracking_env import MotionTrackingEnv
 from supermimic.envs.multi_task_world_model_env import MultiTaskWorldModelEnv
@@ -40,7 +41,7 @@ from supermimic.learners.two_stage_wm import (
 )
 from supermimic.learners.wm_learner import WorldModelLearner, WorldModelLearnerCfg
 from supermimic.models import Dynamics, MultiEncoderAE, ProcessNoiseConfig, build_mlp
-from supermimic.replay_buffer import FieldSpec, ReplayBuffer
+from supermimic.replay_buffer import FieldSpec, RecordedEpisodeHeads, ReplayBuffer
 from supermimic.representations import StateRepresentation, create_representation
 from supermimic.runners.exporter import export_actor_as_onnx
 from supermimic.runners.reset_sampling import ReturnSampler, ReturnSamplerCfg
@@ -234,7 +235,10 @@ class WorldModel:
     if isinstance(self.sim_context, SimContext) and (context_state["scale"] <= 0).any():
       raise ValueError("Simulation context checkpoint scale must be positive")
 
-    self.dynamics.load_state_dict(dynamics_state)
+    if self.dynamics.process_noise_config is not None:
+      self.dynamics.load_checkpoint(bundle["dynamics"])
+    else:
+      self.dynamics.load_state_dict(dynamics_state)
     self.sim_context.load_state_dict(context_state)
     if metadata is not None:
       self.filter_config, self.initial_prior = filter_config, prior
@@ -474,8 +478,9 @@ class _CollectionStep:
   fields: dict[str, torch.Tensor]
   motion_time: torch.Tensor | None
   actor_td: TensorDict | None
-  head_priors: tuple[torch.Tensor, BeliefState] | None
+  head_priors: RecordedEpisodeHeads | None
   result: tuple
+  posterior: tuple | None = None
   token: object = field(default_factory=object)
   next_sensor: torch.Tensor | None = None
   stored: bool = False
@@ -495,6 +500,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
 
   cfg: CfgT
   replay_mode: Literal["full", "model"] = "full"
+  posterior_save_stride: int | None = None
 
   def __init__(
     self,
@@ -678,7 +684,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     )
 
   def _make_replay_buffer(self) -> ReplayBuffer:
-    return ReplayBuffer(
+    replay = ReplayBuffer(
       schema=self._buffer_schema(),
       buffer_size=self.cfg.buffer_size,
       num_envs=self.env.num_envs,
@@ -686,6 +692,10 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       initial_prior=self._wm.initial_prior,
       replay_mode=self.replay_mode,
     )
+    stride = getattr(self, "posterior_save_stride", None)
+    if stride is not None:
+      replay.enable_posterior_cache(stride, self.cfg.history_length)
+    return replay
 
   def _buffer_schema(self) -> dict[str, FieldSpec]:
     """Override to customize the replay buffer schema (e.g. extra fields)."""
@@ -758,6 +768,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       actor_td = actor_td.detach().clone()
     provider = getattr(self, "posterior_provider", None)
     head_priors = None
+    posterior = None
     if isinstance(provider, BeliefProvider) and "episode_id" in fields:
       state = provider.state
       if (
@@ -766,14 +777,21 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
         or not torch.equal(state.time_index, fields["time_index"])
       ):
         raise ValueError("Collection posterior must match the frames being recorded")
-      if self.replay_mode == "full":
-        head_priors = state.head_priors
-      if head_priors is not None:
-        self.replay_buffer.validate_head_priors(
-          state.episode_id, state.time_index, head_priors
+      if self.replay_buffer.posterior_cache is not None:
+        posterior = self.replay_buffer.posterior_cache.capture(
+          self.replay_buffer, state.belief, state.model_version
+        )
+      if self.replay_mode == "full" and state.head_priors is not None:
+        head_priors = self.replay_buffer.capture_head_priors(
+          state.episode_id, state.time_index, state.head_priors
         )
     return _CollectionStep(
-      fields, motion_time, actor_td, head_priors, self.env.step(actions)
+      fields,
+      motion_time,
+      actor_td,
+      head_priors,
+      self.env.step(actions),
+      posterior=posterior,
     )
 
   def _store_collection_step(self, step: _CollectionStep):
@@ -791,7 +809,10 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       batch_size=[self.env.num_envs],
     )
     self.replay_buffer.insert(
-      transition, head_priors=step.head_priors, token=step.token
+      transition,
+      head_priors=step.head_priors,
+      token=step.token,
+      posterior=step.posterior,
     )
     if step.actor_td is not None:
       self._pending_norm_updates.append(
@@ -926,10 +947,20 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       self._representation._default_joint_pos,
       config=self._wm.filter_config,
     )
-    self.posterior_provider = BeliefProvider(
-      estimator, prior_factory, differentiable=False
+    incremental = (
+      getattr(getattr(self, "replay_buffer", None), "posterior_cache", None) is not None
     )
-    self.imagined_posterior_provider = BeliefProvider(estimator, differentiable=True)
+    self.posterior_provider = BeliefProvider(
+      estimator,
+      prior_factory,
+      differentiable=False,
+      incremental=incremental,
+    )
+    self.imagined_posterior_provider = BeliefProvider(
+      estimator,
+      differentiable=True,
+      incremental=incremental,
+    )
     self.wm_env.posterior_provider = self.imagined_posterior_provider
     self._current_posterior = None  # Discard any previous legacy injection.
     self._posterior_ready = False
@@ -1197,7 +1228,12 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
   def step(
     self, *, posterior: PosteriorInput | None = None, record_episode_stats: bool = True
   ) -> int:
-    with torch.inference_mode():
+    with (
+      self._dynamics.readonly()
+      if self.replay_buffer.posterior_cache is not None
+      else nullcontext(),
+      torch.inference_mode(),
+    ):
       step = self._pending_collection
       if step is None:
         step = self._pending_collection = self._collect_action(posterior)

@@ -277,7 +277,11 @@ class BeliefActorCriticPolicyLearner:
     modules = (self.actor, self.critic, env.dynamics, env.representation)
     data, totals = [], {}
     # Analytical test environments and custom rollout environments may have no motion.
-    with getattr(env, "readonly_policy_motion", nullcontext)(), _module_modes(modules):
+    with (
+      getattr(env, "readonly_policy_motion", nullcontext)(),
+      getattr(env.dynamics, "readonly", nullcontext)(),
+      _module_modes(modules),
+    ):
       self.actor.train().requires_grad_(True)
       for module in (self.critic, env.dynamics, env.representation):
         module.eval().requires_grad_(False)

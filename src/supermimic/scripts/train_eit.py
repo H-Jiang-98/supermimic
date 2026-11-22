@@ -99,6 +99,12 @@ def main():
   )
   parser.add_argument("--collection-steps", type=int, default=64)
   parser.add_argument("--buffer-size", type=int, default=128)
+  parser.add_argument(
+    "--posterior-save-stride",
+    type=int,
+    default=1,
+    help="Save Q[t|t] every S collection steps; resume uses saved stride",
+  )
   add_model_fit_args(parser)
   parser.add_argument("--policy-updates", type=int, default=1)
   parser.add_argument("--policy-batch-size", type=int, default=4)
@@ -216,7 +222,10 @@ def main():
       sampling_mode="uniform",
     )
     runner_cfg.policy.batch_size = args.policy_microbatch_size
-    loop_cfg = EITTrainingCfg(collection_steps=args.collection_steps)
+    loop_cfg = EITTrainingCfg(
+      collection_steps=args.collection_steps,
+      posterior_save_stride=args.posterior_save_stride,
+    )
     policy_cfg = BeliefPolicyLearnerCfg(
       batch_size=args.policy_batch_size,
       num_samples=args.samples,
@@ -271,7 +280,11 @@ def main():
         raise ValueError(f"Initialization path is not a file: {initialization}")
       training.load_initialization(initial)
       if args.prepare_initialization:
-        if training.initialization_digest != expected:
+        if (
+          training.initialization_digest != expected
+          and initialization_fingerprint(initial, include_model_revision=False)
+          != expected
+        ):
           raise ValueError(
             "Existing initialization differs from the requested seed/group/configuration"
           )

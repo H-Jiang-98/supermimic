@@ -25,11 +25,11 @@ from supermimic.belief_provider import BeliefProvider
 from supermimic.envs.world_model_env import BeliefRolloutStart
 from supermimic.estimator import LieBeliefFilter
 from supermimic.motion_loader import motion_content_digest
+from supermimic.runners.eit_resume_contract import REFERENCE_VERSION
 from supermimic.runners.eit_snapshots import file_sha256
 from supermimic.utils.gencoord_helpers import compute_gencoord_state
 from supermimic.utils.lie_state import LieState
 
-REFERENCE_VERSION = "eit_live_update_reference_v1"
 REFERENCE_SOURCE = "live_training_before_checkpoint_commit"
 
 
@@ -154,6 +154,7 @@ def _private_components(training):
       config=cfg.filter_config,
     ),
     differentiable=True,
+    incremental=training.runner.wm_env.posterior_provider.incremental,
   )
   env._readonly_motion = None
   env.clear_rollout()
@@ -194,7 +195,7 @@ def _policy_start(payload, replay, device):
       ),
       payload["belief_covariance"].to(device),
     ),
-    payload["model_version"],
+    payload["model_revision"],
     replay,
     replay.insert_count,
     payload["motion_digest"],
@@ -253,7 +254,11 @@ def build_live_reference(training, checkpoint: Path, state: dict):
       replay.model_window_starts(train_ids, 2)[: learner.cov_cfg.batch_size],
       2,
     ).select("state", "action", "sim_ctx")
-    frames = replay.retained_frames(train_ids, fields=("episode_id", "time_index"))
+    frames = replay.posterior_frames(
+      training.policy_episode_ids(), fields=("episode_id", "time_index")
+    )
+    if not len(frames):
+      raise ValueError("Live resume reference has no saved training posterior")
     indices = torch.arange(policy.cfg.batch_size, device=frames.device) % len(frames)
     keys = torch.stack(
       (frames["episode_id"][indices], frames["time_index"][indices]), 1
@@ -287,7 +292,8 @@ def build_live_reference(training, checkpoint: Path, state: dict):
           },
           "belief_covariance": starts.belief.covariance,
           "remaining_steps": starts.remaining_steps,
-          "model_version": starts.model_version,
+          "model_revision": starts.model_version,
+          "model_version": env.dynamics.model_version,
           "motion_digest": starts.motion_digest,
         }
       )
@@ -374,7 +380,10 @@ def compare_reference_update(training, reference) -> dict[str, Any]:
     )
     payload = inputs["starts"]
     replay, env = training.runner.replay_buffer, training.runner.wm_env
-    if payload["model_version"] != env.dynamics.model_version:
+    if (
+      payload["model_version"] != env.dynamics.model_version
+      or payload["model_revision"] != env.dynamics.model_revision
+    ):
       raise ValueError("Reference start model version differs from restored update")
     if payload["motion_digest"] != motion_content_digest(env.motion):
       raise ValueError("Reference start motion differs from restored motion")

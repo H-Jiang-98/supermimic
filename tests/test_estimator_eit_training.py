@@ -13,7 +13,11 @@ from supermimic.learners.belief_policy_learner import BeliefPolicyLearnerCfg
 from supermimic.motion_loader import motion_content_digest
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
 from supermimic.runners.eit_snapshots import file_sha256
-from supermimic.runners.eit_training import EITTraining, EITTrainingCfg
+from supermimic.runners.eit_training import (
+  EITTraining,
+  EITTrainingCfg,
+  initialization_fingerprint,
+)
 from supermimic.sim_context import SimContext
 from tests.test_estimator_belief_training import _RoundRunner, assert_tree
 from tests.test_estimator_world_model_env import _env
@@ -80,10 +84,16 @@ def test_two_rounds_update_all_components_and_exclude_validation_normalization()
   critic = deepcopy(loop.policy.critic.state_dict())
   normalized = []
   original = loop.update_input_normalization
+  env = loop.runner.wm_env
+  reset = env.reset_prepared
+
+  def record_training_rows(start):
+    normalized.extend(start.batch["episode_id"].tolist())
+    return reset(start)
 
   def normalize(frames, policy_keys):
-    normalized.extend(frames["episode_id"].tolist())
-    return original(frames, policy_keys)
+    with patch.object(env, "reset_prepared", side_effect=record_training_rows):
+      return original(frames, policy_keys)
 
   with patch.object(loop, "update_input_normalization", side_effect=normalize):
     first, second = loop.run_round(), loop.run_round()
@@ -104,7 +114,8 @@ def test_two_rounds_update_all_components_and_exclude_validation_normalization()
       not torch.equal(value, module.state_dict()[key]) for key, value in before.items()
     )
   assert int(loop.actor.obs_normalizer.count) == 8
-  assert loop.runner.posterior_provider.state is None
+  assert loop.runner.posterior_provider.state.time_index.tolist() == [7, 7]
+  assert loop.runner.reset_count == 1
   assert loop.runner.imagined_posterior_provider.state is None
 
 
@@ -208,6 +219,48 @@ def test_initialization_copies_exact_weights_and_rejects_after_training():
     source.load_initialization(bundle)
 
 
+def test_shared_initialization_matches_legacy_v3_weight_identity(tmp_path):
+  source = training()
+  bundle = source.initialization_bundle()
+  # The v3 world-model snapshot used content identity and no training revision.
+  legacy = dict(bundle, world_model=source.runner._wm.bundle())
+  del legacy["world_model"]["dynamics"]["model_revision"]
+  source.load_initialization(legacy)
+  assert initialization_fingerprint(bundle) == source.initialization_digest
+  # An intermediate v3 writer included the revision. Preserve its recorded
+  # identity while comparing the actual starting weights across formats.
+  intermediate = dict(bundle, world_model=source.runner._wm.bundle())
+  torch.save(intermediate, tmp_path / "initialization.pt")
+  restored = torch.load(tmp_path / "initialization.pt", weights_only=True)
+  target = training(81)
+  target.load_initialization(restored)
+  assert target.initialization_digest == initialization_fingerprint(intermediate)
+  assert (
+    initialization_fingerprint(restored, include_model_revision=False)
+    == source.initialization_digest
+  )
+  assert initialization_fingerprint(
+    target.runner._wm.bundle(), include_model_revision=False
+  ) == initialization_fingerprint(bundle["world_model"])
+
+
+def test_occupied_output_checks_model_contents_at_equal_revision(tmp_path):
+  loop = training()
+  loop.run(1, tmp_path)
+  model = loop.runner._dynamics
+  disk_hash = file_sha256(tmp_path / "training.pt")
+  original = model.checkpoint()
+  with torch.no_grad():
+    next(model.parameters()).add_(1)
+  replacement = model.checkpoint()
+  assert replacement["model_version"] != original["model_version"]
+  replacement["model_revision"] = original["model_revision"]
+  model.load_checkpoint(replacement)
+  with pytest.raises(ValueError, match="differs from the output checkpoint"):
+    loop.run(1, tmp_path)
+  assert file_sha256(tmp_path / "training.pt") == disk_hash
+
+
 def test_snapshot_baseline_actual_counters_and_repair_after_interrupted_index(tmp_path):
   loop = training()
   loop.load_initialization(loop.initialization_bundle())
@@ -302,6 +355,7 @@ def test_no_fresh_training_frames_preserves_actor_normalizers():
   loop = training()
   loop.cfg = replace(loop.cfg, validation_stride=5)
   loop.run_round()
+  loop.refresh_collection()
   loop.runner._episode_id = torch.tensor([10, 5])
   count = loop.actor.obs_normalizer.count.clone()
   loop.run_round()
@@ -355,6 +409,42 @@ def test_normalization_late_failure_preserves_all_live_statistics():
   assert_tree(loop.actor.state_dict(), actor)
   assert_tree(loop.policy.critic.state_dict(), critic)
   assert loop.runner.imagined_posterior_provider.state is None
+
+
+def test_normalization_reads_fresh_slots_without_copying_frame_keys_to_python():
+  loop = training()
+  loop.runner.replay_buffer.enable_posterior_cache(2, loop.runner.cfg.history_length)
+  loop.refresh_collection()
+  for _ in range(8):
+    loop.runner.step(record_episode_stats=False)
+  loop.runner.finish_collection_round()
+  replay = loop.runner.replay_buffer
+  policy_keys = torch.tensor([[1, 6], [1, 0], [1, 6]])
+  generator = torch.Generator().manual_seed(33)
+  reference_rng = generator.clone_state()
+  expected_times = 2 * torch.cat(
+    [torch.randint(4, (3,), generator=reference_rng) for _ in range(2)]
+  )
+  with (
+    patch.object(torch.Tensor, "tolist", side_effect=AssertionError("host key copy")),
+    patch.object(replay, "posterior_frames", side_effect=AssertionError("key scan")),
+  ):
+    episodes, times = loop.runner.wm_env.sample_policy_keys(
+      3, [1], generator, num_batches=2
+    )
+    starts = loop.update_input_normalization(policy_keys=policy_keys)
+  assert torch.equal(episodes, torch.ones_like(times))
+  assert torch.equal(times, expected_times)
+  assert torch.equal(generator.get_state(), reference_rng.get_state())
+  assert loop._cache_budget["normalization_samples"] == 2
+  assert int(loop.actor.obs_normalizer.count) == 2
+  assert torch.equal(starts.batch["time_index"], policy_keys[:, 1])
+  # An explicit, possibly duplicated selection still ignores validation and
+  # unsaved rows, and can include earlier frames.
+  frames = replay.retained_frames(fields=("episode_id", "time_index"))
+  loop.update_input_normalization(frames[[0, 8, 8, 9, 10]])
+  assert loop._cache_budget["normalization_samples"] == 2
+  assert int(loop.actor.obs_normalizer.count) == 4
 
 
 def test_joint_output_resume_reconciles_metrics_and_preserves_unrelated_directory(
@@ -438,9 +528,8 @@ def test_round_reuses_ordered_sampled_starts_after_normalizing_fresh_frames():
   loop = training()
   loop.run_round()
   loop.policy.cfg = replace(loop.policy.cfg, num_batches=2)
-  # Episode 1 is retained from the first round, episode 3 is fresh. Repeat
-  # an older key across optimizer steps and request the newer times out of order.
-  keys = torch.tensor([[3, 3], [1, 2], [1, 2], [3, 1]])
+  # Episode 1 continues across rounds. Repeat an older key and mix revisions.
+  keys = torch.tensor([[1, 7], [1, 2], [1, 2], [1, 5]])
   env = loop.runner.wm_env
   normalize = loop.update_input_normalization
   old_count = int(loop.actor.obs_normalizer.count)
@@ -449,7 +538,7 @@ def test_round_reuses_ordered_sampled_starts_after_normalizing_fresh_frames():
     estimator = env.posterior_provider.estimator
     with patch.object(estimator, "predict", wraps=estimator.predict) as predict:
       starts = normalize(frames, policy_keys)
-    assert predict.call_count == 3 + 2
+    assert predict.call_count == 0
     assert int(loop.actor.obs_normalizer.count) == old_count + 4
     return starts
 

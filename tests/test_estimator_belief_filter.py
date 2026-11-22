@@ -297,7 +297,9 @@ def test_zero_measurement_noise_is_bounded_and_jitter_consistent(dtype):
   )
   torch.testing.assert_close(d.kalman_gain, reference.to(dtype), atol=1e-5, rtol=1e-5)
   assert torch.isfinite(posterior.covariance).all()
-  assert torch.linalg.eigvalsh(posterior.covariance).min() >= -1e-8
+  # Evaluate the singular float32 matrix in double: CPU single-precision
+  # eigvalsh can return NaN for finite subnormal entries in deterministic rows.
+  assert torch.linalg.eigvalsh(posterior.covariance.double()).min() >= -1e-8
   gain, h = d.kalman_gain, d.measurement_jacobian
   residual = torch.eye(70, dtype=dtype) - gain @ h
   reference = residual @ belief.covariance @ residual.transpose(-1, -2) + d.jitter[

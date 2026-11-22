@@ -1,6 +1,7 @@
 """Pilot scheduling keeps performance, truth-input and fixed-record scoring distinct."""
 
 import json
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -55,6 +56,95 @@ def _pilot(tmp_path):
 
 def _option(arguments, name):
   return arguments[arguments.index(name) + 1]
+
+
+@pytest.mark.parametrize("version", ["eit_pilot_v1", "eit_pilot_v2", "eit_pilot_v3"])
+def test_pilot_keeps_frozen_collection_protocol_for_evaluation(
+  tmp_path, monkeypatch, version
+):
+  from supermimic.scripts.run_eit_pilot import main
+
+  current = _pilot(tmp_path).p
+  assert current["collection_continues_across_rounds"]
+  saved = {**current, "version": version}
+  if version != current["version"]:
+    del saved["collection_continues_across_rounds"]
+    saved["continuous_collection_limit_s"] = 1.28
+  if version == "eit_pilot_v1":
+    del saved["training_process_environment"]
+  write_json(tmp_path / "protocol.json", saved)
+  argv = [
+    "run_eit_pilot",
+    "--motion-file",
+    current["motion_file"],
+    "--device",
+    "cpu",
+    "--output",
+    str(tmp_path),
+    "--phase",
+    "evaluate",
+  ]
+  monkeypatch.setattr(sys, "argv", argv)
+  evaluated = []
+  monkeypatch.setattr(Pilot, "evaluate", lambda pilot: evaluated.append(pilot.p))
+  main()
+  assert evaluated == [saved]
+  if version != current["version"]:
+    argv[-1] = "train"
+    with pytest.raises(ValueError, match="Pilot configuration changed"):
+      main()
+
+
+@pytest.mark.parametrize("legacy_checkpoint", [False, True])
+def test_v2_pilot_resumes_only_incremental_checkpoints(
+  tmp_path, monkeypatch, legacy_checkpoint
+):
+  from supermimic.runners.run_config import EIT_TRAINING_VERSION
+  from supermimic.scripts.run_eit_pilot import main
+  from tests.test_estimator_eit_training import training
+
+  current = _pilot(tmp_path).p
+  legacy = {
+    k: v for k, v in current.items() if k != "collection_continues_across_rounds"
+  }
+  legacy.update(version="eit_pilot_v2", continuous_collection_limit_s=1.28)
+  protocol_path = tmp_path / "protocol.json"
+  write_json(protocol_path, legacy)
+  state = training().state_dict()
+  state["training_seed"] = current["training_seed"]
+  checkpoint = tmp_path / "B/training.pt"
+  checkpoint.parent.mkdir()
+  torch.save(state, checkpoint)
+  if legacy_checkpoint:
+    checkpoint = tmp_path / "C/training.pt"
+    checkpoint.parent.mkdir()
+    torch.save({**state, "version": EIT_TRAINING_VERSION}, checkpoint)
+  monkeypatch.setattr(
+    sys,
+    "argv",
+    [
+      "run_eit_pilot",
+      "--motion-file",
+      current["motion_file"],
+      "--device",
+      "cpu",
+      "--output",
+      str(tmp_path),
+      "--phase",
+      "train",
+    ],
+  )
+  restarted = []
+  monkeypatch.setattr(Pilot, "train", lambda pilot: restarted.append(pilot.p))
+  if legacy_checkpoint:
+    with pytest.raises(ValueError, match="Pilot configuration changed"):
+      main()
+    assert not restarted
+    assert json.loads(protocol_path.read_text()) == legacy
+  else:
+    main()
+    assert restarted == [current]
+    assert json.loads(protocol_path.read_text()) == current
 
 
 def test_pilot_evaluates_all_snapshots_and_final_gradient_truth_and_common_records(
@@ -216,7 +306,12 @@ def test_exact_resume_comparison_reports_nested_key_without_relaxing_tolerance()
     )
 
 
-def test_resume_cache_requires_successful_exact_checks_and_valid_json(tmp_path):
+@pytest.mark.parametrize(
+  "version", ["eit_live_update_reference_v1", "eit_live_update_reference_v2"]
+)
+def test_resume_cache_requires_successful_exact_checks_and_valid_json(
+  tmp_path, version
+):
   from supermimic.runners.eit_snapshots import file_sha256
   from supermimic.scripts.run_eit_pilot import resume_result_matches
 
@@ -234,7 +329,7 @@ def test_resume_cache_requires_successful_exact_checks_and_valid_json(tmp_path):
     "cublas_workspace_config": None,
     "expected_optimizer_origin": "deepcopy_of_live_parameter_optimizer_graph",
   }
-  live = {"device": "cpu", "verification_execution": execution}
+  live = {"version": version, "device": "cpu", "verification_execution": execution}
   torch.save(live, reference)
   row = {
     "version": "eit_fixed_input_resume_v2",
@@ -247,7 +342,7 @@ def test_resume_cache_requires_successful_exact_checks_and_valid_json(tmp_path):
     "fixed_input_model_resume_exact": True,
     "live_optimizer_reference": True,
     "expected_source": "live_training_before_checkpoint_commit",
-    "reference_version": "eit_live_update_reference_v1",
+    "reference_version": version,
     "reference_sha256": file_sha256(reference),
     "verification_execution": execution,
   }
@@ -266,6 +361,12 @@ def test_resume_cache_requires_successful_exact_checks_and_valid_json(tmp_path):
     ("fixed_input_model_resume_exact", False),
     ("group", "B"),
     ("device", "cuda:0"),
+    (
+      "reference_version",
+      "eit_live_update_reference_v2"
+      if version.endswith("v1")
+      else "eit_live_update_reference_v1",
+    ),
   ):
     write_json(path, {**row, key: invalid})
     assert not matches()

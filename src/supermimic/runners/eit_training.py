@@ -23,6 +23,7 @@ from supermimic.learners.belief_policy_learner import (
   BeliefPolicyLearnerCfg,
   policy_metrics_for_json,
 )
+from supermimic.posterior_replay import POSTERIOR_REPLAY_VERSION
 from supermimic.runners.belief_training import (
   BeliefModelTraining,
   BeliefTrainingCfg,
@@ -30,6 +31,7 @@ from supermimic.runners.belief_training import (
 )
 from supermimic.runners.run_config import (
   EIT_INITIALIZATION_VERSION,
+  EIT_POLICY_TRAINING_VERSION,
   validate_eit_checkpoint_contract,
 )
 from supermimic.runners.supermimic_runner import (
@@ -39,7 +41,7 @@ from supermimic.runners.supermimic_runner import (
   build_actor,
   load_actor_checkpoint,
 )
-from supermimic.utils.profiling import PhaseTimer
+from supermimic.utils.profiling import StreamTimer
 
 if TYPE_CHECKING:
   from supermimic.utils.eit_wandb import EITOfflineWandb
@@ -48,9 +50,12 @@ if TYPE_CHECKING:
 @dataclass(frozen=True)
 class EITTrainingCfg(BeliefTrainingCfg):
   normalization_batch_size: int = 16
+  posterior_save_stride: int = 1
 
   def __post_init__(self):
     super().__post_init__()
+    if type(self.posterior_save_stride) is not int or self.posterior_save_stride < 1:
+      raise ValueError("posterior_save_stride must be positive")
     if (
       type(self.normalization_batch_size) is not int
       or self.normalization_batch_size < 1
@@ -58,8 +63,15 @@ class EITTrainingCfg(BeliefTrainingCfg):
       raise ValueError("normalization_batch_size must be positive")
 
 
-def initialization_fingerprint(bundle: dict) -> str:
+def initialization_fingerprint(
+  bundle: dict, *, include_model_revision: bool = True
+) -> str:
   digest = hashlib.sha256()
+  skip_revision_for = (
+    None
+    if include_model_revision
+    else bundle.get("world_model", bundle).get("dynamics")
+  )
 
   def hash_value(value):
     if isinstance(value, torch.Tensor):
@@ -67,6 +79,8 @@ def initialization_fingerprint(bundle: dict) -> str:
       digest.update(value.detach().cpu().contiguous().numpy().tobytes())
     elif isinstance(value, dict):
       for name in sorted(value):
+        if value is skip_revision_for and name == "model_revision":
+          continue
         digest.update(name.encode())
         hash_value(value[name])
     elif isinstance(value, (tuple, list)):
@@ -82,6 +96,8 @@ def initialization_fingerprint(bundle: dict) -> str:
 class EITTraining(BeliefModelTraining):
   """Train the model, actor and critic in separate, versioned phases."""
 
+  cfg: EITTrainingCfg
+
   def __init__(
     self,
     runner: SuperMimicRunner,
@@ -92,6 +108,11 @@ class EITTraining(BeliefModelTraining):
       raise ValueError("EIT policy starts require full replay")
     # Reuse all model-loop preconditions, then explicitly undo its fixed-actor mode.
     super().__init__(runner, cfg or EITTrainingCfg())
+    runner.replay_buffer.enable_posterior_cache(
+      self.cfg.posterior_save_stride, runner.cfg.history_length
+    )
+    runner.posterior_save_stride = self.cfg.posterior_save_stride
+    self.continuous_collection = True
     actor = runner.policy_learner.actor
     actor.requires_grad_(True)
     inputs = runner.cfg.estimator_inputs
@@ -116,73 +137,77 @@ class EITTraining(BeliefModelTraining):
 
   @torch.no_grad()
   def update_input_normalization(
-    self, frames, policy_keys: torch.Tensor | None = None
+    self, frames=None, policy_keys: torch.Tensor | None = None
   ) -> BeliefRolloutStart | None:
-    """Filter each requested episode once, normalizing fresh rows and keeping sampled Q0s."""
+    """Normalize this round's saved training slots or an explicit frame selection."""
+    timer = StreamTimer(self.runner.device)
+    with timer.measure("posterior_cache_normalization_seconds"):
+      starts = self._normalize_saved_posteriors(frames, policy_keys, timer)
+    self._normalization_profile = timer.seconds()
+    return starts
+
+  def _normalize_saved_posteriors(self, frames, policy_keys, timer):
     env = self.runner.wm_env
-    if len(frames) == 0 and policy_keys is None:
-      return None
-    fresh = torch.stack((frames["episode_id"], frames["time_index"]), dim=1)
-    requested = fresh if policy_keys is None else torch.cat((fresh, policy_keys))
-    # Rebuilding uses the retained segment head, which may follow a ring overwrite.
-    retained = self.runner.replay_buffer.retained_frames(
-      fields=("episode_id", "time_index")
+    replay = self.runner.replay_buffer
+    cache = replay.posterior_cache
+    if cache is None:
+      raise ValueError("EIT normalization requires posterior replay")
+    with timer.measure("posterior_cache_read_seconds"):
+      locations = cache.locations(replay)
+      rows, slots, posterior_slots = locations
+      training = (
+        replay._storage["episode_id"][rows, slots] % self.cfg.validation_stride != 0
+      )
+      if frames is None:
+        first = replay.insert_count - self.cfg.collection_steps
+        selected = cache.sequences[posterior_slots] >= first
+      else:
+        selected = cache.frame_mask(replay, locations, frames)
+      selected &= training
+      fresh_locations = tuple(index[selected] for index in locations)
+      starts = (
+        env.prepare_policy_starts(*policy_keys.unbind(dim=1))
+        if policy_keys is not None and len(policy_keys)
+        else None
+      )
+    count = len(fresh_locations[0])
+    gaps = (
+      self.runner._dynamics.model_revision
+      - cache.storage["posterior_revision"][rows, posterior_slots]
+      if len(rows)
+      else rows
     )
-    head_times = {}
-    for episode, time in zip(
-      retained["episode_id"].tolist(), retained["time_index"].tolist(), strict=True
-    ):
-      head_times[episode] = min(head_times.get(episode, time), time)
-    tails = {}
-    for episode, time in requested.tolist():
-      tails[episode] = max(tails.get(episode, time), time)
-    lengths = [time - head_times[episode] + 1 for episode, time in tails.items()]
-    self._prefix_budget = {
-      "posterior_prefix_episodes": len(lengths),
-      "posterior_prefix_frames": sum(lengths),
-      "posterior_prefix_length_min": min(lengths),
-      "posterior_prefix_length_max": max(lengths),
-      "posterior_prefix_length_mean": sum(lengths) / len(lengths),
+    self._cache_budget = {
+      "posterior_save_stride": cache.stride,
+      "effective_posterior_count": len(rows),
+      "available_policy_starts": int(training.sum()),
+      "normalization_samples": count,
+      "posterior_revision_gap_min": int(gaps.min()) if len(gaps) else 0,
+      "posterior_revision_gap_max": int(gaps.max()) if len(gaps) else 0,
+      "posterior_revision_gap_mean": float(gaps.float().mean()) if len(gaps) else 0,
+      **cache.storage_bytes(),
+      "episode_head_storage_bytes": replay.episode_head_storage_bytes,
+      "main_replay_storage_bytes": sum(
+        t.numel() * t.element_size() for t in replay._storage.values()
+      ),
     }
-    fresh_keys = {tuple(key) for key in fresh.tolist()}
-    draw_order = (
-      [] if policy_keys is None else [tuple(key) for key in policy_keys.tolist()]
-    )
-    sampled_keys = set(draw_order)
-    saved = {}
-    # Stage statistics before copying; malformed later batches must not leave
-    # half-updated actor/critic normalization.
+    if not count:
+      return starts
+
+    # Stage statistics so an invalid later chunk cannot partially update live models.
     candidate_actor = deepcopy(self.actor)
     candidate_critic = deepcopy(self.policy.critic)
     candidate_actor.train()
     candidate_critic.train()
+    batch_size = self.cfg.normalization_batch_size
+    batches = env.iter_cached_policy_starts(fresh_locations, batch_size=batch_size)
     try:
-      for chunk in env.iter_policy_starts(
-        *requested.unbind(dim=1), batch_size=self.cfg.normalization_batch_size
-      ):
-        rows = []
-        for i, key in enumerate(
-          zip(
-            chunk.batch["episode_id"].tolist(),
-            chunk.batch["time_index"].tolist(),
-            strict=True,
-          )
-        ):
-          if key in fresh_keys:
-            rows.append(i)
-          if key in sampled_keys:
-            saved[key] = chunk.index(i)
-        if rows:
-          obs = env.reset_prepared(
-            chunk if len(rows) == len(chunk) else chunk.index(rows)
-          )
-          candidate_actor.update_normalization(obs)
-          candidate_critic.update_normalization(obs["critic"])
-      starts = (
-        BeliefRolloutStart.cat([saved[key] for key in draw_order])
-        if draw_order
-        else None
-      )
+      for _ in range(0, count, batch_size):
+        with timer.measure("posterior_cache_read_seconds"):
+          chunk = next(batches)
+        obs = env.reset_prepared(chunk)
+        candidate_actor.update_normalization(obs)
+        candidate_critic.update_normalization(obs["critic"])
       for module in (candidate_actor.obs_normalizer, candidate_actor.goal_normalizers):
         if not all(torch.isfinite(t).all() for t in module.buffers()):
           raise ValueError("Non-finite actor normalization statistics")
@@ -200,28 +225,26 @@ class EITTraining(BeliefModelTraining):
       self.actor.eval()
       self.policy.critic.eval()
 
-  def _update_policy(self) -> dict:
-    runner = self.runner
-    timer = PhaseTimer(runner.device)
-    actor_before, critic_before = self.policy.actor_steps, self.policy.critic_steps
-    # A singleton fragment still supplies a policy start.
-    policy_ids = [
+  def policy_episode_ids(self) -> list[int]:
+    """Include every retained training episode, even a single-frame fragment."""
+    return [
       episode
-      for episode in runner.replay_buffer.training_episode_lengths()
+      for episode in self.runner.replay_buffer.training_episode_lengths()
       if episode % self.cfg.validation_stride
     ]
-    with runner.wm_env.readonly_policy_motion():
+
+  def _update_policy(self) -> dict:
+    runner = self.runner
+    actor_before, critic_before = self.policy.actor_steps, self.policy.critic_steps
+    policy_ids = self.policy_episode_ids()
+    with runner._dynamics.readonly(), runner.wm_env.readonly_policy_motion():
       policy_keys = self.policy.sample_start_keys(policy_ids)
-      fresh_train = self._fresh_training_frames(
-        self.cfg.collection_steps, ("time_index",)
-      )
-      with timer.measure("posterior_prefix_normalization_seconds"):
-        starts = self.update_input_normalization(fresh_train, policy_keys)
+      starts = self.update_input_normalization(None, policy_keys)
       assert starts is not None
       policy_logs = self.policy.update_prepared(starts)
-    self._policy_profile = {**timer.seconds, **self.policy.last_profile}
+    self._policy_profile = {**self._normalization_profile, **self.policy.last_profile}
     self._policy_budget = {
-      **getattr(self, "_prefix_budget", {}),
+      **getattr(self, "_cache_budget", {}),
       "actor_updates": self.policy.actor_steps - actor_before,
       "critic_updates": self.policy.critic_steps - critic_before,
       "policy_starts_drawn": len(starts),
@@ -246,6 +269,9 @@ class EITTraining(BeliefModelTraining):
     state = super().state_dict()
     state.update(
       stage="policy",
+      version=EIT_POLICY_TRAINING_VERSION,
+      posterior_replay_protocol=POSTERIOR_REPLAY_VERSION,
+      model_revision=self.runner._dynamics.model_revision,
       critic=deepcopy(self.policy.critic.checkpoint()),
       policy=deepcopy(self.policy.state_dict()),
       policy_config=asdict(self.policy.cfg),
@@ -258,6 +284,10 @@ class EITTraining(BeliefModelTraining):
   @staticmethod
   def _check_checkpoint_version(state: dict) -> None:
     validate_eit_checkpoint_contract(state, stage="policy")
+    if state.get("version") != EIT_POLICY_TRAINING_VERSION:
+      raise ValueError(
+        "EIT incremental training requires v4; v3 remains evaluation/export only"
+      )
 
   def load_state_dict(self, state: dict) -> None:
     self._check_checkpoint_version(state)
@@ -292,9 +322,21 @@ class EITTraining(BeliefModelTraining):
       self.runner.device,
     )
     candidate_policy.load_state_dict(state["policy"])
+    # Release the policy preflight copies before the model loader creates its own.
+    del candidate_policy, candidate_env, candidate_wm, candidate_actor, candidate_critic
     # The inherited loader preflights model, model optimizer, actor, metadata and
     # RNG before any mutation. All additional EIT components passed above.
-    super().load_state_dict(state)
+    saved_cfg = replace(
+      self.cfg, posterior_save_stride=state["loop_config"]["posterior_save_stride"]
+    )
+    old_cfg, old_stride = self.cfg, self.runner.posterior_save_stride
+    try:
+      self.cfg = saved_cfg
+      self.runner.posterior_save_stride = saved_cfg.posterior_save_stride
+      super().load_state_dict(state)
+    except Exception:
+      self.cfg, self.runner.posterior_save_stride = old_cfg, old_stride
+      raise
     self.policy.critic.load_checkpoint(state["critic"])
     self.policy.load_state_dict(state["policy"])
     self.initialization_digest = initialization
@@ -349,12 +391,15 @@ class EITTraining(BeliefModelTraining):
         critics[group] = critic
     # B/C include identical extra belief columns even when the source was A.
     critics["C"].copy_common_initialization_from(critics["B"])
+    world_model = runner._wm.bundle()
+    # Shared initial weights retain their v3 identity across training protocols.
+    world_model["dynamics"].pop("model_revision", None)
     return deepcopy(
       {
         "version": EIT_INITIALIZATION_VERSION,
         "generation_group": runner.cfg.estimator_inputs.group,
         "generation_seed": self.training_seed,
-        "world_model": runner._wm.bundle(),
+        "world_model": world_model,
         "actors": {
           group: actor_checkpoint(
             actor,

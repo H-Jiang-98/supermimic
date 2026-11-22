@@ -1,4 +1,4 @@
-"""Real two-round EIT acceptance and fixed-input model and policy continuation.
+"""Real continuous-round EIT acceptance and fixed-input model and policy continuation.
 
 Use --device cuda:0 --full-width for the production network benchmark.
 """
@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import time
 from copy import deepcopy
+from itertools import pairwise
 from pathlib import Path
 
 import mjlab.tasks  # noqa: F401
@@ -60,6 +61,8 @@ def parse_args(argv=None):
   parser.add_argument("--full-width", action="store_true")
   parser.add_argument("--policy-horizon", "--horizon", type=int, default=4)
   parser.add_argument("--samples", type=int, default=2)
+  parser.add_argument("--rounds", type=int, default=3)
+  parser.add_argument("--posterior-save-stride", type=int, default=1)
   parser.add_argument("--output", type=Path)
   return parser.parse_args(argv)
 
@@ -108,7 +111,10 @@ def main():
         training = EITTraining(
           runner,
           EITTrainingCfg(
-            collection_steps=8, validation_stride=2, validation_batch_size=2
+            collection_steps=8,
+            validation_stride=2,
+            validation_batch_size=2,
+            posterior_save_stride=args.posterior_save_stride,
           ),
           BeliefPolicyLearnerCfg(
             batch_size=4,
@@ -133,7 +139,7 @@ def main():
         if cuda:
           torch.cuda.synchronize(args.device)
         begin = time.perf_counter()
-        logs = training.run(2, directory / group)
+        logs = training.run(args.rounds, directory / group)
         if cuda:
           torch.cuda.synchronize(args.device)
         elapsed = time.perf_counter() - begin
@@ -146,11 +152,16 @@ def main():
           assert any(
             not torch.equal(v, before[name][k]) for k, v in module.state_dict().items()
           ), name
-        assert logs[1]["collection_actor_version"] == logs[0]["trained_actor_version"]
-        assert logs[1]["collection_model_version"] == logs[0]["trained_model_version"]
+        for previous, current in pairwise(logs):
+          assert (
+            current["collection_actor_version"] == previous["trained_actor_version"]
+          )
+          assert (
+            current["collection_model_version"] == previous["trained_model_version"]
+          )
         assert runner.imagined_posterior_provider.state is None
         train_ids, _ = training.episode_split()
-        starts = runner.wm_env.sample_policy_starts(2, train_ids)
+        starts = runner.wm_env.sample_policy_starts(2, training.policy_episode_ids())
         noises = training.policy.draw_noises(starts)
         saved = torch.load(
           directory / group / "training.pt", map_location=args.device, weights_only=True
@@ -190,7 +201,8 @@ def main():
           {
             "group": group,
             "critic_contract": training.policy.critic.contract(),
-            "rounds": 2,
+            "rounds": args.rounds,
+            "posterior_save_stride": args.posterior_save_stride,
             "round_seconds": elapsed,
             "fixed_input_policy_resume_exact": True,
             "fixed_input_model_resume_exact": True,
@@ -233,12 +245,15 @@ def main():
     "src/supermimic/learners/wm_learner.py",
     "src/supermimic/models.py",
     "src/supermimic/replay_buffer.py",
+    "src/supermimic/posterior_replay.py",
     "src/supermimic/runners/belief_training.py",
     "src/supermimic/runners/eit_training.py",
+    "src/supermimic/runners/supermimic_runner.py",
     "src/supermimic/runners/run_config.py",
     "src/supermimic/runners/eit_inference.py",
     "src/supermimic/envs/world_model_env.py",
     "src/supermimic/belief_provider.py",
+    "src/supermimic/utils/profiling.py",
     "src/supermimic/scripts/train_eit.py",
     "src/supermimic/scripts/eval_eit.py",
   ]
@@ -250,7 +265,7 @@ def main():
     "seed": 2026,
     "cpu_threads": 1,
     "dtype": "float32",
-    "timing_scope": "two full training rounds including any first-use compilation; separate evaluation excluded",
+    "timing_scope": "full training rounds including checkpoint save and any first-use compilation; separate evaluation excluded",
     "memory_scope": "cumulative peak including initialization, training and restore validation",
     "full_width": args.full_width,
     "policy_horizon": args.policy_horizon,

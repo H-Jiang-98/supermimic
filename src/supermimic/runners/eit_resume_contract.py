@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+REFERENCE_VERSION = "eit_live_update_reference_v2"
+SUPPORTED_REFERENCE_VERSIONS = ("eit_live_update_reference_v1", REFERENCE_VERSION)
+
 RESUME_EXECUTION_FIELDS = frozenset(
   {
     "torch_compile",

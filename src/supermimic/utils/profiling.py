@@ -29,6 +29,42 @@ class PhaseTimer:
       self.seconds[name] = self.seconds.get(name, 0.0) + self.now() - start
 
 
+class StreamTimer:
+  """Time interleaved work on one stream, collecting CUDA results at phase end."""
+
+  def __init__(self, device):
+    device = torch.device(device)
+    self.stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
+    self._events = []
+    self._seconds = {}
+
+  @contextmanager
+  def measure(self, name):
+    if self.stream is None:
+      start = perf_counter()
+      try:
+        yield
+      finally:
+        self._seconds[name] = self._seconds.get(name, 0.0) + (perf_counter() - start)
+    else:
+      begin, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+      begin.record(self.stream)
+      try:
+        yield
+      finally:
+        end.record(self.stream)
+        self._events.append((name, begin, end))
+
+  def seconds(self):
+    totals = self._seconds.copy()
+    if self._events:
+      # Events were appended in completion order on the same stream.
+      self._events[-1][2].synchronize()
+      for name, begin, end in self._events:
+        totals[name] = totals.get(name, 0.0) + begin.elapsed_time(end) / 1000
+    return totals
+
+
 def runtime_metadata(parameter, *, reset_peak=False):
   device = parameter.device
   result = {

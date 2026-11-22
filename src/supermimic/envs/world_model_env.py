@@ -63,6 +63,7 @@ class _BeliefFrame(NamedTuple):
   generation: int
   episode_id: torch.Tensor
   time_index: torch.Tensor
+  model_write_generation: int
 
 
 def _cat_beliefs(beliefs: list[BeliefState]) -> BeliefState:
@@ -76,15 +77,16 @@ def _cat_beliefs(beliefs: list[BeliefState]) -> BeliefState:
 
 @dataclass(frozen=True)
 class BeliefRolloutStart:
-  """Detached physical frames and posteriors at one sealed replay/model version."""
+  """Detached starts with mixed source beliefs, pinned to one rollout identity."""
 
   batch: TensorDict
   belief: BeliefState
-  model_version: str
+  model_version: str | int
   replay_buffer: ReplayBuffer
   insert_count: int
   motion_digest: str
   remaining_steps: torch.Tensor
+  model_write_generation: int | None = None
 
   def __len__(self):
     return len(self.batch)
@@ -113,6 +115,7 @@ class BeliefRolloutStart:
         start.replay_buffer is not first.replay_buffer
         or start.insert_count != first.insert_count
         or start.model_version != first.model_version
+        or start.model_write_generation != first.model_write_generation
         or start.motion_digest != first.motion_digest
       ):
         raise ValueError("Policy starts must share replay, model and motion versions")
@@ -346,6 +349,7 @@ class WorldModelEnv(ABC):
       frame is None
       or provider is not frame.provider
       or provider.generation != frame.generation
+      or self.dynamics.write_generation != frame.model_write_generation
       or provider.lookup(frame.episode_id, frame.time_index, self.sim_ctx) is None
     ):
       raise ValueError("Imagined posterior changed; reset from keyed replay")
@@ -358,6 +362,7 @@ class WorldModelEnv(ABC):
       provider.generation,
       candidate.state.episode_id.clone(),
       candidate.state.time_index.clone(),
+      candidate.model_write_generation,
     )
 
   def _rebuild_from_replay(self, episode_id, time_index, *, relative=False):
@@ -378,6 +383,20 @@ class WorldModelEnv(ABC):
       return value
 
     episodes, times = indices(episode_id), indices(time_index)
+    if self.replay_buffer.posterior_cache is not None:
+      if relative:
+        raise ValueError("Cached starts require absolute episode time indices")
+      batch, belief = self.replay_buffer.posterior_cache.read(
+        self.replay_buffer, torch.stack((episodes, times), -1)
+      )
+      candidate = self.posterior_provider.prepare_restore(
+        belief,
+        batch["sim_ctx"],
+        model_version=self.posterior_provider.model_version,
+        episode_id=episodes,
+        time_index=times,
+      )
+      return batch, candidate
     provider = self.posterior_provider
     version = provider.model_version
     with torch.inference_mode(False), torch.no_grad():
@@ -478,7 +497,7 @@ class WorldModelEnv(ABC):
       raise ValueError("Reference motion changed during read-only policy training")
     return digest
 
-  def _unique_policy_keys(self, episode_id, time_index):
+  def _policy_keys(self, episode_id, time_index):
     self._check_posterior_source(None)
     if not isinstance(self.posterior_provider, BeliefProvider):
       raise ValueError("Policy starts require a full belief provider")
@@ -490,15 +509,54 @@ class WorldModelEnv(ABC):
       or times.shape != episodes.shape
       or episodes.dtype != torch.long
       or times.dtype != torch.long
+      or (episodes < 0).any()
+      or (times < 0).any()
     ):
       raise ValueError("Policy start keys require equal nonempty int64 vectors")
-    return torch.unique(torch.stack((episodes, times), -1), dim=0, return_inverse=True)
+    return torch.stack((episodes, times), dim=-1)
+
+  def iter_cached_policy_starts(self, locations, *, batch_size):
+    """Stream already selected replay slots without gathering their keys again."""
+    if type(batch_size) is not int or batch_size < 1:
+      raise ValueError("Policy start batch size must be positive")
+    self._check_posterior_source(None)
+    if not isinstance(self.posterior_provider, BeliefProvider):
+      raise ValueError("Policy starts require a full belief provider")
+    replay = self.replay_buffer
+    cache = replay.posterior_cache
+    if cache is None:
+      raise ValueError("Cached policy starts require posterior replay")
+    replay.finish_collection_round()
+    version = self.posterior_provider.model_version
+    write_generation = self.dynamics.write_generation
+    insert_count = replay.insert_count
+    digest = self._policy_motion_digest()
+    for offset in range(0, len(locations[0]), batch_size):
+      selected = tuple(t[offset : offset + batch_size] for t in locations)
+      batch, belief = cache.read(replay, locations=selected)
+      remaining = (
+        self._last_reference_frame(batch["motion_time"]) - batch["motion_time"] + 1
+      )
+      yield BeliefRolloutStart(
+        batch,
+        belief,
+        version,
+        replay,
+        insert_count,
+        digest,
+        remaining,
+        write_generation,
+      )
 
   def _iter_policy_starts(self, keys, batch_size):
     if type(batch_size) is not int or batch_size < 1:
       raise ValueError("Policy start batch size must be positive")
-    version = self.posterior_provider.model_version
     replay = self.replay_buffer
+    if replay.posterior_cache is not None:
+      locations = replay.posterior_cache.lookup(replay, keys)
+      yield from self.iter_cached_policy_starts(locations, batch_size=batch_size)
+      return
+    version = self.posterior_provider.model_version
     insert_count = replay.insert_count
     digest = self._policy_motion_digest()
     for episode, group in groupby(keys.tolist(), key=itemgetter(0)):
@@ -528,37 +586,53 @@ class WorldModelEnv(ABC):
 
   def iter_policy_starts(self, episode_id, time_index, *, batch_size):
     """Yield detached unique starts by episode and time, in bounded batches."""
-    keys, _ = self._unique_policy_keys(episode_id, time_index)
+    keys = self._policy_keys(episode_id, time_index).unique(dim=0)
     yield from self._iter_policy_starts(keys, batch_size)
 
   def prepare_policy_starts(self, episode_id, time_index) -> BeliefRolloutStart:
     """Return current-model starts in request order, including repeated keys."""
-    keys, inverse = self._unique_policy_keys(episode_id, time_index)
+    keys = self._policy_keys(episode_id, time_index)
     with torch.inference_mode(False), torch.no_grad():
+      if self.replay_buffer.posterior_cache is not None:
+        # Cache lookup preserves both requested order and repeated draws.
+        return next(self._iter_policy_starts(keys, len(keys)))
+      keys, inverse = keys.unique(dim=0, return_inverse=True)
       start = BeliefRolloutStart.cat(list(self._iter_policy_starts(keys, len(keys))))
       return start.index(inverse)
 
   def sample_policy_keys(
     self, batch_size: int, episode_ids, generator=None, *, num_batches: int = 1
   ):
-    """Draw consecutive policy batches from one copy of the eligible keys."""
+    """Draw consecutive policy batches from the eligible replay locations."""
     if type(batch_size) is not int or batch_size < 1:
       raise ValueError("Policy start batch size must be positive")
     if type(num_batches) is not int or num_batches < 1:
       raise ValueError("Number of policy start batches must be positive")
-    frames = self.replay_buffer.retained_frames(
+
+    def draw(count):
+      if not count:
+        raise ValueError(
+          "No training frames with available posterior for policy starts"
+        )
+      return torch.cat(
+        [
+          torch.randint(count, (batch_size,), device=self.device, generator=generator)
+          for _ in range(num_batches)
+        ]
+      )
+
+    replay = self.replay_buffer
+    if replay.posterior_cache is not None:
+      rows, slots, _ = replay.posterior_cache.locations(replay, episode_ids=episode_ids)
+      selected = draw(len(rows))
+      rows, slots = rows[selected], slots[selected]
+      return replay._storage["episode_id"][rows, slots], replay._storage["time_index"][
+        rows, slots
+      ]
+    frames = replay.retained_frames(
       episode_ids=episode_ids, fields=("episode_id", "time_index")
     )
-    if not len(frames):
-      raise ValueError("No training frames available for policy starts")
-    selected = torch.cat(
-      [
-        torch.randint(
-          len(frames), (batch_size,), device=self.device, generator=generator
-        )
-        for _ in range(num_batches)
-      ]
-    )
+    selected = draw(len(frames))
     return frames["episode_id"][selected], frames["time_index"][selected]
 
   def sample_policy_starts(self, batch_size: int, episode_ids, generator=None):
@@ -575,7 +649,11 @@ class WorldModelEnv(ABC):
       start.replay_buffer is not self.replay_buffer
       or start.insert_count != self.replay_buffer.insert_count
       or start.motion_digest != self._policy_motion_digest()
-      or start.model_version != self.dynamics.model_version
+      or start.model_version != self.posterior_provider.model_version
+      or (
+        start.model_write_generation is not None
+        and start.model_write_generation != self.dynamics.write_generation
+      )
     ):
       raise ValueError("Stale rollout start: model, replay or motion changed")
     batch = start.batch.detach().clone()
