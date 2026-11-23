@@ -121,8 +121,8 @@ def _private_components(training):
       "learner": training.learner,
       "actor": live.actor,
       "critic": live.critic,
-      "actor_optimizer": live.actor_optimizer,
-      "critic_optimizer": live.critic_optimizer,
+      "actor_optimizers": live.actor_optimizers,
+      "critic_optimizers": live.critic_optimizers,
       "generators": live.generators,
     }
   )
@@ -159,7 +159,13 @@ def _private_components(training):
   env._readonly_motion = None
   env.clear_rollout()
   policy = copy(live)
-  for name in ("actor", "critic", "actor_optimizer", "critic_optimizer", "generators"):
+  for name in (
+    "actor",
+    "critic",
+    "actor_optimizers",
+    "critic_optimizers",
+    "generators",
+  ):
     setattr(policy, name, cloned[name])
   policy.wm_env = env
   return wm, learner, policy, env
@@ -220,10 +226,12 @@ def _warm_policy(wm, learner, policy, env, cfg, payload, noises):
 
 def build_live_reference(training, checkpoint: Path, state: dict):
   """Capture expected updates from live state; ``state`` is only identity metadata."""
-  if state.get("stage") != "policy" or state["rounds"] < 1:
-    raise ValueError("Live continuation evidence requires a completed policy round")
-  if training.rounds != state["rounds"]:
-    raise ValueError("Live trainer and pending checkpoint round differ")
+  if state.get("stage") != "policy" or state["update_groups"] < 1:
+    raise ValueError(
+      "Live continuation evidence requires a completed policy update group"
+    )
+  if training.update_groups != state["update_groups"]:
+    raise ValueError("Live trainer and pending checkpoint update groups differ")
   # Verify that the committed bytes will describe these live components. This is
   # a comparison only: none of the saved values is loaded into the expected side.
   current = training.state_dict()
@@ -309,7 +317,8 @@ def build_live_reference(training, checkpoint: Path, state: dict):
       "version": REFERENCE_VERSION,
       "source": REFERENCE_SOURCE,
       "checkpoint_sha256": file_sha256(checkpoint),
-      "round": state["rounds"],
+      "collected_steps": state["collected_steps"],
+      "update_groups": state["update_groups"],
       "group": state["runner_config"]["estimator_inputs"]["group"],
       "device": str(parameter.device),
       "dtype": str(parameter.dtype),

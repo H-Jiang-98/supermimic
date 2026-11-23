@@ -2,19 +2,18 @@
 
 在独立评估 seed 的真实仿真中，每个环境槽从片头记录一个 episode。相同的过程模型或滤波器比较应复用同一份 recording 和窗口长度。critic 的真实回报比较则要求由被评估的快照产生动作。训练集内部的验证划分继续用于模型拟合。评分入口用展开的训练文件 SHA-256、加载的 motion 摘要及训练 seed 检查记录来源。与训练共享 seed 和 motion 的记录会被拒绝。历史快照缺少训练 seed 或同 seed 时缺少文件清单，会在 training_overlap_check 中标明无法核验。
 
-诊断支持 v4 和 v3 策略快照。固定记录保存完整 episode 的逐帧测量、动作和初始先验，
-后验评分以指定快照的模型逐帧滤波。训练时的 `posterior_save_stride` 不影响诊断帧数。
+诊断支持 `train_belief` 的 v4 模型快照和 `train_eit` 的 v5 策略快照。两类诊断都报告累计采集帧数 `collected_frames`。模型快照另报 `round`，策略快照另报 `collected_steps` 和 `update_groups`。固定记录保存完整 episode 的逐帧测量、动作和初始先验，后验评分以指定快照的模型逐帧滤波。训练时的 `posterior_save_stride` 不影响诊断帧数。
 
 ```bash
 OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.eval_eit \
-  --checkpoint artifacts/step5/frames_120.pt --motion-file data/motions/walk1_subject1.npz \
-  --seed 2718 --num-envs 1 --record artifacts/step5/episodes.pt \
-  --output artifacts/step5/evaluation.json
+  --checkpoint logs/eit-v5/B/training.pt --motion-file data/motions/walk1_subject1.npz \
+  --seed 2718 --num-envs 1 --record artifacts/eit-v5-diagnostics/episodes.pt \
+  --output artifacts/eit-v5-diagnostics/evaluation.json
 
 OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.diagnose_eit \
-  --checkpoint artifacts/step5/frames_120.pt --recording artifacts/step5/episodes.pt \
+  --checkpoint logs/eit-v5/B/training.pt --recording artifacts/eit-v5-diagnostics/episodes.pt \
   --window-frames 8 --bin-steps 50 --imagined-horizon 128 --imagined-samples 4 \
-  --output artifacts/step5/diagnostics.json
+  --output artifacts/eit-v5-diagnostics/diagnostics.json
 ```
 
 `--mode process` 读取片内全部具有连续后继的一步对和全部完整窗口，按动作从第一个真值状态自由滚动。四组多步 MSE 的通道和缩放与均值拟合一致。一步有符号偏差为 local_error(预测, 真值) 的前 9 维。白化残差的二阶矩为完整的 70×70 矩阵，保留维度间的相关。JSON 同时给出窗口数、被窗口评分的后继总数和一步对数。
@@ -38,7 +37,7 @@ import numpy as np
 from mjlab.asset_zoo.robots.unitree_g1.g1_constants import G1_XML, KNEES_BENT_KEYFRAME
 from supermimic.scripts.check_estimator import stationary_motion
 
-path = Path("artifacts/step5/drift_supine.npz")
+path = Path("artifacts/eit-v5-diagnostics/drift_supine.npz")
 path.parent.mkdir(parents=True, exist_ok=True)
 stationary_motion(path, frames=250)
 model = mujoco.MjModel.from_xml_path(str(G1_XML))
@@ -55,13 +54,13 @@ np.savez(path, **arrays)
 PYTHON
 
 OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.eval_eit \
-  --checkpoint artifacts/step5/frames_120.pt --motion-file artifacts/step5/drift_supine.npz \
-  --num-envs 1 --seed 90817 --reference-controller --record artifacts/step5/drift_episodes.pt \
-  --output artifacts/step5/drift_recording.json
+  --checkpoint logs/eit-v5/B/training.pt --motion-file artifacts/eit-v5-diagnostics/drift_supine.npz \
+  --num-envs 1 --seed 90817 --reference-controller --record artifacts/eit-v5-diagnostics/drift_episodes.pt \
+  --output artifacts/eit-v5-diagnostics/drift_recording.json
 
 OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.diagnose_eit \
-  --checkpoint artifacts/step5/frames_120.pt --recording artifacts/step5/drift_episodes.pt \
-  --mode posterior --bin-steps 50 --output artifacts/step5/drift_diagnostics.json
+  --checkpoint logs/eit-v5/B/training.pt --recording artifacts/eit-v5-diagnostics/drift_episodes.pt \
+  --mode posterior --bin-steps 50 --output artifacts/eit-v5-diagnostics/drift_diagnostics.json
 ```
 
-该 B 组快照在五个一秒箱中各有 50 个样本，RPV9 椭球分别覆盖 2、0、0、0、0 帧。逐帧原始记录、motion、快照与完整诊断 JSON 位于本地 `artifacts/step5/`。
+历史 B 组快照在五个一秒箱中各有 50 个样本，RPV9 椭球分别覆盖 2、0、0、0、0 帧。逐帧原始记录、motion、快照与完整诊断 JSON 位于本地 `artifacts/step5/`。

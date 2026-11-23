@@ -196,6 +196,8 @@ def _initialization_identity(audit, p):
       "Initialization package version/seed differs from pilot protocol",
     )
     identity = initialization_fingerprint(bundle)
+    if p.get("version") == "eit_pilot_v4":
+      return identity
     for group in GROUPS:
       baseline = audit.root / group / "snapshots" / "frames_0.pt"
       if not baseline.is_file():
@@ -311,10 +313,11 @@ def _verify_diagnostic_record(
     audit.failures.append(f"Cannot verify independent recording {path}: {error}")
 
 
-def _validated_sources(audit, p, saved_validation):
+def _validated_sources(audit, p, saved_validation, *, frames=None):
   """Reopen checkpoints and raw task episodes; never trust aggregate success flags."""
   manifest = audit.load("manifest.json")
   if not manifest:
+    audit.data(False, "Frozen validation manifest is missing or empty")
     return []
   unsigned = {k: v for k, v in manifest.items() if k != "manifest_digest"}
   audit.require(
@@ -326,7 +329,8 @@ def _validated_sources(audit, p, saved_validation):
     saved_validation.get("manifest_digest") == manifest.get("manifest_digest"),
     "Validation aggregate belongs to a different manifest",
   )
-  frames = [i * p["num_envs"] * p["collection_steps"] for i in range(p["rounds"] + 1)]
+  if frames is None:
+    frames = [i * p["num_envs"] * p["collection_steps"] for i in range(p["rounds"] + 1)]
   expected_runs = [
     {
       "directory": str(audit.root / group),
@@ -341,7 +345,9 @@ def _validated_sources(audit, p, saved_validation):
   )
   scenes = manifest.get("validation", [])
   audit.require(
-    len(scenes) == 1
+    isinstance(scenes, list)
+    and len(scenes) == 1
+    and isinstance(scenes[0], dict)
     and scenes[0].get("sha256") == p["motion_sha256"]
     and scenes[0].get("seed") == p["validation_seed"]
     and scenes[0].get("num_envs") == p["evaluation_envs"]
@@ -374,6 +380,10 @@ def _validated_sources(audit, p, saved_validation):
           candidate, scenes, audit.root / "evaluation", run=False
         )
       )
+    audit.data(
+      not saved_validation.get("unavailable"),
+      "Validation aggregate includes unavailable candidates",
+    )
     saved_rows = saved_validation.get("baselines", []) + saved_validation.get(
       "trained", []
     )
@@ -390,6 +400,11 @@ def _validated_sources(audit, p, saved_validation):
     expected_keys = {
       (group, p["training_seed"], frame) for group in GROUPS for frame in frames
     }
+    raw_keys = [candidate_key(record) for record in records]
+    audit.require(
+      len(raw_keys) == len(set(raw_keys)) and set(raw_keys) == expected_keys,
+      "Reopened checkpoint list differs from the requested validation candidates",
+    )
     audit.require(
       len(keys) == len(set(keys)),
       "Validation aggregate contains duplicate candidate keys",
@@ -404,12 +419,11 @@ def _validated_sources(audit, p, saved_validation):
     )
     audit.require(
       all(
-        r["candidate"]["collected_frames"] == 0
+        r["candidate"]["actor_steps"] == 0
         for r in saved_validation.get("baselines", [])
       )
       and all(
-        r["candidate"]["collected_frames"] > 0
-        for r in saved_validation.get("trained", [])
+        r["candidate"]["actor_steps"] > 0 for r in saved_validation.get("trained", [])
       ),
       "Validation aggregate baseline/trained candidate categories disagree",
     )
@@ -431,7 +445,14 @@ def _validated_sources(audit, p, saved_validation):
         "Selected snapshots differ from verified validation ranking",
       )
     return records
-  except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
+  except (
+    OSError,
+    ValueError,
+    KeyError,
+    TypeError,
+    RuntimeError,
+    AttributeError,
+  ) as error:
     audit.failures.append(f"Cannot validate source artifacts: {error}")
     return []
 
@@ -974,6 +995,252 @@ def _audit_group(audit, group, p, validation, commands):
   }
 
 
+def _step_report(audit, protocol):
+  """Audit v5 checkpoints and cumulative Logger rows without snapshot indexes."""
+  from supermimic.runners.eit_inference import load_hashed_checkpoint
+  from supermimic.runners.run_config import validate_eit_checkpoint_contract
+  from supermimic.scripts.run_eit_pilot import resume_result_matches
+
+  groups = {}
+  identities = set()
+  initialization = _initialization_identity(audit, protocol)
+  final_frames = protocol["max_iterations"] * protocol["num_envs"]
+  commands = audit.load("commands.jsonl", lines=True)
+  for group in GROUPS:
+    run = audit.root / group
+    path = run / "training.pt"
+    if not path.is_file():
+      audit.pending.append(f"Missing {group}/training.pt")
+      continue
+    try:
+      state, checkpoint_sha = load_hashed_checkpoint(path, "cpu")
+      validate_eit_checkpoint_contract(state, stage="policy")
+      steps, updates = state["collected_steps"], state["update_groups"]
+      audit.require(
+        steps <= protocol["max_iterations"], f"{group}: exceeded cumulative budget"
+      )
+      audit.data(
+        steps == protocol["max_iterations"], f"{group}: training is incomplete"
+      )
+      audit.require(
+        state["collected_frames"] == steps * protocol["num_envs"],
+        f"{group}: physical-frame budget mismatch",
+      )
+      mean, cov, policy = (
+        state["learner"]["mean"],
+        state["learner"]["cov"],
+        state["policy"],
+      )
+      pair_budget = cov["config"]["pair_budget"]
+      if pair_budget is None:
+        pair_budget = (
+          mean["config"]["num_batches"]
+          * mean["config"]["batch_size"]
+          * (mean["config"]["window_frames"] - 1)
+        )
+      actual = {
+        "mean": mean["steps"],
+        "covariance": cov["steps"],
+        "actor": policy["actor_steps"],
+        "critic": policy["critic_steps"],
+      }
+      for name, per_group in protocol["updates_per_training_group"].items():
+        audit.require(
+          actual[name] == updates * per_group, f"{group}: {name} update budget mismatch"
+        )
+      audit.require(
+        pair_budget == protocol["covariance_pair_budget"],
+        f"{group}: covariance draw budget mismatch",
+      )
+      audit.require(
+        state["runner_config"]["estimator_inputs"]["group"] == group,
+        f"{group}: group mismatch",
+      )
+      identities.add(state["initialization_digest"])
+      audit.require(
+        state["training_seed"] == protocol["training_seed"],
+        f"{group}: training seed differs from protocol",
+      )
+      if initialization is not None:
+        audit.require(
+          state["initialization_digest"] == initialization,
+          f"{group}: checkpoint differs from shared initialization",
+        )
+      metrics = audit.load(f"{group}/metrics.jsonl", lines=True)
+      profiles = audit.load(f"{group}/profiling.jsonl", lines=True)
+      logged_steps = [row["step"] for row in metrics]
+      audit.data(
+        bool(logged_steps)
+        and logged_steps[-1] == steps - 1
+        and logged_steps == sorted(set(logged_steps))
+        and logged_steps == [row["step"] for row in profiles],
+        f"{group}: metrics and profiling logs lack matching steps through the checkpoint",
+      )
+      totals = {
+        name: sum(row["seconds"].get(name, 0.0) for row in profiles)
+        for name in PHASES
+        if name != "round_seconds"
+      }
+      peaks = [row["runtime"].get("cuda_peak_allocated_bytes") for row in profiles]
+      groups[group] = {
+        "collected_steps": steps,
+        "collected_frames": state["collected_frames"],
+        "update_groups": updates,
+        "updates": actual,
+        "covariance_pair_budget": pair_budget,
+        "checkpoint_sha256": checkpoint_sha,
+        "phase_seconds": totals,
+        "cuda_peak_allocated_bytes": max(
+          (v for v in peaks if v is not None), default=None
+        ),
+        "offline_storage_bytes": sum(
+          p.stat().st_size
+          for name in ("wandb", "wandb-cache", "wandb-data")
+          for p in (run / name).rglob("*")
+          if p.is_file()
+        ),
+        "learning_curve": [
+          {
+            "collected_frames": r["Counters/collected_frames"],
+            "return": r.get("Policy/return"),
+          }
+          for r in metrics
+        ],
+      }
+      midpoint = audit.root / "resume" / f"{group}-midpoint.pt"
+      reference = midpoint.with_name(f"{group}-reference.pt")
+      receipt = midpoint.with_name(f"{group}.json")
+      if receipt.is_file() and reference.is_file():
+        audit.require(
+          resume_result_matches(
+            receipt,
+            midpoint if midpoint.is_file() else None,
+            group,
+            protocol["resume_after_step"],
+            protocol["device"],
+            reference,
+            protocol.get("training_process_environment"),
+            expected_identity={
+              k: state[k] for k in ("motion_digest", "initialization_digest")
+            },
+          ),
+          f"{group}: midpoint reference, checkpoint or verification receipt mismatched",
+        )
+      else:
+        audit.pending.append(
+          f"{group}: missing midpoint reference or verification receipt"
+        )
+      audit.data(
+        any(
+          c.get("name") == f"train-{group}-to-{protocol['max_iterations']}"
+          and c.get("returncode") == 0
+          and "--resume" in c.get("argv", [])
+          for c in commands
+        ),
+        f"{group}: no successful resumed training command",
+      )
+      folder = f"diagnostics/{group}/{final_frames}"
+      evaluated = audit.load(f"{folder}/evaluation.json")
+      offline = audit.load_diagnostic(f"{folder}/offline.json")
+      sha = groups[group]["checkpoint_sha256"]
+      if evaluated or offline:
+        audit.data(
+          bool(evaluated and offline), f"{group}: incomplete independent diagnostic"
+        )
+      if evaluated and offline:
+        audit.require(
+          all(
+            result.get("checkpoint_sha256") == sha and result.get("group") == group
+            for result in (evaluated, offline)
+          ),
+          f"{group}: final diagnostic checkpoint identity mismatch",
+        )
+        audit.data(
+          evaluated.get("evaluation_complete") is True
+          and evaluated.get("censored_episodes") == 0
+          and evaluated.get("timeout_count") == 0
+          and evaluated.get("protocol") == "full_clip_v1"
+          and evaluated.get("step_budget") is None,
+          f"{group}: incomplete independent episodes",
+        )
+        audit.require(
+          offline.get("training_overlap_check", {}).get("status") == "distinct_seed"
+          and offline.get("recording_seed") == protocol["diagnostic_seed"]
+          and offline.get("recording_source") == "mujoco_evaluation",
+          f"{group}: diagnostic seed or recording source differs from protocol",
+        )
+        recording = audit.root / folder / "episodes.pt"
+        audit.file(
+          recording, offline.get("recording_sha256"), f"{group}: independent recording"
+        )
+        _verify_diagnostic_record(
+          audit, recording, protocol, group, sha, evaluated, offline
+        )
+      online = audit.load(f"online/{group}.json")
+      audit.data(bool(online), f"{group}: missing online benchmark evidence")
+      groups[group]["online_continuous_full_filter"] = _audit_online(
+        audit,
+        online,
+        group,
+        protocol,
+        sha,
+        offline.get("motion_digest"),
+      )
+    except (
+      OSError,
+      ValueError,
+      KeyError,
+      TypeError,
+      RuntimeError,
+      EOFError,
+      pickle.UnpicklingError,
+    ) as error:
+      audit.failures.append(f"{group}: {error}")
+  audit.require(len(identities) <= 1, "A/B/C initialization identities differ")
+  validation = audit.load("evaluation/validation.json")
+  audit.data(
+    validation.get("complete") is True and validation.get("pending_validation") == [],
+    "Validation is incomplete",
+  )
+  records = _validated_sources(audit, protocol, validation, frames=[final_frames])
+  for record in records:
+    candidate = record["candidate"]
+    group = candidate["group"]
+    audit.data(
+      record["complete"]
+      and candidate.get("sha256") == groups.get(group, {}).get("checkpoint_sha256")
+      and candidate.get("actor_steps", 0) > 0,
+      f"{group}: trained final checkpoint lacks matching completed validation",
+    )
+  extra = supplementary(
+    audit,
+    protocol,
+    {
+      g: {"final_snapshot_sha256": groups.get(g, {}).get("checkpoint_sha256")}
+      for g in GROUPS
+    },
+    _verify_diagnostic_record,
+    _coverage,
+    final_frames=final_frames,
+    policy_record="policy-final",
+  )
+  return {
+    "version": "eit_pilot_report_v2",
+    "status": "failed"
+    if audit.failures
+    else "pending"
+    if audit.pending
+    else "complete",
+    "step7_ready": False,
+    "groups": groups,
+    "supplementary": extra,
+    "pending": audit.pending,
+    "failures": audit.failures,
+    "selected": validation.get("selected", []),
+    "budget_unit": "cumulative physical steps per environment",
+  }
+
+
 def build_report(root):
   audit = Audit(root)
   p = audit.load("protocol.json")
@@ -986,6 +1253,8 @@ def build_report(root):
       "step7_ready": False,
       "groups": {},
     }
+  if p.get("version") == "eit_pilot_v4":
+    return _step_report(audit, p)
   validation = audit.load("evaluation/validation.json")
   commands = audit.load("commands.jsonl", lines=True)
   audit.data(
@@ -1025,6 +1294,23 @@ def build_report(root):
 
 
 def plot_report(report, output):
+  if report.get("version") == "eit_pilot_report_v2":
+    import matplotlib.pyplot as plt
+
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots()
+    for group, data in report["groups"].items():
+      rows = [r for r in data["learning_curve"] if r["return"] is not None]
+      ax.plot(
+        [r["collected_frames"] for r in rows], [r["return"] for r in rows], label=group
+      )
+    ax.set(xlabel="Collected physical frames", ylabel="Imagined return")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output / "learning_curves.png")
+    plt.close(fig)
+    return
   import matplotlib
 
   matplotlib.use("Agg")

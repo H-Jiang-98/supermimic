@@ -410,7 +410,7 @@ def test_serialized_input_config_cannot_silently_fill_semantic_defaults(key):
 
 
 @pytest.mark.parametrize(
-  ("section", "key"), [("mean", "window_frames"), ("cov", "epochs")]
+  ("section", "key"), [("mean", "window_frames"), ("cov", "pair_budget")]
 )
 def test_eit_fit_config_requires_both_complete_stage_configs(section, key):
   raw = asdict(_config("B"))

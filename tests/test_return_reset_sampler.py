@@ -163,3 +163,23 @@ GOLDEN = [
   0.0314665,
   0.13254566,
 ]
+
+
+def test_restore_preserves_sampler_statistics_but_rebuilds_physical_window():
+  original = _sampler(horizon=2)
+  _step(original, 5, 0.1, terminated=True)
+  _step(original, 15, 0.2, clip_end=True)
+  _step(original, 6, 0.3)
+  state = original.state_dict()
+  target = _sampler(horizon=2)
+  target.load_state_dict(state)
+  assert original._step == 1 and target._step == 0
+  for name in ("value", "count", "effort", "weights"):
+    torch.testing.assert_close(
+      getattr(target, name), getattr(original, name), rtol=0, atol=0
+    )
+  assert target._rewards.count_nonzero() == 0
+  # Restoring a distribution must not add another effort observation.
+  torch.testing.assert_close(
+    target.state_dict()["effort"], state["effort"], rtol=0, atol=0
+  )

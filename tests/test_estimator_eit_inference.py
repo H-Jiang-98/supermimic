@@ -9,12 +9,14 @@ import torch
 
 from supermimic.critic_inputs import CRITIC_INPUT_VERSION, BeliefCritic
 from supermimic.models import ProcessNoiseConfig
+from supermimic.posterior_replay import POSTERIOR_REPLAY_VERSION
 from supermimic.runners.eit_inference import (
   EITPolicyAdapter,
   evaluation_config,
   load_evaluation_models,
 )
 from supermimic.runners.run_config import (
+  EIT_POLICY_TRAINING_VERSION,
   EIT_TRAINING_VERSION,
   validate_eit_checkpoint_contract,
 )
@@ -42,7 +44,7 @@ def physical_runner(tmp_path, group="C"):
     actor_hidden_dims=(12,),
     critic_hidden_dims=(12,),
     process_noise=ProcessNoiseConfig(hidden_dims=(8,)),
-    buffer_size=4,
+    buffer_size=8,
     sampling_mode="start",
   )
   cfg.estimator_inputs = replace(cfg.estimator_inputs, mode="eval")
@@ -166,9 +168,12 @@ def test_adapter_reset_does_not_reset_physics_and_rejects_skipped_frames(tmp_pat
 def test_evaluation_loader_is_private_and_checks_estimator_contract(tmp_path):
   with physical_runner(tmp_path, "B") as runner:
     saved = {
-      "version": EIT_TRAINING_VERSION,
+      "version": EIT_POLICY_TRAINING_VERSION,
       "stage": "policy",
       "replay_mode": "full",
+      "posterior_replay_protocol": POSTERIOR_REPLAY_VERSION,
+      "loop_config": {"posterior_save_stride": 1},
+      "model_revision": runner._dynamics.model_revision,
       "critic": BeliefCritic(
         "B", runner._sim_context.output_dim, runner.cfg.critic_hidden_dims
       ).checkpoint(),
@@ -220,7 +225,8 @@ def test_model_checkpoint_contract_accepts_training_or_diagnostic_replay(replay_
   [("model", None), ("model", "other"), ("policy", None), ("policy", "model")],
 )
 def test_inference_rejects_missing_or_invalid_replay_contract(stage, replay_mode):
-  saved = {"version": EIT_TRAINING_VERSION, "stage": stage}
+  version = EIT_POLICY_TRAINING_VERSION if stage == "policy" else EIT_TRAINING_VERSION
+  saved = {"version": version, "stage": stage}
   if replay_mode is not None:
     saved["replay_mode"] = replay_mode
   with pytest.raises(ValueError, match="Invalid replay mode"):
@@ -248,12 +254,18 @@ def test_inference_rejects_incompatible_critic_before_building_models(group, fau
   critic = BeliefCritic(group, context_dim, cfg.critic_hidden_dims).checkpoint()
   contract = critic["contract"]
   saved = {
-    "version": EIT_TRAINING_VERSION,
+    "version": EIT_POLICY_TRAINING_VERSION,
     "stage": "policy",
     "replay_mode": "full",
+    "posterior_replay_protocol": POSTERIOR_REPLAY_VERSION,
+    "loop_config": {"posterior_save_stride": 1},
+    "model_revision": 0,
     "runner_config": asdict(cfg),
     "critic": critic,
-    "world_model": {"sim_context": {"scale": torch.ones(context_dim)}},
+    "world_model": {
+      "sim_context": {"scale": torch.ones(context_dim)},
+      "dynamics": {"model_revision": 0},
+    },
   }
   evaluation_config(saved)
   error = CRITIC_INPUT_VERSION

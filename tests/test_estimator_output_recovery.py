@@ -1,8 +1,10 @@
-"""Committed checkpoints survive torn publication/logs without fabricated costs."""
+"""Recovery retains committed step logs and archives torn or ahead records."""
 
 import json
+from pathlib import Path
 
 import pytest
+import torch
 from filelock import FileLock, Timeout
 
 from supermimic.runners.eit_snapshots import file_sha256
@@ -10,107 +12,196 @@ from supermimic.runners.eit_training import EITTraining
 from tests.test_estimator_eit_training import training
 
 
-@pytest.mark.parametrize("rounds", [0, 5, 10])
-def test_reconcile_committed_round_without_another_training_step(tmp_path, rounds):
+def test_recovery_archives_uncommitted_logs_without_changing_checkpoint(
+  tmp_path, monkeypatch
+):
+  monkeypatch.setenv("WANDB_MODE", "disabled")
   loop = training()
-  checkpoint = tmp_path / "training.pt"
-  if rounds:
-    loop.run(rounds, tmp_path)
-    registry_path = tmp_path / "snapshots/index.json"
-    registry = json.loads(registry_path.read_text())
-    last = registry["snapshots"].pop()
-    (tmp_path / last["path"]).unlink()
-    registry_path.write_text(json.dumps(registry))
-    metrics = tmp_path / "metrics.jsonl"
-    lines = metrics.read_bytes().splitlines(keepends=True)
-    expected_metrics = b"".join(lines)
-    metrics.write_bytes(b"".join(lines[:-1]) + lines[-1][:23])
-    profiles = tmp_path / "profiling.jsonl"
-    lines = profiles.read_bytes().splitlines(keepends=True)
-    fragment = lines[-1][:23]
-    profiles.write_bytes(b"".join(lines[:-1]) + fragment)
-  else:
-    loop.save(checkpoint)
-  digest = file_sha256(checkpoint)
+  loop.runner.cfg.log_interval = 1
+  loop.run(4, tmp_path)
+  digest = file_sha256(tmp_path / "training.pt")
+  for name in ("metrics.jsonl", "profiling.jsonl"):
+    path = tmp_path / name
+    good = path.read_bytes()
+    tail = b'{"step": 4}\n{"step":'
+    path.write_bytes(good + tail)
   result = EITTraining.reconcile_output(tmp_path)
-  assert result["round"] == rounds
-  assert file_sha256(checkpoint) == digest
-  snapshot = tmp_path / "snapshots" / f"frames_{rounds * 8}.pt"
-  assert file_sha256(snapshot) == digest
-  if rounds:
-    assert metrics.read_bytes() == expected_metrics
-    assert result["missing_profile_rounds"] == [rounds]
-    assert (
-      list(tmp_path.glob("profiling.interrupted.*.fragment"))[0].read_bytes()
-      == fragment
-    )
-    assert [
-      json.loads(line)["round"] for line in profiles.read_text().splitlines()
-    ] == list(range(1, rounds))
-    note = json.loads((tmp_path / "profiling_recovery.json").read_text())
-    assert note["missing_profile_rounds"] == [rounds]
-    assert "no zero" in note["missing_timing_policy"]
-  again = EITTraining.reconcile_output(tmp_path)
-  assert again["repaired_metric_bytes"] == 0
-  assert not again["profiling_tail_repaired"]
-  assert again["missing_profile_rounds"] == ([rounds] if rounds else [])
+  assert result["collected_steps"] == 4
+  assert file_sha256(tmp_path / "training.pt") == digest
+  for name in ("metrics.jsonl", "profiling.jsonl"):
+    rows = [json.loads(line) for line in (tmp_path / name).read_text().splitlines()]
+    assert [row["step"] for row in rows] == [0, 1, 2, 3]
+    assert next(tmp_path.glob(name + ".interrupted.*")).read_bytes() == tail
+  assert not (tmp_path / "snapshots").exists()
 
 
-def test_complete_profile_tail_is_sealed_without_losing_its_timing(tmp_path):
+def test_recovery_lock_and_validator_prevent_mutation(tmp_path):
   loop = training()
-  loop.run(1, tmp_path)
-  path = tmp_path / "profiling.jsonl"
-  complete = path.read_bytes()
-  path.write_bytes(complete[:-1])
-  result = EITTraining.reconcile_output(tmp_path)
-  assert result["missing_profile_rounds"] == []
-  assert path.read_bytes() == complete
-  assert result["archived_profile_fragment"] is None
-
-
-def test_reconciliation_uses_training_lock_and_rejects_corrupt_complete_rows(tmp_path):
-  loop = training()
-  loop.run(1, tmp_path)
+  loop.save(tmp_path / "training.pt")
   with FileLock(tmp_path / ".belief-training.lock"):
     with pytest.raises(Timeout):
       EITTraining.reconcile_output(tmp_path)
-  path = tmp_path / "profiling.jsonl"
-  path.write_bytes(b"not-json\n")
-  with pytest.raises(ValueError, match="Malformed complete profiling"):
-    EITTraining.reconcile_output(tmp_path)
-  assert path.read_bytes() == b"not-json\n"
+
+  def reject(state):
+    raise ValueError("wrong source")
+
+  with pytest.raises(ValueError, match="wrong source"):
+    EITTraining.reconcile_output(tmp_path, validate_state=reject)
+  assert not (tmp_path / "metrics.jsonl").exists()
 
 
-def test_live_reference_hook_precedes_checkpoint_commit_and_can_retry(tmp_path):
+def test_failed_reference_keeps_all_four_previously_published_files(
+  tmp_path, monkeypatch
+):
+  monkeypatch.setenv("WANDB_MODE", "disabled")
+  from supermimic.runners import eit_training
+
   loop = training()
-  loop.run(1, tmp_path)
+  prior = {}
+
+  def record(files, **kwargs):
+    prior.update({path: file_sha256(path) for path in map(Path, files)})
+
+  monkeypatch.setattr(eit_training, "log_model_artifact", record)
+
+  def fail(path, state):
+    if state["collected_steps"] == 4:
+      raise RuntimeError("injected reference failure")
+
+  loop.before_checkpoint_commit = fail
+  with pytest.raises(RuntimeError, match="injected reference"):
+    loop.run(4, tmp_path)
+  assert {p.name for p in prior} == {
+    "training.pt",
+    "world_model.pt",
+    "actor.pt",
+    "critic.pt",
+  }
+  assert all(file_sha256(p) == digest for p, digest in prior.items())
+
+
+def test_resume_completes_interrupted_sidecar_replacement(tmp_path, monkeypatch):
+  from supermimic.runners import eit_training
+  from supermimic.runners.eit_resume_reference import equal_tree
+
+  monkeypatch.setenv("WANDB_MODE", "disabled")
+  loop = training()
+  replace = Path.replace
+
+  def interrupt(self, target):
+    if (
+      self.parent.name == ".eit-publication"
+      and self.name == "critic.pt"
+      and loop.collected_steps == 4
+    ):
+      raise OSError("injected rename failure")
+    return replace(self, target)
+
+  with monkeypatch.context() as m:
+    m.setattr(Path, "replace", interrupt)
+    with pytest.raises(OSError, match="injected rename"):
+      loop.run(4, tmp_path)
+
+  eit_training.EITTraining.reconcile_output(tmp_path)
+  saved = torch.load(tmp_path / "training.pt", weights_only=True)
+  assert saved["collected_steps"] == 4
+  for name in ("world_model", "actor", "critic"):
+    equal_tree(torch.load(tmp_path / f"{name}.pt", weights_only=True), saved[name])
+  assert not (tmp_path / ".eit-publication").exists()
+
+
+def test_first_publication_can_retry_in_its_own_interrupted_output(
+  tmp_path, monkeypatch
+):
+  monkeypatch.setenv("WANDB_MODE", "disabled")
+  loop = training()
+
+  def fail(*args):
+    (tmp_path / "wandb").mkdir()
+    raise RuntimeError("first save failed after W&B started")
+
+  loop.before_checkpoint_commit = fail
+  with pytest.raises(RuntimeError, match="first save failed"):
+    loop.run(2, tmp_path)
+  assert not (tmp_path / "training.pt").exists()
+  # A dead process can leave its partially written weights in staging.
+  stage = tmp_path / ".eit-publication"
+  stage.mkdir()
+  (stage / "staging").touch()
+  (stage / "actor.pt").write_bytes(b"partial")
+  foreign = tmp_path / "foreign.txt"
+  foreign.write_text("unrelated")
+  with pytest.raises(ValueError, match="Nonempty output"):
+    training().run(2, tmp_path)
+  assert foreign.read_text() == "unrelated"
+  foreign.unlink()
+  marker = tmp_path / ".eit-initializing"
+  marker.unlink()
+  with pytest.raises(ValueError, match="Nonempty output"):
+    training().run(2, tmp_path)
+  marker.touch()
+  training().run(2, tmp_path)
+  assert torch.load(tmp_path / "training.pt", weights_only=True)["collected_steps"] == 2
+  assert not marker.exists()
+  assert not stage.exists()
+  assert (tmp_path / "wandb").is_dir()
+
+
+def test_reconcile_legacy_split_repairs_weights_without_rewriting_checkpoint(
+  tmp_path, monkeypatch
+):
+  from supermimic.runners.eit_resume_reference import equal_tree
+
+  monkeypatch.setenv("WANDB_MODE", "disabled")
+  training().run(2, tmp_path)
   checkpoint = tmp_path / "training.pt"
-  old_digest = file_sha256(checkpoint)
-  reference = tmp_path / "reference.sha256"
+  digest = file_sha256(checkpoint)
+  (tmp_path / ".eit-log-interval.json").unlink()
+  torch.save({"stale": True}, tmp_path / "actor.pt")
+  (tmp_path / "critic.pt").unlink()
+  EITTraining.reconcile_output(tmp_path)
+  assert file_sha256(checkpoint) == digest
+  state = torch.load(checkpoint, weights_only=True)
+  for name in ("actor", "critic", "world_model"):
+    equal_tree(torch.load(tmp_path / f"{name}.pt", weights_only=True), state[name])
+  with monkeypatch.context() as m:
+    m.setattr(torch, "save", lambda *_args: pytest.fail("unexpected second migration"))
+    EITTraining.reconcile_output(tmp_path)
 
-  def interrupted(pending, state):
-    if state["rounds"] == 2:
-      assert file_sha256(checkpoint) == old_digest
-      reference.write_text(file_sha256(pending))
-      raise InterruptedError("reference written, checkpoint not committed")
 
-  loop.before_checkpoint_commit = interrupted
-  with pytest.raises(InterruptedError):
-    loop.run(1, tmp_path)
-  assert file_sha256(checkpoint) == old_digest
-  assert not (tmp_path / "snapshots/frames_16.pt").exists()
-  retry = training()
-  retry.before_checkpoint_commit = lambda pending, _state: reference.write_text(
-    file_sha256(pending)
-  )
-  retry.run(1, tmp_path, resume=checkpoint)
-  assert file_sha256(checkpoint) == reference.read_text()
-  assert file_sha256(tmp_path / "snapshots/frames_16.pt") == reference.read_text()
-  rows = [
-    json.loads(row) for row in (tmp_path / "profiling.jsonl").read_text().splitlines()
-  ]
-  final = rows[-1]["seconds"]
-  assert final["resume_reference_seconds"] > 0
-  assert final["round_seconds_including_resume_reference"] == pytest.approx(
-    final["round_seconds"] + final["resume_reference_seconds"]
-  )
+@pytest.mark.parametrize("boundary", ["log_and_save", "save_only"])
+def test_resume_recovers_actual_interval_budget_and_profile_once(
+  tmp_path, monkeypatch, boundary
+):
+  monkeypatch.setenv("WANDB_MODE", "disabled")
+  loop = training()
+  loop.runner.cfg.save_interval = 3
+  loop.runner.cfg.log_interval = 3 if boundary == "log_and_save" else 8
+  log, step = loop.runner.logger.log, loop.run_step
+
+  def interrupt_log(*args, **kwargs):
+    if kwargs["it"] == 3:
+      raise RuntimeError("injected interruption")
+    return log(*args, **kwargs)
+
+  def interrupt_step(*args, **kwargs):
+    if loop.collected_steps == 4:
+      raise RuntimeError("injected interruption")
+    return step(*args, **kwargs)
+
+  monkeypatch.setattr(loop.runner.logger, "log", interrupt_log)
+  monkeypatch.setattr(loop, "run_step", interrupt_step)
+  with pytest.raises(RuntimeError, match="injected interruption"):
+    loop.run(6, tmp_path)
+  interval = json.loads((tmp_path / ".eit-log-interval.json").read_text())
+  assert interval["metrics.jsonl"]["Budget/mean_updates"] == 1
+  # Simulate interruption between the metrics append and the profiling append.
+  with (tmp_path / "metrics.jsonl").open("a") as output:
+    output.write(json.dumps(interval["metrics.jsonl"]) + "\n")
+  resumed = training()
+  resumed.run(5, tmp_path, resume=tmp_path / "training.pt")
+  for name, expected in interval.items():
+    rows = [json.loads(line) for line in (tmp_path / name).read_text().splitlines()]
+    assert [row["step"] for row in rows] == [0, 3, 4]
+    assert rows[1] == expected
+  assert interval["profiling.jsonl"]["seconds"]["world_model_seconds"] > 0

@@ -573,19 +573,19 @@ MuJoCo smoke 自动生成四帧静止参考，使用 2 个环境、容量为 2 �
 
 `train_belief` 固定 actor。每轮采集结束后，用新训练帧更新模型归一化，然后完成两次拟合。验证 episode 默认满足 `episode_id % 5 == 0`。采样只使用同一 episode 中时间连续的真实后继帧。
 
-`train_belief` 在创建 runner 时选择 `replay_mode="model"`。每帧保存 `state`、`action`、`sim_ctx`、`episode_id`、`time_index`、`terminated` 和 `truncated`。采集端用实测历史和在线滤波产生动作，在执行下一步前核对上一执行动作。训练 RNG 用于均值窗口抽样和 covariance 批次洗牌。
+`train_belief` 在创建 runner 时选择 `replay_mode="model"`。每帧保存 `state`、`action`、`sim_ctx`、`episode_id`、`time_index`、`terminated` 和 `truncated`。采集端用实测历史和在线滤波产生动作，在执行下一步前核对上一执行动作。训练与验证各自使用可恢复的独立 RNG，均值窗口和 covariance 转移均有放回抽样。
 
 | 阶段 | 数据与目标 | 默认配置 |
 |---|---|---|
 | 预测均值 | 从真实首帧开始回喂预测，优化根位置、根朝向、关节位置和关节速度的加权 MSE | 8 帧窗口、7 步预测，每批 2048 窗，每轮 10 次 Muon/Adam 更新 |
-| 过程 covariance | 按本轮更新后的均值计算全部一步右局部残差，以零均值高斯 NLL 拟合完整下三角因子 | 独立 Adam，每批 256 对，每轮打乱遍历一次，含末批 |
+| 过程 covariance | 均值更新后冻结均值和归一化，仅提取当前抽中转移的一步右局部残差，以高斯 NLL 拟合下三角因子 | 独立 Adam，每批 8192 对，每组默认抽 143,360 对，18 次更新，验证另抽 8192 对 |
 
 ```bash
 OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.train_belief \
   --motion-file data/motions/walk1_subject1.npz --device cuda:0 \
   --output logs/belief-b --group B --rounds 10 \
   --mean-window-frames 8 --mean-batch-size 2048 --mean-updates 10 --mean-lr 2e-4 \
-  --cov-batch-size 256 --cov-epochs 1 --cov-lr 2e-4
+  --cov-batch-size 8192 --cov-validation-pairs 8192 --cov-lr 2e-4
 ```
 
 `metrics.jsonl` 记录两个阶段各自的步数、分组 MSE、每对转移的过程 NLL，以及训练和验证样本量。恢复时传入 `--resume logs/belief-b/training.pt` 和原 motion，`--rounds` 指新增轮数。两个阶段的优化器、配置、归一化和 RNG 均从轮次边界恢复，物理环境和 replay 重新开始。实现与实测结果见[第三步说明](plan_step3.md)。
@@ -631,7 +631,7 @@ clip 最后一个评分动作后停止回报，普通策略 horizon 截断保留
 
 ```bash
 OMP_NUM_THREADS=1 PYTORCH_JIT=0 .venv/bin/python -m supermimic.scripts.check_eit_replay_precision \
-  --checkpoint logs/eit-v4/B/training.pt --motion-file data/motions/walk1_subject1.npz \
+  --checkpoint logs/eit-v5/B/training.pt --motion-file data/motions/walk1_subject1.npz \
   --num-envs 4 --steps 32 --output /tmp/eit-replay-precision.json
 ```
 
@@ -641,51 +641,72 @@ A/B/C 的训练、评估和播放均要求联合 checkpoint 内嵌 `eit_rpv_beli
 加载时校验组别、输入维度和 `rpv9_log_std_corr_v1` 编码。A 组也执行同一版本检查。
 新训练默认在输出目录的父目录创建或读取 `eit_initialization_v3_eit_rpv_belief_critic_v2_seed<seed>.pt`。
 同一 seed 的三组使用同一份初始化包，分别写入各自的训练目录。也可用 `--initialization` 指定当前契约的初始化包。
-各组独立采集与更新。以下是初始工程配置，尚未验证长时控制收敛。
+各组独立采集与更新。当前默认使用公共 ReturnSampler，保留 `--sampling-mode uniform`。
 
 ```bash
-OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
+WANDB_MODE=offline OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
   .venv/bin/python -m supermimic.scripts.train_eit \
   --motion-file data/motions/walk1_subject1.npz --device cuda:0 \
-  --group B --output logs/eit-v4/B \
-  --num-envs 8 --rounds 10 --wandb-mode offline
+  --group B --output logs/eit-v5/B --max-iterations 1000000 \
+  --num-envs 1024 --buffer-size 1000 --replay-ratio 16 \
+  --mean-updates 10 --mean-batch-size 2048 --mean-window-frames 8 \
+  --cov-batch-size 8192 --cov-validation-pairs 8192 \
+  --policy-updates 1 --policy-batch-size 4096 --samples 1 \
+  --policy-horizon 32 --policy-microbatch-size 16 \
+  --critic-epochs 5 --critic-minibatches 4 --save-interval 1000 --log-interval 10
 ```
 
-默认 N=4、K=2、H=4、microbatch=2，每轮一次 actor 更新及两轮 critic 回归；
-两个训练入口接受相同的 `--mean-*` 和 `--cov-*` 参数，默认配置见第三步。
-`--policy-horizon`、`--samples`、`--policy-batch-size`、`--policy-microbatch-size`
-分别控制想象长度、噪声轨迹数、起点数与分块。更大规模应先测量完整训练显存。
+每个物理步调用公共 `runner.step()`。公共 Ratio 按
+`num_envs × replay_ratio / (mean_updates × mean_batch_size × mean_window_frames)`
+调度 **mean → covariance → policy/critic** 更新组，默认稳态每 10 步一组。
+warmup 等待完整训练窗口、验证转移和 posterior；跳过的机会不积累。新训练帧和新保存
+posterior 各只更新一次归一化，包括同一步多组训练时。
 
-`train_eit` 每轮原子更新完整的 `training.pt`，用于断点续训；历史快照默认只保留
-第 0 轮及累计轮数为 10 的倍数的状态。用 `--snapshot-interval N` 调整历史快照间隔，
-单位为轮，N 必须为正整数；设为 1 恢复逐轮保存。结束轮数不是间隔倍数时，最新状态
-仍保存在 `training.pt`，不额外发布历史快照。此参数不使用原 `runner.save_interval`。
-恢复时省略该参数会沿用 checkpoint 中的间隔，旧 checkpoint 没有该字段时沿用 1；
-显式传入可改变后续保存间隔，已发布快照不删除。评估清单中的候选轮次必须有相应快照。
-三卡 A/B/C 的完整命令见 [PRO 6000 训练说明](docs/train_eit_pro6000.md)。
+默认每组为 **10 mean、18 covariance、1 actor、20 critic** 次逻辑更新。
+covariance 预算为 `10×2048×(8−1)=143,360` 次有放回抽样，分 17 个 8192 整批和一个
+4096 尾批；独立验证抽 8192 对。可用 `--cov-pair-budget` 覆盖训练预算。
+两个模型训练入口共用此 fitter；buffer、policy horizon、samples 不改变默认预算，
+不再缓存全部残差或遍历 covariance epochs。`train_belief` 仍保留分轮采集。
 
-EIT 默认启用离线 W&B；`WANDB_MODE=disabled` 或 `--wandb-mode disabled` 可关闭。
-每轮记录模型损失、策略/critic 指标、累计实采帧数、预算、耗时与显存，同时保存超参数。
-训练期间不登录或上传。续训沿用输出目录内的 run ID，生成新的离线片段；之后按训练
-顺序用 `wandb sync --append` 同步。默认只记录指标和配置；加 `--wandb-log-models`
-可将按间隔保存的快照作为模型附件暂存，复用原有 artifact 实现。
-参数、文件位置及同步命令见 [EIT 离线 W&B 说明](docs/eit_wandb.md)。
+actor/critic 复用 Muon＋Adam，学习率均为 2e-4。actor 完整逻辑 batch 累积后做 norm 1.0
+及逐元素 0.1 clipping。critic 使用原始 value 计算 GAE，只裁剪最终 target，拟合不按累计
+survival 加权的 MSE；每次 actor 更新后 5 epoch×4 minibatch，复用一次 permutation。
+`--critic-microbatch-size` 独立配置，默认关闭。critic 的片尾零 bootstrap 与 ReturnSampler
+的片尾均值 bootstrap 各自独立。完整预算、后验缓存容量及 GPU 启动见
+[PRO 6000 说明](docs/train_eit_pro6000.md)；当前没有该规模的 PRO 6000 实测。
 
-恢复时配置和组别从 checkpoint 读取，`--rounds` 表示新增轮数：
+唯一周期保存参数为公共 `runner.cfg.save_interval`，CLI 对应 `--save-interval`。
+按累计零基物理 `step % save_interval == 0` 触发，另保存初始及结束状态，重复状态不重复发布。
+每次保存 `world_model.pt`、`actor.pt`、带输入契约的 `critic.pt` 和原子替换的 `training.pt`，
+作为同一个离线 model artifact 归档。覆盖前等待上一份归档结束，不再发布独立历史快照。
+
+EIT 默认 `WANDB_MODE=offline`，测试可设 `disabled`，disabled 仍保存本地权重。
+复用公共 W&B 初始化、Logger、artifact 与清理入口。每次启动/恢复都新建 run，记录来源、
+起始累计步及 parent run。项目和名称使用公共 runner 配置；日志按 `log_interval` 输出。
+没有固定 ID 拼接、`--wandb-mode` 或 `--wandb-log-models`。[离线记录说明](docs/eit_wandb.md)
+
+`max_iterations` 是累计目标，默认 1,000,000，替代 EIT 的 rounds/collection_steps：
 
 ```bash
-OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.train_eit \
+WANDB_MODE=offline OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.train_eit \
   --motion-file data/motions/walk1_subject1.npz --device cuda:0 \
-  --output logs/eit-v4/B --resume logs/eit-v4/B/training.pt --rounds 10
+  --output logs/eit-v5/B --resume logs/eit-v5/B/training.pt --max-iterations 2000000
 OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.eval_eit \
-  --checkpoint logs/eit-v4/B/training.pt \
+  --checkpoint logs/eit-v5/B/training.pt \
   --motion-file data/motions/walk1_subject1.npz --device cuda:0 \
-  --num-envs 8 --output logs/eit-v4/B/evaluation.json
+  --num-envs 8 --output logs/eit-v5/B/evaluation.json
 ```
 
-策略续训使用 `eit_training_v4`。checkpoint 保存模型、actor、critic、优化器、归一化、RNG、训练计数，以及后验保存间隔、缓存协议和模型修订号。新进程从空 replay 和新物理 episode 开始，使用 checkpoint 中的间隔，从采集步 0 重新保存后验。训练对象再次向同一目录追加轮次时，会核对轮次、模型权重的 SHA-256 和修订号。
+当前策略 checkpoint 为 `eit_training_v5`，模型专用为 `eit_model_training_v4`；旧 checkpoint
+不兼容。完整状态保存优化器、归一化、独立 RNG、Ratio 余额、累计计数和 ReturnSampler 统计。
+恢复重建物理轨迹、replay、在线 belief 和轨迹相关窗口；累计调度及日志继续，新 replay 的
+posterior 保存序列从 0 开始。共享初始化仍为 `eit_initialization_v3`。
 
-用 `--resume-reference PATH` 可在本次训练的最后一轮提交 checkpoint 前，保存固定模型输入、策略起点、噪声和预期更新结果。参考文件同时记录缓存后验的来源修订号和本次想象模型的身份，用于复验恢复后的下一次模型和策略更新。模型专用训练和共享初始化包使用 v3 格式。各版本的评估与导出适用范围见[评估说明](README_eval.md#eit-定量评估和播放)。
+RTX 5090 已完成默认预算的一组 10/18/1/20 更新、完整规模 checkpoint 恢复及离线 artifact 校验，
+A/B/C 小批量 CUDA 下一次更新恢复逐位一致，1095 项回归通过。[实测与范围](docs/validation/eit_v5_rtx5090.json)
+
+`--resume-reference PATH` 在最终 checkpoint 提交前生成固定输入、噪声及 live optimizer
+下一次更新的参考结果，供 `check_eit_resume` 独立验证。固定输入连续性不意味着恢复物理轨迹。
 `eval_eit` 复用 mjlab tracking 的首 episode 评估循环和跟踪指标，从 clip 头开始，
 等待所有环境首个 episode 结束。它关闭动作探索，保留传感噪声及在线滤波，三组均使用
 后验均值。可用 `--steps` 限制 smoke 预算，未结束轨迹标记截断，成功率记为 null。
@@ -693,13 +714,13 @@ OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.eval_eit \
 本地 playback 使用 `play --eit-checkpoint ... --motion-file ...`，详见
 [评估统计口径及 viewer 说明](README_eval.md#eit-定量评估和播放)。
 
-`check_eit_training` 默认对 A/B/C 各训练三轮。以下命令在 B 组复验三个保存间隔，每次都核对固定输入下的下一次模型和策略更新，并在独立进程运行 4 步评估。
+`check_eit_training` 默认对 A/B/C 各采集 12 步。以下命令在 B 组复验三个保存间隔，每次都核对固定输入下的下一次模型和策略更新，并在独立进程运行 4 步评估。
 
 ```bash
 for stride in 1 2 4; do
   OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
     .venv/bin/python -m supermimic.scripts.check_eit_training \
-    --device cpu --groups B --rounds 3 --posterior-save-stride "$stride"
+    --device cpu --groups B --max-iterations 12 --posterior-save-stride "$stride"
 done
 ```
 

@@ -12,8 +12,9 @@ import torch
 
 from supermimic.critic_inputs import BeliefCritic
 from supermimic.models import ProcessNoiseConfig
+from supermimic.posterior_replay import POSTERIOR_REPLAY_VERSION
 from supermimic.runners.eit_inference import EITPolicyAdapter
-from supermimic.runners.run_config import EIT_TRAINING_VERSION
+from supermimic.runners.run_config import EIT_POLICY_TRAINING_VERSION
 from supermimic.runners.supermimic_runner import (
   SuperMimicRunnerCfg,
   actor_checkpoint,
@@ -231,8 +232,11 @@ def test_local_eit_play_runs_native_viewer_step_without_wandb(
   checkpoint = tmp_path / "training.pt"
   torch.save(
     {
-      "version": EIT_TRAINING_VERSION,
+      "version": EIT_POLICY_TRAINING_VERSION,
       "stage": "policy",
+      "posterior_replay_protocol": POSTERIOR_REPLAY_VERSION,
+      "loop_config": {"posterior_save_stride": 1},
+      "model_revision": adapter.wm.dynamics.model_revision,
       "replay_mode": "full",
       "critic": BeliefCritic(
         adapter.cfg.estimator_inputs.group,
@@ -285,7 +289,7 @@ def test_local_eit_play_rejects_old_checkpoint_before_starting_viewer(tmp_path):
   checkpoint = tmp_path / "training.pt"
   torch.save({"version": "eit_training_v2", "stage": "policy"}, checkpoint)
   cfg = play.PlayConfig(eit_checkpoint=checkpoint, motion_file="walk.npz", device="cpu")
-  with pytest.raises(ValueError, match=EIT_TRAINING_VERSION):
+  with pytest.raises(ValueError, match=EIT_POLICY_TRAINING_VERSION):
     play.play(TASK, cfg)
 
 
@@ -309,7 +313,11 @@ def test_local_eit_play_uses_shared_adapter_and_closes_on_viewer_error(
   cfg = play.PlayConfig(
     eit_checkpoint=tmp_path / "training.pt", motion_file="walk.npz", device="cpu"
   )
-  saved = {"version": EIT_TRAINING_VERSION, "stage": "policy", "replay_mode": "full"}
+  saved = {
+    "version": EIT_POLICY_TRAINING_VERSION,
+    "stage": "policy",
+    "replay_mode": "full",
+  }
   runner_cfg = SimpleNamespace(representation="gencoord")
   actor, wm, env = Mock(), Mock(), Mock()
   api = Mock(side_effect=AssertionError("Local playback must not contact W&B"))

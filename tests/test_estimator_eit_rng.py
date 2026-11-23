@@ -42,7 +42,7 @@ def test_resume_rejects_prior_replay_contract_without_changing_rng(make_loop):
   loop = make_loop()
   checkpoint = loop.state_dict()
   assert checkpoint["version"] == (
-    "eit_training_v4" if checkpoint["stage"] == "policy" else "eit_training_v3"
+    "eit_training_v5" if checkpoint["stage"] == "policy" else "eit_model_training_v4"
   )
   checkpoint["version"] = "eit_training_v2"
   rng = torch.random.get_rng_state()
@@ -80,6 +80,7 @@ def test_eval_seed_pairs_first_reset_and_measurement_across_actor_architectures(
         actor_hidden_dims=(16,),
         critic_hidden_dims=(16,),
         process_noise=ProcessNoiseConfig(hidden_dims=(8,)),
+        replay_ratio=0,
         buffer_size=4,
         sampling_mode="uniform",
       )

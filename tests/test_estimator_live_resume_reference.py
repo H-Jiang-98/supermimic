@@ -16,14 +16,14 @@ from supermimic.runners.eit_resume_reference import (
   fixed_update_execution,
   write_live_reference,
 )
-from tests.test_estimator_eit_training import training
+from tests.test_estimator_eit_training import advance, training
 
 
 def test_live_reference_is_generated_without_any_loader_and_preserves_live_state(
   tmp_path,
 ):
   source = training()
-  source.run_round()
+  advance(source)
   path = tmp_path / "training.pt"
   source.save(path)
   state = torch.load(path, weights_only=True)
@@ -72,7 +72,7 @@ def test_sparse_reference_can_use_a_singleton_as_its_only_saved_training_start(
   loop.before_checkpoint_commit = lambda path, state: write_live_reference(
     loop, path, state, evidence
   )
-  loop.run_round(checkpoint)
+  advance(loop, checkpoint)
   reference = torch.load(evidence, weights_only=True)
   assert loop.episode_split()[0] == [3]
   assert reference["inputs"]["policy_keys"].tolist() == [[1, 0], [1, 0]]
@@ -86,15 +86,15 @@ def test_losing_a_nonzero_restored_optimizer_moment_fails_against_live_reference
   tmp_path, monkeypatch, optimizer
 ):
   source = training()
-  source.run_round()
+  advance(source)
   checkpoint = tmp_path / "training.pt"
   source.save(checkpoint)
   state = torch.load(checkpoint, weights_only=True)
   reference = build_live_reference(source, checkpoint, state)
   target = training(81)
   selected = {
-    "actor": target.policy.actor_optimizer,
-    "critic": target.policy.critic_optimizer,
+    "actor": target.policy.actor_optimizers[0],
+    "critic": target.policy.critic_optimizers[0],
     "covariance": target.learner.cov_optimizer,
     "mean": target.learner.mean.optimizers[0],
   }[optimizer]
@@ -122,7 +122,7 @@ def test_precommit_reference_matches_committed_bytes_and_failure_keeps_old_check
 ):
   loop = training()
   checkpoint, evidence = tmp_path / "training.pt", tmp_path / "reference.pt"
-  loop.run_round(checkpoint)
+  advance(loop, checkpoint)
   old = checkpoint.read_bytes()
 
   def fail_reference(path, state):
@@ -131,7 +131,7 @@ def test_precommit_reference_matches_committed_bytes_and_failure_keeps_old_check
 
   loop.before_checkpoint_commit = fail_reference
   with pytest.raises(RuntimeError, match="reference generation failed"):
-    loop.run_round(checkpoint)
+    advance(loop, checkpoint)
   assert checkpoint.read_bytes() == old
   # A new live round from the last committed checkpoint can capture a reference.
   recovered = training()
@@ -139,9 +139,9 @@ def test_precommit_reference_matches_committed_bytes_and_failure_keeps_old_check
   recovered.before_checkpoint_commit = lambda path, state: write_live_reference(
     recovered, path, state, evidence
   )
-  recovered.run_round(checkpoint)
+  advance(recovered, checkpoint)
   reference = torch.load(evidence, weights_only=True)
-  assert reference["round"] == 2
+  assert reference["collected_steps"] == 8
   from supermimic.runners.eit_snapshots import file_sha256
 
   assert reference["checkpoint_sha256"] == file_sha256(checkpoint)
@@ -179,6 +179,10 @@ def test_fixed_execution_restores_determinism_flags_after_failure():
   [
     "metrics.jsonl",
     ".belief-training.lock",
+    ".eit-initializing",
+    ".eit-initializing/ref.pt",
+    ".eit-publication/actor.pt",
+    ".eit-log-interval.json",
     "snapshots/frames_0.pt",
     "wandb_run.json",
     "wandb/offline-run-example/run-example.wandb",
@@ -208,13 +212,13 @@ def test_real_cpu_checkpoint_live_reference_and_independent_restore(tmp_path):
   with physical_runner(tmp_path, "C") as runner:
     runner.cfg.estimator_inputs = replace(runner.cfg.estimator_inputs, mode="train")
     runner.cfg.mean = MeanFitCfg(num_batches=1, batch_size=2, window_frames=3)
-    runner.cfg.cov = CovarianceFitCfg(batch_size=2)
+    runner.cfg.cov = CovarianceFitCfg(batch_size=2, validation_pairs=4)
     runner.world_model_learner = TwoStageWorldModelLearner(
       runner._dynamics, runner._representation, runner.cfg.mean, runner.cfg.cov, "cpu"
     )
     loop = EITTraining(
       runner,
-      EITTrainingCfg(collection_steps=4, validation_stride=2),
+      EITTrainingCfg(validation_stride=2),
       BeliefPolicyLearnerCfg(
         batch_size=2, num_samples=2, microbatch_size=2, horizon=2, critic_epochs=1
       ),
@@ -222,7 +226,7 @@ def test_real_cpu_checkpoint_live_reference_and_independent_restore(tmp_path):
     loop.before_checkpoint_commit = lambda path, state: write_live_reference(
       loop, path, state, reference
     )
-    loop.run_round(checkpoint)
+    advance(loop, checkpoint)
   report = verify(checkpoint, tmp_path / "motion.npz", "cpu", reference)
   assert report["version"] == "eit_fixed_input_resume_v2"
   assert report["live_optimizer_reference"] is True

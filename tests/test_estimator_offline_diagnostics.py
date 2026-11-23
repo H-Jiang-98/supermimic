@@ -140,16 +140,20 @@ def test_record_rejects_cross_reset_and_missing_successors():
 def test_real_record_checkpoint_identity_and_optional_imagined_rollout(tmp_path):
   from dataclasses import replace
 
+  from supermimic.runners.belief_training import BeliefModelTraining
   from supermimic.runners.eit_training import EITTraining
   from supermimic.scripts.diagnose_eit import diagnose
   from supermimic.scripts.eval_eit import evaluate
+  from supermimic.scripts.record_eit_drift import summarize_evidence
   from tests.test_estimator_eit_inference import physical_runner
 
   checkpoint = tmp_path / "training.pt"
   recording = tmp_path / "record.pt"
   motion = tmp_path / "motion.npz"
+  model_checkpoint = tmp_path / "model.pt"
   with physical_runner(tmp_path, "B") as runner:
     runner.cfg.estimator_inputs = replace(runner.cfg.estimator_inputs, mode="train")
+    BeliefModelTraining(runner).save(model_checkpoint)
     EITTraining(runner).save(checkpoint)
   online = evaluate(
     checkpoint,
@@ -161,6 +165,7 @@ def test_real_record_checkpoint_identity_and_optional_imagined_rollout(tmp_path)
     record_path=recording,
   )
   with torch.compiler.set_stance("force_eager"):
+    model_report = diagnose(model_checkpoint, recording, window_frames=3)
     report = diagnose(
       checkpoint,
       recording,
@@ -170,6 +175,17 @@ def test_real_record_checkpoint_identity_and_optional_imagined_rollout(tmp_path)
       imagined_samples=2,
       motion_file=motion,
     )
+  assert model_report["round"] == model_report["collected_frames"] == 0
+  assert model_report["process"]["transitions"] == 2
+  assert model_report["fixed_record_posterior"] and "critic" not in model_report
+  evidence = summarize_evidence(report, report)
+  assert (
+    evidence["collected_steps"]
+    == evidence["update_groups"]
+    == evidence["collected_frames"]
+    == 0
+  )
+  assert "round" not in evidence
   assert report["process"]["transitions"] == 2
   assert report["process"]["windows"] == 1
   assert report["critic"]["censored_samples"] == 3

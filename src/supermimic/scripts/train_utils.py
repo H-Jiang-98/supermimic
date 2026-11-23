@@ -23,7 +23,7 @@ def add_model_fit_args(parser: argparse.ArgumentParser) -> None:
     "--mean-updates",
     type=int,
     default=MeanFitCfg.num_batches,
-    help="Mean optimizer updates per round",
+    help="Mean optimizer updates per training group",
   )
   mean.add_argument(
     "--mean-batch-size",
@@ -51,10 +51,12 @@ def add_model_fit_args(parser: argparse.ArgumentParser) -> None:
     help="Residuals per covariance update, including a partial final batch",
   )
   cov.add_argument(
-    "--cov-epochs",
+    "--cov-pair-budget",
     type=int,
-    default=CovarianceFitCfg.epochs,
-    help="Shuffled passes over all retained training pairs per round",
+    help="Sampled training transitions per group; default: mean updates × batch × (window - 1)",
+  )
+  cov.add_argument(
+    "--cov-validation-pairs", type=int, default=CovarianceFitCfg.validation_pairs
   )
 
 
@@ -67,7 +69,10 @@ def model_fit_configs(args) -> tuple[MeanFitCfg, CovarianceFitCfg]:
       window_frames=args.mean_window_frames,
     ),
     CovarianceFitCfg(
-      lr=args.cov_lr, batch_size=args.cov_batch_size, epochs=args.cov_epochs
+      lr=args.cov_lr,
+      batch_size=args.cov_batch_size,
+      pair_budget=args.cov_pair_budget,
+      validation_pairs=args.cov_validation_pairs,
     ),
   )
 

@@ -170,7 +170,7 @@ def test_microbatch_accumulation_matches_full_gradients_and_updates():
   assert small.wm_env.steps_taken == 2 * (1 + 2 + 3)
   assert stats_small["Policy/valid_steps"] == 12
   assert small.wm_env.state is None
-  assert small.actor_steps == 1 and small.critic_steps == 2
+  assert small.actor_steps == 1 and small.critic_steps == 20
   for key, before in model_before.items():
     assert torch.equal(before, small.wm_env.dynamics.state_dict()[key])
   assert all(p.grad is None for p in small.wm_env.dynamics.parameters())
@@ -230,10 +230,10 @@ def test_optimizer_restore_reproduces_next_fixed_batch_update():
     for name in actual:
       assert torch.equal(actual[name], expected[name])
   actual = learner.state_dict()
-  for name in ("actor_optimizer", "critic_optimizer"):
-    for index, value in actual[name]["state"].items():
+  for name in ("actor_optimizers", "critic_optimizers"):
+    for index, value in actual[name][0]["state"].items():
       for key in value:
-        assert torch.equal(value[key], expected_optimizer[name]["state"][index][key])
+        assert torch.equal(value[key], expected_optimizer[name][0]["state"][index][key])
 
 
 def test_rng_streams_restore_independently_of_global_rng():
@@ -255,23 +255,23 @@ def test_restore_preflight_is_atomic(malformation):
   checkpoint = learner.state_dict()
   corrupted = deepcopy(checkpoint)
   if malformation == "critic_nan":
-    corrupted["critic_optimizer"]["state"][0]["exp_avg"].fill_(float("nan"))
+    corrupted["critic_optimizers"][0]["state"][0]["exp_avg"].fill_(float("nan"))
   elif malformation == "actor_shape":
-    corrupted["actor_optimizer"]["state"][0]["exp_avg"] = torch.zeros(1)
+    corrupted["actor_optimizers"][0]["state"][0]["exp_avg"] = torch.zeros(1)
   elif malformation == "rng":
     corrupted["rng"]["measurement"] = torch.zeros(7, dtype=torch.uint8)
   elif malformation == "group":
-    corrupted["critic_optimizer"]["param_groups"][0]["lr"] = 3
+    corrupted["critic_optimizers"][0]["param_groups"][0]["lr"] = 3
   else:
     corrupted["critic_steps"] = -1
   with pytest.raises((ValueError, RuntimeError)):
     learner.load_state_dict(corrupted)
   actual = learner.state_dict()
   assert actual["actor_steps"] == checkpoint["actor_steps"]
-  for name in ("actor_optimizer", "critic_optimizer"):
-    for index, value in actual[name]["state"].items():
+  for name in ("actor_optimizers", "critic_optimizers"):
+    for index, value in actual[name][0]["state"].items():
       for key in value:
-        assert torch.equal(value[key], checkpoint[name]["state"][index][key])
+        assert torch.equal(value[key], checkpoint[name][0]["state"][index][key])
   for name in actual["rng"]:
     assert torch.equal(actual["rng"][name], checkpoint["rng"][name])
 
@@ -332,7 +332,7 @@ def test_real_belief_policy_two_updates_freeze_model_and_normalizers(group):
       for name, value in log.items()
       if name != "Policy/explained_variance"
     )
-  assert learner.actor_steps == 2 and learner.critic_steps == 4
+  assert learner.actor_steps == 2 and learner.critic_steps == 40
   assert any(
     not torch.equal(value, learner.actor.state_dict()[name])
     for name, value in before_actor.items()
@@ -383,3 +383,101 @@ def test_real_covariance_film_and_bootstrap_fixed_noise_directional_derivative()
   )
   assert derivative.norm() > 1e-6
   env.clear_rollout()
+
+
+def test_critic_uses_raw_values_for_gae_and_only_clips_final_targets():
+  from dataclasses import replace
+
+  learner, starts, noises = setup()
+  learner.cfg = replace(learner.cfg, lam=0.0)
+  learner._v_max = 1.0
+  with torch.no_grad():
+    learner.critic.weight.zero_()
+    learner.critic.bias.fill_(100.0)
+  learner.critic.requires_grad_(False)
+  original = learner.wm_env.step
+  rewards, continuations = [], []
+
+  def step(*args, **kwargs):
+    obs, reward, done, extras = original(*args, **kwargs)
+    reward = reward - 50.0
+    rewards.append(reward.detach())
+    continuations.append((1 - done).detach())
+    return obs, reward, done, extras
+
+  learner.wm_env.step = step
+  start = starts.index(torch.tensor([2]))
+  _, data, _ = learner._rollout(start, noises[0][:, 2, :1], noises[1][:, 2, :1], 2)
+  expected = (
+    torch.stack(rewards) + learner.cfg.gamma * torch.stack(continuations) * 100
+  ).clamp(max=1)
+  clipped_values_first = (
+    torch.stack(rewards) + learner.cfg.gamma * torch.stack(continuations)
+  ).clamp(max=1)
+  torch.testing.assert_close(data[1], expected.flatten())
+  assert not torch.allclose(data[1], clipped_values_first.flatten())
+
+
+@pytest.mark.parametrize("microbatch", [1, 2, 7])
+def test_critic_microbatch_is_independent_and_preserves_logical_updates(microbatch):
+  from dataclasses import replace
+
+  full, starts, noises = setup(12)
+  split, _, _ = setup(1)
+  split.cfg = replace(split.cfg, critic_microbatch_size=microbatch)
+  scored_sizes = []
+
+  def record_scoring_batch(module, args):
+    if not torch.is_grad_enabled() and next(module.parameters()).requires_grad:
+      scored_sizes.append(len(args[0]))
+
+  with split.critic.register_forward_pre_hook(record_scoring_batch):
+    full_metrics = full.update_from(starts, *noises)
+    split_metrics = split.update_from(starts, *noises)
+  assert sum(scored_sizes) == 12 and max(scored_sizes) <= microbatch
+  torch.testing.assert_close(
+    split_metrics["Policy/explained_variance"],
+    full_metrics["Policy/explained_variance"],
+    rtol=1e-12,
+    atol=1e-12,
+  )
+  for a, b in zip(full.critic.parameters(), split.critic.parameters(), strict=True):
+    torch.testing.assert_close(a, b, rtol=1e-12, atol=1e-12)
+  assert full.critic_steps == split.critic_steps == 20
+
+
+def test_muon_and_adam_policy_state_restore_and_clipping():
+  torch.manual_seed(93)
+  actor = Actor().double()
+  actor.linear = nn.Sequential(
+    nn.Linear(2, 8), nn.Tanh(), nn.Linear(8, 8), nn.Tanh(), nn.Linear(8, 1)
+  ).double()
+  critic = nn.Sequential(
+    nn.Linear(4, 8), nn.Tanh(), nn.Linear(8, 8), nn.Tanh(), nn.Linear(8, 1)
+  ).double()
+  learner = BeliefActorCriticPolicyLearner(
+    actor,
+    critic,
+    Env(),
+    BeliefPolicyLearnerCfg(batch_size=3, num_samples=2, microbatch_size=1, horizon=3),
+  )
+  _, starts, noises = setup()
+  assert isinstance(learner.actor_optimizers[1], torch.optim.Muon)
+  assert learner.actor_optimizers[0].param_groups[0]["betas"] == (0.9, 0.95)
+  assert learner.critic_optimizers[0].param_groups[0]["betas"] == (0.9, 0.999)
+  learner.update_from(starts, *noises)
+  assert all(p.grad.abs().max() <= 0.1 for p in actor.parameters())
+  saved = learner.state_dict()
+  weights = deepcopy((actor.state_dict(), critic.state_dict()))
+  learner.update_from(starts, *noises)
+  expected = deepcopy((actor.state_dict(), critic.state_dict()))
+  actor.load_state_dict(weights[0])
+  critic.load_state_dict(weights[1])
+  learner.load_state_dict(saved)
+  learner.update_from(starts, *noises)
+  for actual, target in zip(
+    (actor.state_dict(), critic.state_dict()), expected, strict=True
+  ):
+    for name in actual:
+      torch.testing.assert_close(actual[name], target[name], rtol=0, atol=0)
+  assert learner.actor_steps == 2 and learner.critic_steps == 40

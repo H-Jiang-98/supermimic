@@ -51,3 +51,27 @@ def test_disabled_capture_runs_each_update_without_graph_state():
     after < before for before, after in zip(losses[:-1], losses[1:], strict=True)
   )
   assert weight.item() < 1.0
+
+
+def test_critic_fit_uses_one_permutation_unweighted_mse_and_small_batches(monkeypatch):
+  from unittest.mock import Mock
+
+  from supermimic.learners.learner_utils import fit_critic
+
+  critic = nn.Linear(1, 1, bias=False)
+  critic.weight.data.zero_()
+  optimizer = torch.optim.SGD(critic.parameters(), lr=0.1)
+  random = Mock(wraps=torch.randperm)
+  monkeypatch.setattr(torch, "randperm", random)
+  features, targets = torch.ones(2, 1), torch.tensor([1.0, 3.0])
+  # One logical minibatch has the plain arithmetic mean gradient: -4.
+  loss, _, steps = fit_critic(
+    critic, [optimizer], features, targets, epochs=1, minibatches=1, max_norm=100
+  )
+  torch.testing.assert_close(loss, torch.tensor(5.0))
+  torch.testing.assert_close(critic.weight, torch.tensor([[0.4]]))
+  random.reset_mock()
+  _, _, steps = fit_critic(
+    critic, [optimizer], features, targets, epochs=5, minibatches=4
+  )
+  assert steps == 10 and random.call_count == 1

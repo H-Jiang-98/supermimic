@@ -38,11 +38,15 @@ def _reference_path(reference: Path, output: Path, *inputs: Path | None) -> Path
   snapshots = (output / "snapshots").resolve()
   reserved = (
     "training.pt",
+    "world_model.pt",
+    "actor.pt",
+    "critic.pt",
     "metrics.jsonl",
     "profiling.jsonl",
     "profiling_recovery.json",
     "wandb_run.json",
     ".belief-training.lock",
+    ".eit-log-interval.json",
   )
   protected = {item.resolve() for item in inputs if item is not None}
   protected.update((output / name).resolve() for name in reserved)
@@ -51,7 +55,13 @@ def _reference_path(reference: Path, output: Path, *inputs: Path | None) -> Path
     or path.is_relative_to(snapshots)
     or any(
       path.is_relative_to((output / name).resolve())
-      for name in ("wandb", "wandb-data", "wandb-cache")
+      for name in (
+        "wandb",
+        "wandb-data",
+        "wandb-cache",
+        ".eit-publication",
+        ".eit-initializing",
+      )
     )
   ):
     raise ValueError(
@@ -77,7 +87,7 @@ def main():
   parser.add_argument(
     "--resume-reference",
     type=Path,
-    help="Publish live next-update evidence before committing the final round checkpoint",
+    help="Publish live next-update evidence before committing the final checkpoint",
   )
   parser.add_argument(
     "--initialization",
@@ -89,16 +99,32 @@ def main():
     "--device", default="cuda:0" if torch.cuda.is_available() else "cpu"
   )
   parser.add_argument("--seed", type=int, default=2026)
-  parser.add_argument("--num-envs", type=int, default=8)
-  parser.add_argument("--rounds", type=int, default=10)
   parser.add_argument(
-    "--snapshot-interval",
-    type=int,
-    help="Publish historical snapshots every N cumulative rounds; 10 for new runs, "
-    "saved interval on resume (legacy: 1). training.pt is saved every round.",
+    "--num-envs", type=int, default=1024, help="Parallel physical environments"
   )
-  parser.add_argument("--collection-steps", type=int, default=64)
-  parser.add_argument("--buffer-size", type=int, default=128)
+  parser.add_argument(
+    "--max-iterations",
+    type=int,
+    default=1_000_000,
+    help="Cumulative physical steps per environment, including before resume",
+  )
+  parser.add_argument("--replay-ratio", type=float, default=16)
+  parser.add_argument(
+    "--save-interval",
+    type=int,
+    help="Physical collection steps between saves (runner default: 1000)",
+  )
+  parser.add_argument(
+    "--log-interval",
+    type=int,
+    help="Physical collection steps between logs (runner default: 10)",
+  )
+  parser.add_argument(
+    "--sampling-mode", choices=("return", "uniform"), default="return"
+  )
+  parser.add_argument(
+    "--buffer-size", type=int, default=1000, help="Retained frames per environment"
+  )
   parser.add_argument(
     "--posterior-save-stride",
     type=int,
@@ -106,12 +132,34 @@ def main():
     help="Save Q[t|t] every S collection steps; resume uses saved stride",
   )
   add_model_fit_args(parser)
-  parser.add_argument("--policy-updates", type=int, default=1)
-  parser.add_argument("--policy-batch-size", type=int, default=4)
-  parser.add_argument("--samples", type=int, default=2)
-  parser.add_argument("--policy-microbatch-size", type=int, default=2)
-  parser.add_argument("--policy-horizon", type=int, default=4)
-  parser.add_argument("--critic-epochs", type=int, default=2)
+  parser.add_argument(
+    "--policy-updates",
+    type=int,
+    default=1,
+    help="Actor optimizer updates per training group",
+  )
+  parser.add_argument(
+    "--policy-batch-size",
+    type=int,
+    default=4096,
+    help="Replay starts per actor update, sampled with replacement",
+  )
+  parser.add_argument(
+    "--samples", type=int, default=1, help="Independent noise rollouts per start"
+  )
+  parser.add_argument(
+    "--policy-microbatch-size",
+    type=int,
+    default=16,
+    help="Expanded start/sample trajectories per backward pass; gradients accumulate "
+    "over the full policy batch before one actor update",
+  )
+  parser.add_argument(
+    "--policy-horizon", type=int, default=32, help="Maximum imagined steps per rollout"
+  )
+  parser.add_argument("--critic-epochs", type=int, default=5)
+  parser.add_argument("--critic-minibatches", type=int, default=4)
+  parser.add_argument("--critic-microbatch-size", type=int)
   parser.add_argument("--exploration", type=float, default=0.1)
   parser.add_argument("--hidden-dims", type=int, nargs="+", default=[2048, 2048, 2048])
   parser.add_argument(
@@ -120,41 +168,24 @@ def main():
   parser.add_argument("--critic-hidden-dims", type=int, nargs="+", default=[256, 128])
   parser.add_argument("--jacobian-batch-chunk-size", type=int)
   parser.add_argument("--jacobian-chunk-size", type=int)
-  logging = parser.add_argument_group("offline W&B logging")
-  logging.add_argument(
-    "--wandb-mode",
-    choices=("offline", "disabled"),
-    default=os.environ.get("WANDB_MODE", "offline"),
-    help="Offline logging only; defaults to WANDB_MODE or offline, never uploads",
-  )
-  logging.add_argument(
-    "--wandb-project", help="Default: saved W&B project or runner project"
-  )
-  logging.add_argument("--wandb-entity", help="Optional account/team for later sync")
-  logging.add_argument("--wandb-name", help="Default: eit-<group>-seed<seed>")
-  logging.add_argument(
-    "--wandb-group", help="Experiment group for comparing runs; default: eit"
-  )
-  logging.add_argument(
-    "--wandb-log-models",
-    action="store_true",
-    help="Also stage published snapshots as offline model artifacts (uses extra disk)",
-  )
+  parser.add_argument("--wandb-project", help="Common runner W&B project")
+  parser.add_argument("--run-name", help="Common runner run name")
   args = parser.parse_args()
-  if args.wandb_mode not in ("offline", "disabled"):
-    parser.error(
-      "EIT W&B mode must be offline or disabled; use --wandb-mode explicitly"
-    )
-  if args.num_envs < 1 or args.rounds < 1:
-    parser.error("num-envs and rounds must be positive")
-  if args.snapshot_interval is not None and args.snapshot_interval < 1:
-    parser.error("snapshot-interval must be positive")
+  os.environ.setdefault("WANDB_MODE", "offline")
+  if os.environ["WANDB_MODE"] not in ("offline", "disabled"):
+    parser.error("EIT requires WANDB_MODE=offline or disabled")
+  if args.num_envs < 1 or args.max_iterations < 0:
+    parser.error("num-envs must be positive and max-iterations nonnegative")
+  if any(
+    value is not None and value < 1 for value in (args.save_interval, args.log_interval)
+  ):
+    parser.error("save-interval and log-interval must be positive")
   if args.resume and args.initialization:
     parser.error("resume and initialization are mutually exclusive")
   if args.prepare_initialization and not args.initialization:
     parser.error("--prepare-initialization requires an explicit --initialization path")
   if args.prepare_initialization and args.resume_reference:
-    parser.error("--resume-reference requires actual training rounds")
+    parser.error("--resume-reference requires actual training")
   if not args.prepare_initialization and not args.output:
     parser.error("training requires --output")
   initialization = args.initialization
@@ -199,12 +230,10 @@ def main():
     loop_cfg = EITTrainingCfg(**saved["loop_config"])
     policy_cfg = BeliefPolicyLearnerCfg(**saved["policy_config"])
     num_envs = saved["num_envs"]
-    starting_round = saved["rounds"]
     if saved.get("training_seed") is not None:
       env_cfg.seed = saved["training_seed"]
     del saved
   else:
-    starting_round = 0
     mean, cov = model_fit_configs(args)
     runner_cfg = SuperMimicRunnerCfg.for_estimator_inputs(
       args.group,
@@ -219,11 +248,11 @@ def main():
       mean=mean,
       cov=cov,
       buffer_size=args.buffer_size,
-      sampling_mode="uniform",
+      sampling_mode=args.sampling_mode,
+      replay_ratio=args.replay_ratio,
     )
     runner_cfg.policy.batch_size = args.policy_microbatch_size
     loop_cfg = EITTrainingCfg(
-      collection_steps=args.collection_steps,
       posterior_save_stride=args.posterior_save_stride,
     )
     policy_cfg = BeliefPolicyLearnerCfg(
@@ -233,9 +262,16 @@ def main():
       horizon=args.policy_horizon,
       num_batches=args.policy_updates,
       critic_epochs=args.critic_epochs,
+      critic_minibatches=args.critic_minibatches,
+      critic_microbatch_size=args.critic_microbatch_size,
       noise=args.exploration,
     )
     num_envs = args.num_envs
+  runner_cfg.max_iterations = args.max_iterations
+  for name in ("wandb_project", "run_name", "save_interval", "log_interval"):
+    value = getattr(args, name)
+    if value is not None:
+      setattr(runner_cfg, name, value)
   motion.sampling_mode = (
     "external" if runner_cfg.sampling_mode == "return" else runner_cfg.sampling_mode
   )
@@ -246,10 +282,8 @@ def main():
     if reference_path is not None:
       from supermimic.runners.eit_resume_reference import write_live_reference
 
-      target_round = starting_round + args.rounds
-
       def capture_live_reference(pending_checkpoint, state):
-        if state["rounds"] == target_round:
+        if state["collected_steps"] == args.max_iterations:
           write_live_reference(training, pending_checkpoint, state, reference_path)
 
       training.before_checkpoint_commit = capture_live_reference
@@ -290,27 +324,7 @@ def main():
           )
         print(f"EIT_INITIALIZATION {training.initialization_digest} {initialization}")
         return
-    interval = args.snapshot_interval
-    if interval is None and args.resume is None:
-      interval = 10
-    logger = None
-    if args.wandb_mode == "offline":
-      from supermimic.utils.eit_wandb import EITOfflineWandb
-
-      logger = EITOfflineWandb(
-        project=args.wandb_project,
-        entity=args.wandb_entity,
-        name=args.wandb_name,
-        group=args.wandb_group,
-        log_models=args.wandb_log_models,
-      )
-    training.run(
-      args.rounds,
-      args.output,
-      resume=args.resume,
-      snapshot_interval=interval,
-      logger=logger,
-    )
+    training.run(args.max_iterations, args.output, resume=args.resume)
   finally:
     env.close()
 

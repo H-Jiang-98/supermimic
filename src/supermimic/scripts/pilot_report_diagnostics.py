@@ -256,8 +256,18 @@ def diagnostic_structure_errors(
   return errors
 
 
-def supplementary(audit, p, groups, verify_record, coverage):
-  final_frames = p["rounds"] * p["num_envs"] * p["collection_steps"]
+def supplementary(
+  audit,
+  p,
+  groups,
+  verify_record,
+  coverage,
+  *,
+  final_frames=None,
+  policy_record="policy-baseline",
+):
+  if final_frames is None:
+    final_frames = p["rounds"] * p["num_envs"] * p["collection_steps"]
   gradients = {}
   for group in "ABC":
     offline = audit.load_diagnostic(f"diagnostics/{group}/{final_frames}/offline.json")
@@ -383,7 +393,7 @@ def supplementary(audit, p, groups, verify_record, coverage):
     )
   common_spec = audit.load("diagnostics/common-recordings.json")
   common = {}
-  for name in ("policy-baseline", "walking-reference"):
+  for name in (policy_record, "walking-reference"):
     location = common_spec.get("recordings", {}).get(name)
     if not location or not Path(location).is_file():
       audit.pending.append(f"Missing shared independent recording: {name}")

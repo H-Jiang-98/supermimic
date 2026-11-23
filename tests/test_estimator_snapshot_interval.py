@@ -1,152 +1,152 @@
-"""Sparse historical snapshots preserve latest-state recovery and audit guards."""
+"""Common zero-based physical-step saving and coherent background artifacts."""
 
 import json
-from copy import deepcopy
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from threading import Event
+from unittest.mock import Mock
 
 import pytest
 import torch
 
-from supermimic.runners import belief_training
-from supermimic.runners.eit_snapshots import file_sha256
-from supermimic.runners.eit_training import EITTraining
-from tests.test_estimator_belief_training import assert_tree
+from supermimic.runners import eit_training
 from tests.test_estimator_eit_training import training
 
 
-def snapshot_rounds(output):
-  rows = json.loads((output / "snapshots/index.json").read_text())["snapshots"]
-  assert {p.name for p in (output / "snapshots").glob("*.pt")} == {
-    f"frames_{r['collected_frames']}.pt" for r in rows
-  }
-  for row in rows:
-    assert file_sha256(output / row["path"]) == row["sha256"]
-  return [row["round"] for row in rows]
+def test_initial_periodic_final_and_resume_save_points(tmp_path, monkeypatch):
+  monkeypatch.setenv("WANDB_MODE", "disabled")
+  publications = []
 
+  def record(files, **kwargs):
+    state = torch.load(files[-1], weights_only=True)
+    assert [p.rsplit("/", 1)[-1] for p in files] == [
+      "world_model.pt",
+      "actor.pt",
+      "critic.pt",
+      "training.pt",
+    ]
+    assert (
+      torch.load(files[0], weights_only=True)["dynamics"]["model_revision"]
+      == state["model_revision"]
+    )
+    assert (
+      torch.load(files[2], weights_only=True)["contract"] == state["critic"]["contract"]
+    )
+    publications.append((state["collected_steps"], kwargs["run"].id))
 
-@pytest.mark.parametrize("interval,expected", [(2, [0, 2, 4]), (3, [0, 3])])
-def test_interval_keeps_latest_unscheduled_round_and_all_metrics(
-  tmp_path, interval, expected
-):
+  monkeypatch.setattr(eit_training, "log_model_artifact", record)
   loop = training()
-  loop.run(5, tmp_path, snapshot_interval=interval)
-  assert snapshot_rounds(tmp_path) == expected
+  loop.runner.cfg.save_interval = 3
+  loop.run(7, tmp_path)
+  assert [step for step, _ in publications] == [0, 1, 4, 7]
   state = torch.load(tmp_path / "training.pt", weights_only=True)
-  assert state["rounds"] == state["policy"]["actor_steps"] == 5
-  assert state["snapshot_interval"] == interval
-  for name in ("metrics.jsonl", "profiling.jsonl"):
-    assert [
-      json.loads(line)["round"] for line in (tmp_path / name).read_text().splitlines()
-    ] == list(range(1, 6))
+  assert "rounds" not in state and "snapshot_interval" not in state
+  assert not (tmp_path / "snapshots").exists()
+  other = training(81)
+  other.runner.cfg.save_interval = 3
+  other.run(11, tmp_path, resume=tmp_path / "training.pt")
+  assert [step for step, _ in publications] == [0, 1, 4, 7, 7, 10, 11]
+  assert other.collected_steps == 11 and other.collected_frames == 22
+  assert not other.runner.replay_buffer.insert_count == 11
 
 
-def test_resume_preserves_absolute_cadence_and_can_override_future_rounds(tmp_path):
-  checkpoint = tmp_path / "training.pt"
-  training().run(2, tmp_path, snapshot_interval=3)
-  assert snapshot_rounds(tmp_path) == [0]
-  resumed = training(81)
-  resumed.run(2, tmp_path, resume=checkpoint)
-  assert resumed.snapshot_interval == 3
-  assert snapshot_rounds(tmp_path) == [0, 3]
-  previous = {p.name: p.read_bytes() for p in (tmp_path / "snapshots").glob("*.pt")}
-  training(91).run(2, tmp_path, resume=checkpoint, snapshot_interval=2)
-  assert snapshot_rounds(tmp_path) == [0, 3, 6]
-  assert torch.load(checkpoint, weights_only=True)["snapshot_interval"] == 2
-  for name, data in previous.items():
-    assert (tmp_path / "snapshots" / name).read_bytes() == data
+def test_publication_waits_before_overwriting_files(tmp_path, monkeypatch):
+  monkeypatch.setenv("WANDB_MODE", "disabled")
+  started, release = Event(), Event()
+  versions = []
 
+  def archive(files, **kwargs):
+    before = [open(path, "rb").read() for path in files]
+    if not versions:
+      started.set()
+      assert release.wait(15)
+    assert before == [open(path, "rb").read() for path in files]
+    versions.append(kwargs["metadata"]["collected_steps"])
 
-@pytest.mark.parametrize("rounds,expected", [(2, [0]), (3, [0, 3])])
-def test_recovery_after_checkpoint_commit_obeys_recorded_interval(
-  tmp_path, monkeypatch, rounds, expected
-):
-  original = belief_training.publish_snapshot
-
-  def interrupt(checkpoint, state=None):
-    state = state or torch.load(checkpoint, weights_only=True)
-    if state["rounds"] == rounds:
-      raise InterruptedError("checkpoint committed before snapshot and metrics")
-    return original(checkpoint, state)
-
-  with monkeypatch.context() as context:
-    context.setattr(belief_training, "publish_snapshot", interrupt)
-    with pytest.raises(InterruptedError):
-      training().run(rounds, tmp_path, snapshot_interval=3)
-  checkpoint = tmp_path / "training.pt"
-  digest = file_sha256(checkpoint)
-  recovered = EITTraining.reconcile_output(tmp_path)
-  assert recovered["round"] == rounds
-  assert recovered["repaired_metric_bytes"] > 0
-  assert snapshot_rounds(tmp_path) == expected
-  assert file_sha256(checkpoint) == digest
-  assert EITTraining.reconcile_output(tmp_path)["repaired_metric_bytes"] == 0
-  assert snapshot_rounds(tmp_path) == expected
-
-
-def test_unscheduled_resume_still_rejects_rollback_behind_snapshot_index(tmp_path):
+  monkeypatch.setattr(eit_training, "log_model_artifact", archive)
   loop = training()
-  loop.run(2, tmp_path, snapshot_interval=3)
-  checkpoint = tmp_path / "training.pt"
-  older = checkpoint.read_bytes()
-  loop.run(1, tmp_path)
-  checkpoint.write_bytes(older)
-  for name in ("metrics.jsonl", "profiling.jsonl"):
-    path = tmp_path / name
-    path.write_bytes(b"".join(path.read_bytes().splitlines(keepends=True)[:2]))
-  with pytest.raises(ValueError, match="index is ahead"):
-    training().run(1, tmp_path, resume=checkpoint)
-  assert checkpoint.read_bytes() == older
-  assert snapshot_rounds(tmp_path) == [0, 3]
+  with ThreadPoolExecutor(max_workers=1) as executor:
+    future = executor.submit(loop.run, 1, tmp_path)
+    assert started.wait(15)
+    assert (
+      torch.load(tmp_path / "training.pt", weights_only=True)["collected_steps"] == 0
+    )
+    release.set()
+    future.result(timeout=30)
+  assert versions == [0, 1]
 
 
-def test_legacy_checkpoint_keeps_every_round_publication(tmp_path):
-  source = training()
-  state = source.state_dict()
-  state.pop("snapshot_interval")
-  checkpoint = tmp_path / "training.pt"
-  torch.save(state, checkpoint)
-  restored = training(81)
-  restored.snapshot_interval = 10
-  restored.run(1, tmp_path, resume=checkpoint)
-  assert restored.snapshot_interval == 1
-  assert snapshot_rounds(tmp_path) == [0, 1]
-
-
-@pytest.mark.parametrize("interval", [0, -1, True, 1.5, "10"])
-def test_invalid_interval_rejected_before_writing_or_restoring(tmp_path, interval):
+@pytest.mark.parametrize("interval", [0, -1, True])
+def test_invalid_save_interval_precedes_collection(tmp_path, interval):
   loop = training()
-  before = deepcopy(loop.state_dict())
-  with pytest.raises(ValueError, match="positive integer"):
-    loop.run(1, tmp_path, snapshot_interval=interval)
-  assert list(tmp_path.iterdir()) == []
-  state = deepcopy(before)
-  state["snapshot_interval"] = interval
-  with pytest.raises(ValueError, match="positive integer"):
-    loop.load_state_dict(state)
-  assert_tree(loop.state_dict(), before)
+  loop.runner.cfg.save_interval = interval
+  with pytest.raises(ValueError, match="save_interval"):
+    loop.run(3, tmp_path)
+  assert loop.collected_steps == 0
 
 
-def test_pilot_explicitly_preserves_every_round_snapshots():
-  from supermimic.scripts.run_eit_pilot import training_arguments
+def test_final_duplicate_state_is_not_republished(tmp_path, monkeypatch):
+  monkeypatch.setenv("WANDB_MODE", "disabled")
+  archive = Mock()
+  monkeypatch.setattr(eit_training, "log_model_artifact", archive)
+  loop = training()
+  loop.run(0, tmp_path)
+  assert archive.call_count == 1
 
-  args = training_arguments(
-    {"motion_file": "walking.npz", "device": "cpu", "training_seed": 2026}
-  )
-  assert args[args.index("--snapshot-interval") + 1] == "1"
+
+def test_final_save_time_is_logged_at_a_log_boundary(tmp_path, monkeypatch):
+  monkeypatch.setenv("WANDB_MODE", "disabled")
+
+  class Timer(eit_training.PhaseTimer):
+    @contextmanager
+    def measure(self, name):
+      with super().measure(name):
+        yield
+      if name == "checkpoint_save_seconds":
+        self.seconds[name] = 1.0
+
+  monkeypatch.setattr(eit_training, "PhaseTimer", Timer)
+  loop = training()
+  loop.runner.cfg.log_interval = 2
+  loop.runner.cfg.save_interval = 1000
+  loop.run(3, tmp_path)
+  rows = [
+    json.loads(line) for line in (tmp_path / "profiling.jsonl").read_text().splitlines()
+  ]
+  assert [r["step"] for r in rows] == [0, 2]
+  assert sum(r["seconds"].get("checkpoint_save_seconds", 0) for r in rows) == 3
 
 
-@pytest.mark.parametrize("interval", ["0", "-1"])
-def test_cli_rejects_nonpositive_interval_before_creating_environment(
-  monkeypatch, interval
+def test_reference_verification_is_timed_separately_and_preserves_training_peak(
+  tmp_path, monkeypatch
 ):
-  from supermimic.scripts import train_eit
+  from supermimic.runners import belief_training
 
-  monkeypatch.setattr(
-    "sys.argv",
-    ["train_eit", "--motion-file", "unused.npz", "--snapshot-interval", interval],
-  )
-  monkeypatch.setattr(
-    train_eit, "create_env", lambda *_: pytest.fail("created environment")
-  )
-  with pytest.raises(SystemExit) as error:
-    train_eit.main()
-  assert error.value.code == 2
+  monkeypatch.setenv("WANDB_MODE", "disabled")
+
+  class Timer(eit_training.PhaseTimer):
+    @contextmanager
+    def measure(self, name):
+      with super().measure(name):
+        yield
+      if name in ("checkpoint_save_seconds", "reference"):
+        self.seconds[name] = 3.0 if name == "checkpoint_save_seconds" else 2.0
+
+  metadata = eit_training.runtime_metadata
+
+  def peak(reported):
+    def measure(*args, **kwargs):
+      return {**metadata(*args, **kwargs), "cuda_peak_allocated_bytes": reported}
+
+    return measure
+
+  monkeypatch.setattr(eit_training, "PhaseTimer", Timer)
+  monkeypatch.setattr(belief_training, "PhaseTimer", Timer)
+  monkeypatch.setattr(eit_training, "runtime_metadata", peak(100))
+  monkeypatch.setattr(belief_training, "runtime_metadata", peak(400))
+  loop = training()
+  loop.before_checkpoint_commit = lambda *_: None
+  row = loop.run(1, tmp_path)[-1]
+  assert row["Perf/checkpoint_save_seconds"] == 2.0
+  assert row["Perf/resume_reference_seconds"] == 4.0
+  assert row["Perf/cuda_peak_allocated_bytes"] == 400

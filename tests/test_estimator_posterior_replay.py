@@ -15,7 +15,7 @@ from supermimic.runners.eit_training import EITTraining
 from supermimic.runners.run_config import validate_eit_checkpoint_contract
 from supermimic.utils.lie_state import LieState
 from tests.test_estimator_belief_integration import setup_env
-from tests.test_estimator_eit_training import training
+from tests.test_estimator_eit_training import advance, training
 from tests.test_estimator_runner import _collection_runner
 
 
@@ -174,7 +174,7 @@ def test_three_rounds_keep_live_belief_and_filter_each_new_measurement_once(stri
       side_effect=AssertionError("training hashed dynamics"),
     ),
   ):
-    logs = [loop.run_round() for _ in range(3)]
+    logs = [advance(loop) for _ in range(3)]
   assert correct.call_count - imagined_calls[0] == 12
   assert predict.call_count - imagined_calls[1] == 11
   assert min(imagined_calls) > 0
@@ -194,8 +194,8 @@ def test_three_rounds_keep_live_belief_and_filter_each_new_measurement_once(stri
 
 def test_cache_preparation_has_no_filter_calls_and_keeps_mixed_sources_and_order():
   loop = training()
-  loop.run_round()
-  loop.run_round()
+  advance(loop)
+  advance(loop)
   env = loop.runner.wm_env
   keys = torch.tensor([[1, 7], [1, 1], [1, 1], [1, 4]])
   estimator = env.posterior_provider.estimator
@@ -209,7 +209,7 @@ def test_cache_preparation_has_no_filter_calls_and_keeps_mixed_sources_and_order
     obs = env.reset_prepared(starts.repeat_interleave(2))
   assert len(obs) == 8
   assert torch.equal(starts.batch["time_index"], keys[:, 1])
-  assert starts.batch["posterior_revision"].unique().numel() == 2
+  assert starts.batch["posterior_revision"].unique().numel() == 3
   # The source revision differs from the current model, but next imagined filter
   # steps still retain action derivatives (also exercised by policy regressions).
   assert (starts.batch["posterior_revision"] < starts.model_version).all()
@@ -220,7 +220,7 @@ def test_saved_stride_wins_on_restore_and_v3_remains_readable_but_not_resumable(
   source.cfg = replace(source.cfg, posterior_save_stride=4)
   source.runner.posterior_save_stride = 4
   source.runner.replay_buffer.enable_posterior_cache(4, 5)
-  source.run_round()
+  advance(source)
   checkpoint = source.state_dict()
   target = training()
   target.load_state_dict(checkpoint)
@@ -230,8 +230,9 @@ def test_saved_stride_wins_on_restore_and_v3_remains_readable_but_not_resumable(
   assert target.runner.posterior_provider.state is None
   assert target.runner._dynamics.model_revision == checkpoint["model_revision"]
   old = dict(checkpoint, version="eit_training_v3")
-  validate_eit_checkpoint_contract(old)
-  with pytest.raises(ValueError, match="requires v4"):
+  with pytest.raises(ValueError, match="checkpoint"):
+    validate_eit_checkpoint_contract(old)
+  with pytest.raises(ValueError, match="checkpoint"):
     EITTraining._check_checkpoint_version(old)
 
 
@@ -240,7 +241,7 @@ def test_fresh_restore_reuses_matching_allocations_and_releases_superseded_cache
   target_stride,
 ):
   source = training()
-  source.run_round()
+  advance(source)
   saved = source.state_dict()
   target = training()
   replay = target.runner.replay_buffer
@@ -274,7 +275,7 @@ def test_fresh_restore_reuses_matching_allocations_and_releases_superseded_cache
 
 def test_populated_restore_preserves_old_replay_on_failure_and_clears_it_on_success():
   loop = training()
-  loop.run_round()
+  advance(loop)
   saved = loop.state_dict()
   runner = loop.runner
   old = runner.replay_buffer
@@ -362,7 +363,7 @@ def test_custom_correlated_head_preserves_native_precision_and_tolerated_asymmet
 
 def test_revision_rejects_updates_during_collection_and_entire_policy_update():
   loop = training()
-  loop.run_round()
+  advance(loop)
   model = loop.runner._dynamics
   before = model.model_revision
   with model.readonly():
@@ -375,20 +376,22 @@ def test_revision_rejects_updates_during_collection_and_entire_policy_update():
     torch.tensor([1, 1]), torch.tensor([0, 1])
   )
   noises = loop.policy.draw_noises(start)
-  original = loop.policy.critic_optimizer.step
+  original = loop.policy.critic_optimizers[0].step
 
   def forbidden_step(*args, **kwargs):
     original(*args, **kwargs)
     model.begin_write()
 
-  with patch.object(loop.policy.critic_optimizer, "step", side_effect=forbidden_step):
+  with patch.object(
+    loop.policy.critic_optimizers[0], "step", side_effect=forbidden_step
+  ):
     with pytest.raises(ValueError, match="forbidden"):
       loop.policy.update_from(start, *noises)
 
 
 def test_checkpoint_weight_load_invalidates_prepared_start_even_at_same_revision():
   loop = training()
-  loop.run_round()
+  advance(loop)
   env, model = loop.runner.wm_env, loop.runner._dynamics
   start = env.prepare_policy_starts(torch.tensor([1]), torch.tensor([0]))
   checkpoint = model.checkpoint()
@@ -418,7 +421,7 @@ def test_sparse_policy_sampler_rejects_missing_starts_without_filter_fallback():
   loop.runner.replay_buffer.enable_posterior_cache(4, 5)
   loop.runner.posterior_save_stride = 4
   loop.cfg = replace(loop.cfg, posterior_save_stride=4)
-  loop.run_round()
+  advance(loop)
   env = loop.runner.wm_env
   with pytest.raises(ValueError, match="missing or overwritten"):
     env.prepare_policy_starts(torch.tensor([1]), torch.tensor([1]))

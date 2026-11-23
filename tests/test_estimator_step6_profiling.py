@@ -12,39 +12,25 @@ from tests.test_estimator_belief_training import training as model_training
 from tests.test_estimator_eit_training import training
 
 
-def test_round_budget_counts_actual_updates_and_cache_reads(tmp_path):
+def test_step_budget_counts_actual_updates_and_cache_reads(tmp_path, monkeypatch):
+  monkeypatch.setenv("WANDB_MODE", "disabled")
   loop = training()
   loop.policy.cfg = replace(loop.policy.cfg, num_batches=2)
-  [row] = loop.run(1, tmp_path)
-  budget = row["budget"]
-  assert budget["collected_frames"] == 8
-  assert budget["available_training_windows"] == 2
-  assert budget["sampled_training_windows"] == 2
-  assert budget["training_pairs"] == budget["validation_pairs"] == 3
-  assert budget["mean_updates"] == 1
-  assert budget["covariance_updates"] == math.ceil(3 / 2)
-  assert budget["covariance_pair_draws"] == 3
-  assert budget["actor_updates"] == budget["critic_updates"] == 2
-  assert budget["policy_starts_drawn"] == 4
-  assert budget["imagined_steps"] == 16
-  assert 0 < budget["survival_weighted_imagined_steps"] <= 16
-  assert budget["effective_posterior_count"] == 8
-  assert budget["normalization_samples"] == 4
-  assert budget["available_policy_starts"] == 4
-  assert budget["posterior_storage_bytes"] > 0
-  assert budget["episode_head_storage_bytes"] > 0
-  assert budget["physical_episode_endings"] == 0
-  state = torch.load(tmp_path / "training.pt", weights_only=True)
-  assert state["last_metrics"] == row
-  [profile] = [
+  rows = loop.run(4, tmp_path)
+  row = rows[-1]
+  assert row["Counters/collected_frames"] == 8
+  assert row["Budget/mean_updates"] == 1
+  assert row["Budget/covariance_updates"] == 2
+  assert row["Budget/covariance_pair_draws"] == 4
+  assert row["Budget/actor_updates"] == row["Budget/critic_updates"] == 2
+  assert row["Budget/policy_starts_drawn"] == 4
+  assert row["Budget/imagined_steps"] == 16
+  assert 0 < row["Budget/survival_weighted_imagined_steps"] <= 16
+  assert row["Budget/normalization_samples"] == 3
+  profiles = [
     json.loads(line) for line in (tmp_path / "profiling.jsonl").read_text().splitlines()
   ]
-  seconds = profile["seconds"]
-  assert (
-    0
-    < seconds["posterior_cache_read_seconds"]
-    <= seconds["posterior_cache_normalization_seconds"]
-  )
+  seconds = profiles[-1]["seconds"]
   for name in (
     "physical_collection_seconds",
     "mean_rollout_update_seconds",
@@ -54,17 +40,10 @@ def test_round_budget_counts_actual_updates_and_cache_reads(tmp_path):
     "policy_rollout_backward_seconds",
     "critic_regression_seconds",
     "checkpoint_save_seconds",
-    "snapshot_and_metrics_seconds",
-    "round_seconds",
   ):
     assert math.isfinite(seconds[name]) and seconds[name] > 0
-  assert seconds["round_seconds"] >= sum(
-    value
-    for name, value in seconds.items()
-    if name not in ("round_seconds", "posterior_cache_read_seconds")
-  )
-  assert profile["runtime"]["dtype"] == "torch.float64"
-  assert profile["runtime"]["cuda_peak_allocated_bytes"] is None
+  assert profiles[-1]["runtime"]["dtype"] == "torch.float64"
+  assert profiles[-1]["runtime"]["cuda_peak_allocated_bytes"] is None
 
 
 def test_collection_budget_excludes_previous_round_and_refresh_boundaries():

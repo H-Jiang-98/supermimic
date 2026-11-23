@@ -97,7 +97,11 @@ def summarize_evidence(process, posterior):
   return {
     "checkpoint_sha256": process["checkpoint_sha256"],
     "recording_sha256": process["recording_sha256"],
-    "round": process["round"],
+    **{
+      key: process[key]
+      for key in ("round", "collected_steps", "update_groups", "collected_frames")
+      if key in process
+    },
     "training_overlap_check": process["training_overlap_check"],
     "mean_model": {
       "transitions": values["transitions"],

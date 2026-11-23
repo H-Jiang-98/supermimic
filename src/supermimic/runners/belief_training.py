@@ -11,13 +11,12 @@ import hashlib
 import json
 import os
 from collections.abc import Callable
-from contextlib import ExitStack
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from shutil import copyfileobj
 from tempfile import NamedTemporaryFile
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
 import torch
 from filelock import FileLock
@@ -41,9 +40,6 @@ from supermimic.runners.supermimic_runner import (
   load_actor_checkpoint,
 )
 from supermimic.utils.profiling import PhaseTimer, runtime_metadata
-
-if TYPE_CHECKING:
-  from supermimic.utils.eit_wandb import EITOfflineWandb
 
 
 @dataclass(frozen=True)
@@ -90,8 +86,7 @@ class BeliefModelTraining:
       raise ValueError("Belief training needs at least two retained frames")
     self.runner = runner
     self.cfg = cfg or BeliefTrainingCfg()
-    # Storage policy, separate from learning configuration and initialization.
-    # The joint-training CLI selects 10 for new runs; older callers keep 1.
+    # Historical snapshots belong only to the round-based model-only entry point.
     self.snapshot_interval = 1
     self.rounds = 0
     self.collected_frames = 0
@@ -221,7 +216,8 @@ class BeliefModelTraining:
         "mean_updates": train["mean_updates"],
         "covariance_updates": train["cov_updates"],
         "covariance_batch_size": learner.cov_cfg.batch_size,
-        "covariance_epochs": learner.cov_cfg.epochs,
+        "covariance_pair_budget": learner.cov_cfg.training_pairs(learner.mean_cfg),
+        "covariance_validation_draws": validation["cov_pair_draws"],
         "physical_terminations": terminated,
         "physical_truncations": truncated,
         "physical_episode_endings": completed,
@@ -307,12 +303,20 @@ class BeliefModelTraining:
         "training_motion_files": self.training_motion_files,
         "training_seed": self.training_seed,
         "loop_config": asdict(self.cfg),
-        "snapshot_interval": self.snapshot_interval,
+        **(
+          {}
+          if self.continuous_collection
+          else {"snapshot_interval": self.snapshot_interval}
+        ),
         "runner_config": asdict(runner.cfg),
         "world_model": runner._wm.bundle(),
         "actor": actor_checkpoint(self.actor, runner.cfg),
         "learner": self.learner.state_dict(),
-        "rounds": self.rounds,
+        **(
+          {"update_groups": self.update_groups}
+          if self.continuous_collection
+          else {"rounds": self.rounds}
+        ),
         "collected_frames": self.collected_frames,
         "num_envs": runner.env.num_envs,
         "episode_id": getattr(runner, "_episode_id", None),
@@ -347,11 +351,26 @@ class BeliefModelTraining:
       )
     if state.get("loop_config") != asdict(self.cfg):
       raise ValueError("Belief training loop configuration mismatch")
-    if state.get("runner_config") != asdict(runner.cfg):
+    operational = (
+      {
+        "max_iterations",
+        "log_interval",
+        "save_interval",
+        "run_name",
+        "wandb_project",
+        "log_root",
+      }
+      if self.continuous_collection
+      else set()
+    )
+    if {
+      k: v for k, v in state.get("runner_config", {}).items() if k not in operational
+    } != {k: v for k, v in asdict(runner.cfg).items() if k not in operational}:
       raise ValueError("Belief training runner configuration mismatch")
     if runner._pending_collection is not None:
       raise RuntimeError("Cannot restore during a pending collection transaction")
-    for key in ("rounds", "collected_frames"):
+    progress = "update_groups" if self.continuous_collection else "rounds"
+    for key in (progress, "collected_frames"):
       if type(state.get(key)) is not int or state[key] < 0:
         raise ValueError(f"Invalid checkpoint {key}")
     if (
@@ -359,7 +378,7 @@ class BeliefModelTraining:
     ):
       raise ValueError("Checkpoint environment count mismatch")
     ids = state["episode_id"]
-    if ids is None and state["rounds"]:
+    if ids is None and state[progress]:
       raise ValueError("Completed rounds require checkpoint episode IDs")
     if ids is not None and (
       not isinstance(ids, torch.Tensor)
@@ -421,8 +440,10 @@ class BeliefModelTraining:
     runner.cfg.initial_prior = runner._wm.initial_prior
     self.learner.load_state_dict(state["learner"])
     load_actor_checkpoint(self.actor, runner.cfg, state["actor"])
-    self.rounds, self.collected_frames = state["rounds"], state["collected_frames"]
-    self.snapshot_interval = checkpoint_snapshot_interval(state)
+    setattr(self, progress, state[progress])
+    self.collected_frames = state["collected_frames"]
+    if not self.continuous_collection:
+      self.snapshot_interval = checkpoint_snapshot_interval(state)
     # Older v3 checkpoints do not document the original collection seed/files.
     self.training_seed = state.get("training_seed")
     if not state.get("training_motion_files"):
@@ -440,6 +461,9 @@ class BeliefModelTraining:
       torch.cuda.set_rng_state(cuda_rng, runner.device)
     self._output_checkpoint = None
     self._ready = False
+    self._restart_after_restore(state)
+
+  def _restart_after_restore(self, state):
     self.refresh_collection()
 
   def save(self, path: Path, *, metrics: dict | None = None) -> None:
@@ -607,7 +631,6 @@ class BeliefModelTraining:
     *,
     resume: Path | None = None,
     snapshot_interval: int | None = None,
-    logger: EITOfflineWandb | None = None,
   ) -> list[dict]:
     if type(rounds) is not int or rounds < 1:
       raise ValueError("rounds must be positive")
@@ -640,7 +663,7 @@ class BeliefModelTraining:
       return occupied
 
     check_destination()
-    with FileLock(lock_path, timeout=0), ExitStack() as observers:
+    with FileLock(lock_path, timeout=0):
       occupied = check_destination()
       if resume is not None or occupied:
         source = resume if resume is not None else checkpoint
@@ -682,10 +705,6 @@ class BeliefModelTraining:
       if snapshot_interval is not None:
         self.snapshot_interval = snapshot_interval
       self._output_checkpoint = checkpoint
-      # Initialize observers only after committing/reconciling the checkpoint;
-      # their files must not make a fresh output directory appear occupied.
-      if logger is not None:
-        observers.enter_context(logger.track(self, output))
       logs = []
       for _ in range(rounds):
         metrics = self.run_round(checkpoint)
@@ -709,8 +728,6 @@ class BeliefModelTraining:
         with profile_path.open("a") as stream:
           stream.write(json.dumps(self.last_profile, sort_keys=True, allow_nan=False))
           stream.write("\n")
-        if logger is not None:
-          logger.log_round(metrics, self.last_profile)
         print("BELIEF_TRAINING " + row)
         logs.append(metrics)
       return logs

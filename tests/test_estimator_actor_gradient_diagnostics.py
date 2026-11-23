@@ -185,8 +185,8 @@ def test_real_record_runs_training_horizon_gradient_diagnostic(tmp_path):
       motion_file=motion,
     )
   gradient = report["actor_gradients"]
-  assert gradient["horizon"] == 4
-  assert gradient["samples_per_start"] == 2
+  assert gradient["horizon"] == 32
+  assert gradient["samples_per_start"] == 1
   assert gradient["starts"] == 1
   assert gradient["effective_imagined_steps"] == 8
   assert gradient["actor_state_source"] == "posterior"

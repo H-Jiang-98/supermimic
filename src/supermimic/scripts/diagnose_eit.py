@@ -401,9 +401,15 @@ def diagnose(
     "stage": saved["stage"],
     "group": cfg.estimator_inputs.group,
     "model_version": dynamics.model_version,
-    "round": saved["rounds"],
+    "collected_frames": saved["collected_frames"],
     "episodes": len(record["episodes"]),
   }
+  if saved["stage"] == "policy":
+    result.update(
+      collected_steps=saved["collected_steps"], update_groups=saved["update_groups"]
+    )
+  else:
+    result["round"] = saved["rounds"]
   if mode in ("process", "all"):
     result["process"] = score_process(
       dynamics, representation, record["episodes"], window_frames, batch_size

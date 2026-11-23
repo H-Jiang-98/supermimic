@@ -2,7 +2,7 @@
 
 Uses a generated 32-frame MuJoCo reference and production-width networks by
  default. Each timing includes stochastic rollout, belief Jacobians, actor
- backward, critic bootstrap and two critic optimizer epochs. Replay prefix
+ backward, critic bootstrap and five critic epochs with four minibatches. Replay prefix
  reconstruction is separately timed; physical collection is not in update time.
 """
 
@@ -315,7 +315,7 @@ def main():
     },
     "warmup": args.warmup,
     "repeats": args.repeats,
-    "scope": "Fixed model C policy: stochastic rollout, full belief filter, RPV critic, actor backward and two critic epochs; excludes collection and prefix replay",
+    "scope": "Fixed model C policy: stochastic rollout, full belief filter, RPV critic, actor backward and five critic epochs with four minibatches; excludes collection and prefix replay",
     "model_unchanged": True,
     "posterior_cache_read_seconds": cache_read_seconds,
     "numerical": numerical,

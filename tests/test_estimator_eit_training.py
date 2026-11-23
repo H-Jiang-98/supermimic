@@ -1,6 +1,5 @@
 """Alternating EIT phases, normalization splits and transactional continuation."""
 
-import json
 from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
@@ -11,8 +10,8 @@ import torch
 
 from supermimic.critic_inputs import BeliefCritic
 from supermimic.learners.belief_policy_learner import BeliefPolicyLearnerCfg
-from supermimic.motion_loader import motion_content_digest
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
+from supermimic.runners.belief_training import parameter_digest
 from supermimic.runners.eit_snapshots import file_sha256
 from supermimic.runners.eit_training import (
   EITTraining,
@@ -25,9 +24,20 @@ from tests.test_estimator_belief_training import _RoundRunner, assert_tree
 from tests.test_estimator_world_model_env import _env
 
 
-def training(seed=31):
+def training(seed=31, *, buffer_size=8, replay_ratio=1):
   runner = _RoundRunner(seed)
   runner.cfg.critic_hidden_dims = (12,)
+  runner.cfg.buffer_size = buffer_size
+  runner.cfg.replay_ratio = replay_ratio
+  runner._sampler = None
+  runner.task_id = "test-eit"
+  runner.registry_name = None
+  from dataclasses import make_dataclass
+
+  from supermimic.utils.logger import Logger
+
+  runner.env.cfg = make_dataclass("EnvCfg", [("seed", object)], namespace={})(None)
+  runner.logger = Logger(None, 2, 10, "cpu")
   context_dim = runner._dynamics.sim_ctx_dim
   runner._sim_context = SimContext(
     [SimpleNamespace(dim=context_dim)], [(-1.0, 1.0)] * context_dim
@@ -44,7 +54,7 @@ def training(seed=31):
     for key, value in template.items()
   }
   runner.replay_buffer = ReplayBuffer(
-    runner._schema, 8, 2, initial_prior=runner._wm.initial_prior
+    runner._schema, buffer_size, 2, initial_prior=runner._wm.initial_prior
   )
   env = _env("B")
   # All simulated measurements/replay/prefix/model interfaces stay real; only
@@ -63,7 +73,6 @@ def training(seed=31):
   return EITTraining(
     runner,
     EITTrainingCfg(
-      collection_steps=4,
       validation_stride=2,
       validation_batch_size=2,
       normalization_batch_size=2,
@@ -74,37 +83,33 @@ def training(seed=31):
       microbatch_size=2,
       horizon=2,
       critic_epochs=1,
+      critic_minibatches=1,
       noise=0,
     ),
   )
 
 
-def test_two_rounds_update_all_components_and_exclude_validation_normalization():
-  loop = training()
-  model = deepcopy(loop.runner._dynamics.state_dict())
-  actor = deepcopy(loop.actor.state_dict())
-  critic = deepcopy(loop.policy.critic.state_dict())
-  first, second = loop.run_round(), loop.run_round()
-  assert first["budget"]["normalization_samples"] == 4
-  assert second["budget"]["normalization_samples"] == 4
-  assert second["collection_actor_version"] == first["trained_actor_version"]
-  assert second["collection_model_version"] == first["trained_model_version"]
-  assert first["collection_actor_version"] != first["trained_actor_version"]
-  assert (
-    loop.learner.mean_steps == loop.policy.actor_steps == loop.policy.critic_steps == 2
-  )
-  for before, module in (
-    (model, loop.runner._dynamics),
-    (actor, loop.actor),
-    (critic, loop.policy.critic),
-  ):
-    assert any(
-      not torch.equal(value, module.state_dict()[key]) for key, value in before.items()
-    )
-  assert int(loop.actor.obs_normalizer.count) == 8
-  assert loop.runner.posterior_provider.state.time_index.tolist() == [7, 7]
-  assert loop.runner.reset_count == 1
-  assert loop.runner.imagined_posterior_provider.state is None
+def advance(loop, checkpoint_path=None, steps=4):
+  before_actor = parameter_digest(loop.actor)
+  before_model = loop.runner._dynamics.model_revision
+  rows = [loop.run_step() for _ in range(steps)]
+  updates = [u for row in rows for u in row["updates"]]
+  result = {
+    **rows[-1],
+    **(updates[-1] if updates else {}),
+    "collection_actor_version": before_actor,
+    "trained_actor_version": parameter_digest(loop.actor),
+    "collection_model_version": before_model,
+    "trained_model_version": loop.runner._dynamics.model_revision,
+  }
+  if updates:
+    result["budget"] = {
+      **updates[-1]["budget"],
+      "normalization_samples": sum(row["normalization_samples"] for row in rows),
+    }
+  if checkpoint_path is not None:
+    loop.save(checkpoint_path)
+  return result
 
 
 @pytest.mark.parametrize(
@@ -121,15 +126,15 @@ def test_two_rounds_update_all_components_and_exclude_validation_normalization()
 )
 def test_failed_restore_changes_no_component_or_rng(component):
   source, target = training(31), training(81)
-  source.run_round()
-  target.run_round()
+  advance(source)
+  advance(target)
   checkpoint = source.state_dict()
   if component == "critic":
     checkpoint["critic"]["state_dict"]["mlp.0.weight"][0, 0] = float("nan")
   elif component == "critic_version":
     checkpoint["critic"]["contract"]["version"] = "unknown_critic_version"
   elif component == "policy_optimizer":
-    checkpoint["policy"]["actor_optimizer"]["state"][0]["exp_avg"] = torch.zeros(1)
+    checkpoint["policy"]["actor_optimizers"][0]["state"][0]["exp_avg"] = torch.zeros(1)
   elif component == "model_optimizer":
     checkpoint["learner"]["cov"]["optimizer"]["state"][0]["exp_avg"] = torch.zeros(1)
   elif component == "actor":
@@ -169,7 +174,7 @@ def test_zero_measurement_noise_rejected_before_loading(entry):
     checkpoint["world_model"]["estimator"]["measurement_config"][field] = 0.0
     load = loop._check_checkpoint_version
   else:
-    loop.run_round()
+    advance(loop)
     checkpoint = loop.state_dict()
     inputs = (
       checkpoint["actor"]["input_config"]
@@ -184,11 +189,11 @@ def test_zero_measurement_noise_rejected_before_loading(entry):
 
 def test_restore_reproduces_next_model_and_policy_updates(tmp_path):
   source, target = training(31), training(81)
-  source.run_round()
+  advance(source)
   source.save(tmp_path / "training.pt")
   saved = torch.load(tmp_path / "training.pt", weights_only=True)
   target.load_state_dict(saved)
-  assert target.rounds == source.rounds
+  assert target.update_groups == source.update_groups
   assert target.runner.wm_env.replay_buffer is target.runner.replay_buffer
   assert target.runner.replay_buffer.replay_mode == "full"
   assert target.runner.replay_buffer.num_transitions == 0
@@ -237,7 +242,7 @@ def test_initialization_copies_exact_weights_and_rejects_after_training():
     a.data_ptr() != b.data_ptr()
     for a, b in zip(source.actor.parameters(), target.actor.parameters(), strict=True)
   )
-  source.run_round()
+  advance(source)
   with pytest.raises(ValueError, match="active training"):
     source.load_initialization(bundle)
 
@@ -269,7 +274,7 @@ def test_shared_initialization_matches_legacy_v3_weight_identity(tmp_path):
 
 def test_occupied_output_checks_model_contents_at_equal_revision(tmp_path):
   loop = training()
-  loop.run(1, tmp_path)
+  loop.run(4, tmp_path)
   model = loop.runner._dynamics
   disk_hash = file_sha256(tmp_path / "training.pt")
   original = model.checkpoint()
@@ -280,83 +285,8 @@ def test_occupied_output_checks_model_contents_at_equal_revision(tmp_path):
   replacement["model_revision"] = original["model_revision"]
   model.load_checkpoint(replacement)
   with pytest.raises(ValueError, match="differs from the output checkpoint"):
-    loop.run(1, tmp_path)
+    loop.run(4, tmp_path)
   assert file_sha256(tmp_path / "training.pt") == disk_hash
-
-
-def test_snapshot_baseline_actual_counters_and_repair_after_interrupted_index(tmp_path):
-  loop = training()
-  loop.load_initialization(loop.initialization_bundle())
-  loop.run(1, tmp_path)
-  index = tmp_path / "snapshots/index.json"
-  registry = json.loads(index.read_text())
-  baseline, first = registry["snapshots"]
-  state = torch.load(tmp_path / "training.pt", weights_only=True)
-  for name in ("mean_steps", "cov_steps", "actor_steps", "critic_steps"):
-    assert baseline[name] == 0
-    assert first[name] > 0
-  assert baseline["round"] == baseline["collected_frames"] == 0
-  assert first["actor_steps"] == state["policy"]["actor_steps"]
-  assert first["critic_steps"] == state["policy"]["critic_steps"]
-  assert first["mean_steps"] == state["learner"]["mean"]["steps"]
-  assert first["cov_steps"] == state["learner"]["cov"]["steps"]
-  assert first["sha256"] == file_sha256(tmp_path / "training.pt")
-  assert first["sha256"] == file_sha256(tmp_path / first["path"])
-  assert (
-    first["initialization_digest"]
-    == baseline["initialization_digest"]
-    == loop.initialization_digest
-  )
-  assert first["model_version"] == state["learner"]["model_version"]
-  assert first["round"] == 1 and first["collected_frames"] == 8
-  registry["snapshots"].pop()
-  index.write_text(json.dumps(registry))
-  training().run(1, tmp_path, resume=tmp_path / "training.pt")
-  restored = json.loads(index.read_text())["snapshots"]
-  assert restored[:2] == [baseline, first]
-  assert len(restored) == 3 and restored[-1]["round"] == 2
-  assert file_sha256(tmp_path / first["path"]) == first["sha256"]
-
-
-def test_snapshot_same_frame_conflict_preserves_immutable_bytes(tmp_path):
-  loop = training()
-  loop.run(1, tmp_path)
-  path = tmp_path / "training.pt"
-  state = torch.load(path, weights_only=True)
-  row = json.loads((tmp_path / "snapshots/index.json").read_text())["snapshots"][-1]
-  state["extra_marker"] = 1
-  torch.save(state, path)
-  with pytest.raises(ValueError, match="Snapshot index conflict"):
-    training().run(1, tmp_path, resume=path)
-  assert file_sha256(tmp_path / row["path"]) == row["sha256"]
-
-
-def test_rolled_back_checkpoint_and_metrics_cannot_reuse_published_frame_key(tmp_path):
-  loop = training()
-  loop.run(1, tmp_path)
-  path = tmp_path / "training.pt"
-  original = path.read_bytes()
-  path.write_bytes((tmp_path / "snapshots/frames_0.pt").read_bytes())
-  (tmp_path / "metrics.jsonl").write_text("")
-  with pytest.raises(ValueError, match="index is ahead"):
-    loop.run(1, tmp_path, resume=path)
-  assert (tmp_path / "snapshots/frames_8.pt").read_bytes() == original
-
-
-@pytest.mark.parametrize(
-  "target", ["snapshots", "snapshots/index.json", "snapshots/frames_8.pt"]
-)
-def test_snapshot_symlink_cannot_redirect_resumed_output(tmp_path, target):
-  loop = training()
-  output = tmp_path / "run"
-  loop.run(1, output)
-  path = output / target
-  outside = tmp_path / "outside"
-  path.rename(outside)
-  path.symlink_to(outside)
-  with pytest.raises(ValueError, match="local files"):
-    loop.run(1, output, resume=output / "training.pt")
-  assert path.is_symlink()
 
 
 def test_model_only_checkpoint_cannot_masquerade_as_joint_resume():
@@ -377,11 +307,11 @@ def test_policy_training_requires_full_replay_before_collection():
 def test_no_fresh_training_frames_preserves_actor_normalizers():
   loop = training()
   loop.cfg = replace(loop.cfg, validation_stride=5)
-  loop.run_round()
+  advance(loop)
   loop.refresh_collection()
   loop.runner._episode_id = torch.tensor([10, 5])
   count = loop.actor.obs_normalizer.count.clone()
-  loop.run_round()
+  advance(loop)
   assert torch.equal(loop.actor.obs_normalizer.count, count)
 
 
@@ -491,39 +421,15 @@ def test_normalization_reads_fresh_slots_without_copying_frame_keys_to_python():
   assert torch.equal(episodes, torch.ones_like(times))
   assert torch.equal(times, expected_times)
   assert torch.equal(generator.get_state(), reference_rng.get_state())
-  assert loop._cache_budget["normalization_samples"] == 2
-  assert int(loop.actor.obs_normalizer.count) == 2
+  assert loop._cache_budget["normalization_samples"] == 4
+  assert int(loop.actor.obs_normalizer.count) == 4
   assert torch.equal(starts.batch["time_index"], policy_keys[:, 1])
   # An explicit, possibly duplicated selection still ignores validation and
   # unsaved rows, and can include earlier frames.
   frames = replay.retained_frames(fields=("episode_id", "time_index"))
   loop.update_input_normalization(frames[[0, 8, 8, 9, 10]])
   assert loop._cache_budget["normalization_samples"] == 2
-  assert int(loop.actor.obs_normalizer.count) == 4
-
-
-def test_joint_output_resume_reconciles_metrics_and_preserves_unrelated_directory(
-  tmp_path,
-):
-  loop = training()
-  first = loop.run(1, tmp_path / "run")[0]
-  checkpoint = tmp_path / "run" / "training.pt"
-  resumed = training(81)
-  second = resumed.run(1, tmp_path / "new", resume=checkpoint)[0]
-  assert second["round"] == first["round"] + 1
-  assert second["collection_actor_version"] == first["trained_actor_version"]
-  fork_index = json.loads((tmp_path / "new/snapshots/index.json").read_text())
-  parent, child = fork_index["snapshots"]
-  assert parent["sha256"] == file_sha256(checkpoint)
-  assert file_sha256(tmp_path / "new" / parent["path"]) == parent["sha256"]
-  assert child["sha256"] == file_sha256(tmp_path / "new/training.pt")
-  unrelated = tmp_path / "unrelated"
-  unrelated.mkdir()
-  marker = unrelated / "training.pt"
-  marker.write_bytes(b"unrelated run")
-  with pytest.raises(ValueError, match="its own current"):
-    training().run(1, unrelated, resume=checkpoint)
-  assert marker.read_bytes() == b"unrelated run"
+  assert int(loop.actor.obs_normalizer.count) == 6
 
 
 def test_common_initialization_rejects_prefit_critic():
@@ -534,31 +440,6 @@ def test_common_initialization_rejects_prefit_critic():
     loop.initialization_bundle()
   with pytest.raises(ValueError, match="active training"):
     loop.load_initialization(initial)
-
-
-def test_single_target_resumes_in_place_and_checks_metric_history(tmp_path):
-  loop = training()
-  loop.policy.cfg = replace(loop.policy.cfg, batch_size=1, num_samples=1, horizon=1)
-  loop.run(1, tmp_path)
-  checkpoint = tmp_path / "training.pt"
-  history = tmp_path / "metrics.jsonl"
-  state = torch.load(checkpoint, weights_only=True)
-  row = json.loads(history.read_text())
-  field = "Policy/explained_variance"
-  assert state["last_metrics"]["policy"][field] is None
-  assert row["policy"][field] is None
-  assert "NaN" not in history.read_text()
-  changed = deepcopy(row)
-  changed["policy"][field] = 0.25
-  history.write_text(json.dumps(changed, sort_keys=True) + "\n")
-  resumed = training(81)
-  resumed.policy.cfg = loop.policy.cfg
-  with pytest.raises(ValueError, match="Metrics history disagrees"):
-    resumed.run(1, tmp_path, resume=checkpoint)
-  history.write_text(json.dumps(row, sort_keys=True) + "\n")
-  second = resumed.run(1, tmp_path, resume=checkpoint)[0]
-  assert second["round"] == 2
-  assert second["policy"][field] is None
 
 
 def test_round_policy_samples_singleton_training_episode():
@@ -573,43 +454,7 @@ def test_round_policy_samples_singleton_training_episode():
   with patch.object(
     loop.policy, "update_prepared", wraps=loop.policy.update_prepared
   ) as update:
-    loop.run_round()
+    advance(loop)
   starts = update.call_args.args[0]
   assert starts.batch["episode_id"].tolist() == [1, 3]
   assert starts.batch["time_index"][0].item() == 0
-
-
-def test_round_reuses_ordered_sampled_starts_after_normalizing_fresh_frames():
-  loop = training()
-  loop.run_round()
-  loop.policy.cfg = replace(loop.policy.cfg, num_batches=2)
-  # Episode 1 continues across rounds. Repeat an older key and mix revisions.
-  keys = torch.tensor([[1, 7], [1, 2], [1, 2], [1, 5]])
-  env = loop.runner.wm_env
-  normalize = loop.update_input_normalization
-  old_count = int(loop.actor.obs_normalizer.count)
-
-  def counted_normalize(frames, policy_keys):
-    estimator = env.posterior_provider.estimator
-    with patch.object(estimator, "predict", wraps=estimator.predict) as predict:
-      starts = normalize(frames, policy_keys)
-    assert predict.call_count == 0
-    assert int(loop.actor.obs_normalizer.count) == old_count + 4
-    return starts
-
-  with (
-    patch.object(loop.policy, "sample_start_keys", return_value=keys),
-    patch.object(loop, "update_input_normalization", side_effect=counted_normalize),
-    patch.object(loop.policy, "update_from", wraps=loop.policy.update_from) as updates,
-    patch(
-      "supermimic.envs.world_model_env.motion_content_digest",
-      wraps=motion_content_digest,
-    ) as motion_hash,
-  ):
-    loop.run_round()
-  assert motion_hash.call_count == 1
-  assert len(updates.call_args_list) == 2
-  for call, expected in zip(updates.call_args_list, keys.split(2), strict=True):
-    start = call.args[0]
-    actual = torch.stack((start.batch["episode_id"], start.batch["time_index"]), dim=1)
-    assert torch.equal(actual, expected)

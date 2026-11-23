@@ -113,7 +113,7 @@ def learner_for(model, mean=None, cov=None):
     model,
     model._apply_prediction.__self__,
     mean or MeanFitCfg(window_frames=3, batch_size=2, num_batches=1),
-    cov or CovarianceFitCfg(batch_size=2),
+    cov or CovarianceFitCfg(batch_size=2, validation_pairs=4),
     str(model.action_scale.device),
   )
 
@@ -450,26 +450,33 @@ def test_model_replay_checks_previous_action_only_for_recorded_successors(bounda
     replay.validate_previous_action(episode, time_index, different)
 
 
-def test_fit_shuffles_each_pair_once_per_epoch_and_keeps_last_batch(monkeypatch):
+def test_fit_samples_with_replacement_and_keeps_tail_batch(monkeypatch):
   estimator, replay = fixture(episodes=(6, 4, 1))
-  fit = learner_for(estimator.dynamics, cov=CovarianceFitCfg(batch_size=2, epochs=2))
+  fit = learner_for(
+    estimator.dynamics,
+    cov=CovarianceFitCfg(batch_size=2, pair_budget=11, validation_pairs=7),
+  )
   fresh = replay.retained_frames([0])
-  order = []
+  sizes, samples = [], []
   update = fit.update_covariance
 
   def record(batch):
-    order.extend(batch["inputs"].tolist())
+    sizes.append(len(batch))
+    samples.extend(batch["inputs"].tolist())
+    assert not batch["residual"].requires_grad
     return update(batch)
 
   monkeypatch.setattr(fit, "update_covariance", record)
   train, validation = fit.fit(replay, [0], [1, 2], fresh, 3)
-  pairs = replay.model_windows(replay.model_window_starts([0], 2), 2)
-  inputs = fit.residual_data(pairs)["inputs"].tolist()
-  assert len(order) == 10
-  assert sorted(order[:5]) == sorted(order[5:]) == sorted(inputs)
-  assert order[:5] != order[5:]
-  assert fit.cov_steps == 6 and train["cov_pairs"] == 5
-  assert validation["cov_pairs"] == 3 and validation["mean_windows"] == 3
+  inputs = fit.residual_data(
+    replay.model_windows(replay.model_window_starts([0], 2), 2)
+  )["inputs"].tolist()
+  assert sizes == [2, 2, 2, 2, 2, 1]
+  assert all(sample in inputs for sample in samples)
+  assert len({tuple(sample) for sample in samples}) < len(samples)
+  assert train["cov_pair_draws"] == 11 and train["cov_updates"] == 6
+  assert train["cov_pairs"] == 5 and validation["cov_pairs"] == 3
+  assert validation["cov_pair_draws"] == 7
   assert int(fit.dynamics.state_normalizer.count) == len(fresh)
   assert all(not p.requires_grad and p.grad is None for p in fit.dynamics.parameters())
 

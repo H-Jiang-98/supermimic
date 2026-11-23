@@ -1,6 +1,6 @@
 # 第三步　拟合世界模型的预测均值与过程 covariance
 
-`train_belief` 每轮用固定 actor 采集真实轨迹，依次拟合动力学均值与条件过程 covariance。`train_eit` 复用同一轮次实现，再用更新后的世界模型训练 actor 和 critic。A/B/C 使用相同的模型拟合目标。[策略训练](plan_step4.md)
+`train_belief` 每轮用固定 actor 采集真实轨迹，依次拟合动力学均值与条件过程 covariance。`train_eit` 使用公共 `runner.step()` 和 `Ratio` 逐步采集、调度更新组，复用同一模型 fitter，再训练 actor 和 critic。A/B/C 使用相同的模型拟合目标。[策略训练](plan_step4.md)
 
 ## 每轮的数据
 
@@ -8,10 +8,10 @@
 
 `train_eit` 的完整 replay 还保存实测 `actor_obs`、`prev_action`、参考时间和旋转/平移对齐。独立缓存按全局采集步保存执行动作前的后验。两个入口共用下列模型窗口规则。
 
-1. 使用本轮开始时的 actor、归一化统计和世界模型采集。按物理 episode ID 分组，默认将 `episode_id % 5 == 0` 的 episode 留作验证。同一 episode 的所有帧始终属于同一组。
+1. `train_belief` 使用本轮开始时的模型采集；`train_eit` 使用当前模型逐步采集。按物理 episode ID 分组，默认将 `episode_id % 5 == 0` 的 episode 留作验证。同一 episode 的所有帧始终属于同一组。
 2. 在均值更新前，用本轮新采集的训练帧更新状态和动作归一化，每帧一次。动作经过与动力学前向相同的处理。采集超过环形 replay 容量时，在帧被覆写前把该批统计累加到独立副本。封存时检查保留数据有限且有效转移的仿真上下文一致。完整 replay 还可逐帧核对测量中的上一动作和相邻记录的执行动作。校验通过后才将归一化统计写入模型。
 3. 封存时按环境和时间扫描一次保留帧的后继关系。每条转移要求 episode 相同、帧号恰好加一、前一帧没有终止或截断。均值窗口和一步对共用这份索引，按 episode 取训练和验证子集。跨物理存储环尾的连续窗口可用。每个片段末帧只有在后继已经记录时才能作为转移起点。
-4. 从训练集有放回抽取完整窗口训练均值。随后遍历训练集全部有效的一步转移训练 covariance。两到七帧的短片段在默认配置下也贡献一步转移。单帧没有模型拟合目标，若属于训练集且保存了后验，仍可作为策略起点。
+4. 从训练集有放回抽取完整窗口训练均值。随后从有效一步转移中均匀、有放回抽样训练 covariance，抽样次数由 mean 更新预算推导。两到七帧的短片段在默认配置下也贡献一步转移。单帧没有模型拟合目标，若属于训练集且保存了后验，仍可作为策略起点。
 
 ## 预测均值
 
@@ -28,18 +28,18 @@
 
 ## 条件过程 covariance
 
-均值更新后冻结均值网络和归一化统计。对每对真实相邻帧，用真实前帧 sₜ、动作 aₜ 和仿真上下文 ξₜ 重新计算预测 μₜ₊₁ = `mean_lie(sₜ, aₜ, ξₜ)`。目标 rₜ = `local_error(μₜ₊₁, sₜ₊₁)` 表示从预测均值到真实后继的 70 维右局部扰动。输入和残差在无梯度模式下提取，只用于本轮。
+均值更新后冻结均值网络和归一化统计。对每对真实相邻帧，用真实前帧 sₜ、动作 aₜ 和仿真上下文 ξₜ 重新计算预测 μₜ₊₁ = `mean_lie(sₜ, aₜ, ξₜ)`。目标 rₜ = `local_error(μₜ₊₁, sₜ₊₁)` 表示从预测均值到真实后继的 70 维右局部扰动。输入和残差仅对当前抽中批次在无梯度模式下提取，拟合后释放，不保留全量残差缓存。
 
 `noise_head` 读取同一组归一化输入，输出 2485 个数，构造 70×70 的完整下三角因子 L。对角线使用 softplus 加正下限。同一行的非对角系数以该行对角元素为尺度，保留各物理量之间的交叉项。预测过程 covariance 为 LLᵀ。[动力学实现](src/supermimic/models.py)
 
-对每个残差用下三角求解得到 z = L⁻¹r。包含归一化常数的单样本损失为 ℓ = ½‖z‖² + Σ log Lᵢᵢ + 35 log(2π)。独立的 Adam 只更新 `noise_head`，默认学习率 `2e-4`、每批 256 对、每轮打乱遍历一次。末批按实际样本数参与训练和统计。[两阶段实现](src/supermimic/learners/two_stage_wm.py)
+对每个残差用下三角求解得到 z = L⁻¹r。包含归一化常数的单样本损失为 ℓ = ½‖z‖² + Σ log Lᵢᵢ + 35 log(2π)。独立的 Adam 只更新 `noise_head`，默认学习率 `2e-4`、每批 8192 对。每组抽样次数为 mean updates × batch × (window−1)，默认 143,360，即 17 个整批和一个 4096 尾批，共 18 次更新。损失按实际抽样数加权汇总，允许重复抽样。[两阶段实现](src/supermimic/learners/two_stage_wm.py)
 
 ## 策略、验证与恢复
 
-- `train_belief` 始终固定 actor。`train_eit` 在模型拟合后读取本轮新采、仍保留且保存了后验的训练帧，更新 actor/critic 归一化。策略起点从整个 replay 中符合条件的训练帧抽取。想象保留动作穿过均值、过程 covariance 和滤波更新的梯度。下一轮使用新模型和新 actor，延续物理 episode、belief 和观测历史。
+- `train_belief` 始终固定 actor。`train_eit` 每个采集步用新训练帧及新保存 posterior 各更新一次对应归一化，包括 warmup；同一步多组拟合不重复计数。策略起点从整个 replay 中符合条件的训练帧抽取。想象保留动作穿过均值、过程 covariance 和滤波更新的梯度。下一采集步使用新模型和新 actor，延续物理 episode、belief 和观测历史。
 - `metrics.jsonl` 分别记录累计 `mean_steps`、`cov_steps`、训练与验证 episode、采集和训练后的模型版本。各集合内的 `Loss/state` 是加权 rollout 误差，四个分组值是原始 MSE，`Loss/process_nll` 按实际转移数平均。`mean_windows` 是实际抽取的窗口数，`cov_pairs` 是可用的一步对数。
-- 有验证完整窗口时，默认抽取 4 个打分。验证集只有短片段时，记录 `mean_windows=0`，仍对其全部一步转移计算 NLL。运行一轮需要至少一个完整训练窗口和一对验证转移。
-- `stage=model` 使用 `eit_training_v3`，保存固定 actor 的模型训练状态。`stage=policy` 使用 `eit_training_v4`，另保存 critic、策略配置和优化器、后验保存间隔、缓存协议及模型修订号。跨进程续训恢复对应组件和 RNG，使用空 replay 开始新的物理轨迹。共同初值使用 `eit_initialization_v3`。[训练与恢复](README.md#estimator-第四步完整策略与模型交替训练)
+- 有验证完整窗口时，默认抽取 4 个打分。验证集只有短片段时，记录 `mean_windows=0`，仍独立、有放回抽取 8192 个验证转移计算 NLL。训练与验证的 RNG 独立且可恢复。模型拟合需要至少一个完整训练窗口和一对验证转移；EIT 还要求可用 posterior，warmup 跳过的机会不补欠账。
+- `stage=model` 使用 `eit_model_training_v4`，保存固定 actor 的模型训练状态。`stage=policy` 使用 `eit_training_v5`，另保存 critic、策略配置和优化器、后验保存间隔、缓存协议及模型修订号。跨进程续训恢复对应组件和 RNG，使用空 replay 开始新的物理轨迹。共同初值使用 `eit_initialization_v3`。[训练与恢复](README.md#estimator-第四步完整策略与模型交替训练)
 - 纯模型训练的轮次存档保存当前 RNG，可在相同版本及相同输入下复核下一次优化器更新。
 
 ## 运行
@@ -53,7 +53,7 @@ OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.train_belief \
   --collection-steps 12 --buffer-size 24
 ```
 
-两个训练入口共用 `--mean-window-frames`、`--mean-updates`、`--mean-batch-size`、`--mean-lr`、`--cov-batch-size`、`--cov-epochs` 和 `--cov-lr`。运行 `train_eit` 可额外设置 `--policy-horizon` 等策略参数。恢复时提供同一 motion、对应入口的 `--resume <输出目录>/training.pt` 和 `--output`。`--rounds` 指新增轮数。
+两个训练入口共用 `--mean-window-frames`、`--mean-updates`、`--mean-batch-size`、`--mean-lr`、`--cov-batch-size`、`--cov-pair-budget`、`--cov-validation-pairs` 和 `--cov-lr`。运行 `train_eit` 可额外设置 `--policy-horizon` 等策略参数。恢复时提供同一 motion、对应入口的 `--resume <输出目录>/training.pt` 和 `--output`。`train_belief --rounds` 指新增轮数；`train_eit --max-iterations` 指累计物理采集步目标。当前保存与离线记录配置见 [训练说明](docs/train_eit_pro6000.md)。下文 v3 验收记录保留原始配置，不代表当前预算。
 
 ## 专用 replay 验收（v3）
 

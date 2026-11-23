@@ -122,6 +122,56 @@ def _optimize_step(
   return grad_norm
 
 
+def fit_critic(
+  critic,
+  optimizers,
+  features,
+  targets,
+  *,
+  epochs=5,
+  minibatches=4,
+  microbatch_size=None,
+  generator=None,
+  max_norm=1.0,
+  check_finite=False,
+):
+  """Fit unweighted MSE with one permutation reused across all epochs.
+
+  Normal batches use the original divisible prefix. Small batches shrink the
+  number of minibatches so each logical optimizer update remains nonempty.
+  Microbatches only split gradient accumulation inside a logical minibatch.
+  """
+  if len(targets) == 0:
+    raise ValueError("Critic needs at least one sample")
+  count = min(minibatches, len(targets))
+  size = len(targets) // count
+  permutation = torch.randperm(size * count, device=targets.device, generator=generator)
+  params = list(critic.parameters())
+  critic.requires_grad_(True)
+  losses, norms = [], []
+  for _ in range(epochs):
+    for indices in permutation.view(count, size):
+      for optimizer in optimizers:
+        optimizer.zero_grad(set_to_none=True)
+      total = targets.new_zeros(())
+      for chunk in indices.split(microbatch_size or size):
+        loss = (
+          critic(features[chunk]).reshape(-1) - targets[chunk].reshape(-1)
+        ).square().sum() / size
+        if check_finite and not torch.isfinite(loss):
+          raise FloatingPointError("Non-finite critic loss; critic step rejected")
+        loss.backward()
+        total += loss.detach()
+      norm = torch.nn.utils.clip_grad_norm_(
+        params, max_norm, error_if_nonfinite=check_finite
+      )
+      for optimizer in optimizers:
+        optimizer.step()
+      losses.append(total)
+      norms.append(norm.detach())
+  return torch.stack(losses).mean(), torch.stack(norms).mean(), epochs * count
+
+
 def graph_state(
   modules: Iterable[nn.Module], optimizers: Iterable[torch.optim.Optimizer]
 ) -> list[torch.Tensor]:

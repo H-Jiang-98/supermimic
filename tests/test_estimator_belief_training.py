@@ -54,7 +54,7 @@ class _RoundRunner(SuperMimicRunner):
       actor_hidden_dims=(12,),
       buffer_size=8,
       mean=MeanFitCfg(batch_size=2, num_batches=1, window_frames=3),
-      cov=CovarianceFitCfg(batch_size=2),
+      cov=CovarianceFitCfg(batch_size=2, validation_pairs=4),
     )
     self.device = "cpu"
     self.env = SimpleNamespace(num_envs=2)
@@ -218,7 +218,7 @@ def test_two_rounds_freeze_actor_exclude_validation_and_refresh_current_model():
     for k, v in runner._dynamics.mlp.state_dict().items()
   )
   assert loop.rounds == loop.learner.mean_steps == 2
-  assert loop.learner.cov_steps == 5
+  assert loop.learner.cov_steps == 4
   assert runner.reset_count == 3
   assert loop.collected_frames == 16
   assert first["collection_model_version"] != first["trained_model_version"]

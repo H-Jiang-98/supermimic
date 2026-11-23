@@ -32,6 +32,7 @@ def candidate(frames):
     group="B",
     training_seed=2,
     collected_frames=frames,
+    actor_steps=int(frames > 0),
     sha256=f"{frames:064x}",
     training_motion_digest="training",
   )
@@ -73,6 +74,42 @@ def test_early_failure_ranking_baseline_missing_and_ties():
   assert batch.select(rows) == []
   rows[-1] = rank_row(50, 0.1, 1, success=0.1)
   assert batch.select(rows) == [candidate(50)]
+
+
+def test_warmup_is_evaluated_but_only_updated_actors_can_win(tmp_path, monkeypatch):
+  warmup = rank_row(10, 1, 0, success=1)
+  warmup["candidate"]["actor_steps"] = 0
+  trained = rank_row(20, 0.2, 1)
+  rows = [dict(warmup, tasks=[])]
+  manifest = dict(manifest_digest="manifest", runs=[{}], validation=[], test=[])
+  monkeypatch.setattr(batch, "candidates", lambda _: [r["candidate"] for r in rows])
+  monkeypatch.setattr(
+    batch,
+    "evaluate_candidate",
+    lambda c, *args: next(r for r in rows if r["candidate"] == c),
+  )
+  report = batch.study(manifest, tmp_path, "validation", False)
+  assert report["complete"] and report["baselines"] == rows
+  assert report["selected"] == report["trained"] == []
+  assert not batch.study(manifest, tmp_path, "test", False)["complete"]
+  rows.append(dict(trained, tasks=[]))
+  report = batch.study(manifest, tmp_path, "validation", False)
+  assert report["selected"] == [trained["candidate"]]
+  assert report["trained"] == rows[1:] and report["baselines"] == rows[:1]
+
+
+def test_unreadable_candidates_remain_visible_and_block_selection(
+  tmp_path, monkeypatch
+):
+  monkeypatch.setattr(
+    batch, "probe", lambda *args: {"evaluation_motion_digest": "loaded"}
+  )
+  manifest = batch.freeze(spec(tmp_path), tmp_path)
+  report = batch.study(manifest, tmp_path, "validation", False)
+  assert not report["complete"]
+  assert report["selected"] == report["trained"] == report["baselines"] == []
+  assert [r["candidate"]["collected_frames"] for r in report["unavailable"]] == [10, 20]
+  assert all(t["status"] == "failed" for t in report["pending_validation"])
 
 
 def test_model_stage_rejected_by_formal_admission():
@@ -243,7 +280,8 @@ def test_admission_reads_checkpoint_and_pairs_initialization_by_seed(tmp_path):
   import torch
 
   from supermimic.critic_inputs import BeliefCritic
-  from supermimic.runners.eit_snapshots import publish_snapshot
+  from supermimic.posterior_replay import POSTERIOR_REPLAY_VERSION
+  from supermimic.runners.run_config import EIT_POLICY_TRAINING_VERSION
 
   train = [{"sha256": "raw"}]
   runs = []
@@ -258,10 +296,15 @@ def test_admission_reads_checkpoint_and_pairs_initialization_by_seed(tmp_path):
       "state": {0: {"step": torch.tensor(1.0)}},
     }
     state = dict(
-      version=EIT_TRAINING_VERSION,
+      version=EIT_POLICY_TRAINING_VERSION,
       stage="policy",
+      posterior_replay_protocol=POSTERIOR_REPLAY_VERSION,
+      loop_config={"posterior_save_stride": 1},
+      model_revision=1,
+      collected_steps=5,
+      num_envs=2,
       replay_mode="full",
-      rounds=1,
+      update_groups=1,
       collected_frames=10,
       training_seed=2,
       training_motion_files=train,
@@ -270,6 +313,7 @@ def test_admission_reads_checkpoint_and_pairs_initialization_by_seed(tmp_path):
       runner_config={
         "estimator_inputs": {"group": group, "measurement_noise": {}},
         "initial_prior": {},
+        "buffer_size": 8,
       },
       learner={
         "model_version": "world",
@@ -279,17 +323,19 @@ def test_admission_reads_checkpoint_and_pairs_initialization_by_seed(tmp_path):
       policy={
         "actor_steps": 1,
         "critic_steps": 1,
-        "actor_optimizer": optimizer,
-        "critic_optimizer": optimizer,
+        "actor_optimizers": [optimizer],
+        "critic_optimizers": [optimizer],
       },
       critic=BeliefCritic(group, 2, (4,)).checkpoint(),
-      world_model={"sim_context": {"scale": torch.ones(2)}},
+      world_model={
+        "sim_context": {"scale": torch.ones(2)},
+        "dynamics": {"model_revision": 1},
+      },
       actor_version="actor",
       critic_version="critic",
     )
     path = directory / "training.pt"
     torch.save(state, path)
-    publish_snapshot(path, state)
   items = batch.candidates({"runs": runs, "training": train})
   assert [i["group"] for i in items] == ["A", "B"]
   assert all("initialization fingerprints differ" in i["error"] for i in items)
@@ -299,7 +345,7 @@ def test_admission_reads_checkpoint_and_pairs_initialization_by_seed(tmp_path):
     "expanded training motion"
     in batch.candidates({"runs": runs[:1], "training": []})[0]["error"]
   )
-  index = batch.read_json(tmp_path / "B" / "snapshots/index.json")["snapshots"][0]
+  index = None
   state["policy"]["actor_steps"] = 2
   with pytest.raises(ValueError, match="Actual optimizer"):
     batch.admit(state, runs[1], index, train)

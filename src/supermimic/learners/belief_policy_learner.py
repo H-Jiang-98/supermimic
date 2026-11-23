@@ -15,21 +15,29 @@ import torch
 from torch import nn
 
 from supermimic.belief_provider import belief_rollout
-from supermimic.learners.learner_utils import validate_optimizer_state
+from supermimic.learners.learner_utils import (
+  build_optimizers,
+  fit_critic,
+  validate_optimizer_state,
+)
+from supermimic.learners.policy_learner import gae_returns
 from supermimic.utils.profiling import PhaseTimer
 
 
 @dataclass(frozen=True)
 class BeliefPolicyLearnerCfg:
-  batch_size: int = 4
-  num_samples: int = 2
-  microbatch_size: int = 2
-  horizon: int = 4
+  batch_size: int = 4096
+  num_samples: int = 1
+  microbatch_size: int = 16
+  horizon: int = 32
   num_batches: int = 1
   noise: float = 0.1
   lr: float = 2e-4
   critic_lr: float = 2e-4
-  critic_epochs: int = 2
+  critic_epochs: int = 5
+  critic_minibatches: int = 4
+  critic_microbatch_size: int | None = None
+  grad_clip_value: float = 0.1
   gamma: float = 0.99
   lam: float = 0.95
   max_grad_norm: float = 1.0
@@ -43,9 +51,16 @@ class BeliefPolicyLearnerCfg:
       "horizon",
       "num_batches",
       "critic_epochs",
+      "critic_minibatches",
     ):
       if type(getattr(self, key)) is not int or getattr(self, key) < 1:
         raise ValueError(f"Invalid policy {key}")
+    if self.critic_microbatch_size is not None and (
+      type(self.critic_microbatch_size) is not int or self.critic_microbatch_size < 1
+    ):
+      raise ValueError("Invalid critic_microbatch_size")
+    if not math.isfinite(self.grad_clip_value) or self.grad_clip_value < 0:
+      raise ValueError("Invalid grad_clip_value")
     for key in ("lr", "critic_lr", "max_grad_norm"):
       if not math.isfinite(getattr(self, key)) or getattr(self, key) <= 0:
         raise ValueError(f"Invalid policy {key}")
@@ -101,19 +116,23 @@ def _module_modes(modules):
 
 class BeliefActorCriticPolicyLearner:
   def __init__(self, actor, critic, wm_env, cfg=None, device=None):
-    del device  # Modules and prepared starts own the actual device/dtype.
     self.actor: nn.Module = actor
     self.critic: nn.Module = critic
     self.wm_env = wm_env
     self.wm_env.eit_critic = True
     self.wm_env.critic_input_config = getattr(critic, "config", None)
     self.cfg = cfg or BeliefPolicyLearnerCfg()
-    self.actor_optimizer = torch.optim.Adam(actor.parameters(), lr=self.cfg.lr)
-    self.critic_optimizer = torch.optim.Adam(critic.parameters(), lr=self.cfg.critic_lr)
+    device = str(next(actor.parameters()).device)
+    self.actor_optimizers = build_optimizers(
+      [actor], self.cfg.lr, betas=(0.9, 0.95), device=device
+    )
+    self.critic_optimizers = build_optimizers(
+      [critic], self.cfg.critic_lr, device=device
+    )
     self.actor_steps = self.critic_steps = 0
     parameter = next(actor.parameters())
     self.generators = {}
-    for offset, name in enumerate(("sampling", "process", "measurement")):
+    for offset, name in enumerate(("sampling", "process", "measurement", "critic")):
       generator = torch.Generator(device=parameter.device)
       generator.manual_seed((torch.initial_seed() + offset) % (2**63 - 1))
       self.generators[name] = generator
@@ -204,6 +223,7 @@ class BeliefActorCriticPolicyLearner:
     survival = process_noise.new_ones(len(starts))
     returns = torch.zeros_like(survival)
     observations, rewards, continuations, weights = [], [], [], []
+    aux_loss = 0.0
     saturation = process_noise.new_zeros(())
     film_scale = process_noise.new_zeros(2)
     with belief_rollout(getattr(env, "posterior_provider", None)):
@@ -211,6 +231,8 @@ class BeliefActorCriticPolicyLearner:
         observations.append(obs["critic"].detach())
         weights.append(survival.detach())
         actions = self.actor(obs)
+        aux = getattr(self.actor, "auxiliary_loss", lambda: 0.0)()
+        aux_loss = aux_loss + (aux.mean() if isinstance(aux, torch.Tensor) else aux)
         with torch.no_grad():
           saturation += (env.limit_actions(actions) != actions).float().mean()
           if getattr(self.actor, "film", None) is not None:
@@ -233,9 +255,13 @@ class BeliefActorCriticPolicyLearner:
     observations = torch.stack(observations)
     with torch.no_grad():
       raw_values = self.critic(observations).squeeze(-1)
-      values = raw_values.clamp(max=self._v_max) if cfg.value_clipping else raw_values
-      targets = lambda_returns(
-        torch.stack(rewards), torch.stack(continuations), values, cfg.gamma, cfg.lam
+      targets = gae_returns(
+        raw_values[:-1],
+        raw_values[-1],
+        torch.stack(rewards),
+        1 - torch.stack(continuations),
+        cfg.gamma,
+        cfg.lam,
       )
       if cfg.value_clipping:
         targets.clamp_(max=self._v_max)
@@ -255,6 +281,7 @@ class BeliefActorCriticPolicyLearner:
       "film_scale": film_scale * len(starts),
       "value_clamp_fraction": (raw_values > self._v_max).float().mean() * len(starts),
     }
+    self._rollout_aux_loss = aux_loss
     if return_components:
       return returns, data, metrics, (reward_return, bootstrap)
     return returns, data, metrics
@@ -279,7 +306,7 @@ class BeliefActorCriticPolicyLearner:
       raise ValueError("Prepared policy starts must have a remaining scoring action")
     count = len(starts)
     modules = (self.actor, self.critic, env.dynamics, env.representation)
-    data, totals = [], {}
+    data, order, totals = [], [], {}
     # Analytical test environments and custom rollout environments may have no motion.
     with (
       getattr(env, "readonly_policy_motion", nullcontext)(),
@@ -290,7 +317,8 @@ class BeliefActorCriticPolicyLearner:
       for module in (self.critic, env.dynamics, env.representation):
         module.eval().requires_grad_(False)
         module.zero_grad(set_to_none=True)
-      self.actor_optimizer.zero_grad(set_to_none=True)
+      for optimizer in self.actor_optimizers:
+        optimizer.zero_grad(set_to_none=True)
       actor_start = timer.now()
       try:
         for horizon in lengths.unique(sorted=True).tolist():
@@ -306,8 +334,16 @@ class BeliefActorCriticPolicyLearner:
               raise FloatingPointError(
                 "Non-finite imagined return; actor step rejected"
               )
-            (-returns.sum() / count).backward()
+            (
+              -returns.sum() / count + self._rollout_aux_loss * len(selected) / count
+            ).backward()
             data.append(regression)
+            order.append(
+              (
+                torch.arange(horizon, device=selected.device)[:, None] * count
+                + selected
+              ).flatten()
+            )
             for name, value in metrics.items():
               totals[name] = totals.get(name, 0) + value
             del returns
@@ -317,7 +353,10 @@ class BeliefActorCriticPolicyLearner:
         actor_norm = torch.nn.utils.clip_grad_norm_(
           self.actor.parameters(), cfg.max_grad_norm, error_if_nonfinite=True
         )
-        self.actor_optimizer.step()
+        if cfg.grad_clip_value:
+          torch.nn.utils.clip_grad_value_(self.actor.parameters(), cfg.grad_clip_value)
+        for optimizer in self.actor_optimizers:
+          optimizer.step()
         self.actor_steps += 1
         timer.seconds["policy_rollout_backward_seconds"] = timer.now() - actor_start
         critic_start = timer.now()
@@ -326,40 +365,36 @@ class BeliefActorCriticPolicyLearner:
         features, targets, weights = (
           torch.cat([record[i] for record in data]) for i in range(3)
         )
-        denominator = weights.sum()
-        if not torch.isfinite(denominator) or denominator <= 0:
-          raise FloatingPointError("Invalid critic survival weights")
-        critic_losses, critic_norms = [], []
-        for _ in range(cfg.critic_epochs):
-          self.critic_optimizer.zero_grad(set_to_none=True)
-          loss_sum = targets.new_zeros(())
-          for offset in range(0, len(targets), cfg.microbatch_size):
-            selection = slice(offset, offset + cfg.microbatch_size)
-            prediction = self.critic(features[selection]).squeeze(-1)
-            loss = (
-              weights[selection] * (prediction - targets[selection]).square()
-            ).sum()
-            if not torch.isfinite(loss):
-              raise FloatingPointError("Non-finite critic loss; critic step rejected")
-            (loss / denominator).backward()
-            loss_sum += loss.detach()
-          self._check_gradients(self.critic)
-          critic_norms.append(
-            torch.nn.utils.clip_grad_norm_(
-              self.critic.parameters(), cfg.max_grad_norm, error_if_nonfinite=True
-            )
-          )
-          self.critic_optimizer.step()
-          self.critic_steps += 1
-          critic_losses.append(loss_sum / denominator)
+        # Restore time-major, then trajectory order before drawing the one
+        # permutation. Rollout chunk size and equal-length grouping cannot alter it.
+        permutation = torch.cat(order).argsort()
+        features, targets = features[permutation], targets[permutation]
+        critic_loss, critic_norm, updates = fit_critic(
+          self.critic,
+          self.critic_optimizers,
+          features,
+          targets,
+          epochs=cfg.critic_epochs,
+          minibatches=cfg.critic_minibatches,
+          microbatch_size=cfg.critic_microbatch_size,
+          generator=self.generators["critic"],
+          max_norm=cfg.max_grad_norm,
+          check_finite=True,
+        )
+        self.critic_steps += updates
         with torch.no_grad():
-          errors = self.critic(features).squeeze(-1) - targets
           variance = targets.var(unbiased=False)
-          explained = (
-            1 - errors.var(unbiased=False) / variance
-            if variance > 0
-            else targets.new_tensor(float("nan"))
-          )
+          if variance > 0:
+            # The fitted targets are private and no longer needed. Reuse their
+            # storage for residuals and keep each critic forward bounded.
+            residuals = targets
+            size = cfg.critic_microbatch_size or len(targets)
+            for start in range(0, len(targets), size):
+              chunk = slice(start, start + size)
+              residuals[chunk].sub_(self.critic(features[chunk]).squeeze(-1))
+            explained = 1 - residuals.var(unbiased=False) / variance
+          else:
+            explained = targets.new_tensor(float("nan"))
         timer.seconds["critic_regression_seconds"] = timer.now() - critic_start
         return {
           "Policy/return": totals["return"] / count,
@@ -375,16 +410,17 @@ class BeliefActorCriticPolicyLearner:
           "Policy/film_gamma": totals["film_scale"][0] / totals["valid_steps"],
           "Policy/film_beta": totals["film_scale"][1] / totals["valid_steps"],
           "Policy/value_clamp_fraction": totals["value_clamp_fraction"] / count,
-          "Policy/critic_loss": torch.stack(critic_losses).mean(),
+          "Policy/critic_loss": critic_loss,
           "Policy/explained_variance": explained,
           "Grad/actor_norm": actor_norm.detach(),
-          "Grad/critic_norm": torch.stack(critic_norms).mean().detach(),
+          "Grad/critic_norm": critic_norm.detach(),
         }
       except Exception:
-        self.actor_optimizer.zero_grad(set_to_none=True)
-        self.critic_optimizer.zero_grad(set_to_none=True)
+        for optimizer in (*self.actor_optimizers, *self.critic_optimizers):
+          optimizer.zero_grad(set_to_none=True)
         raise
       finally:
+        self._rollout_aux_loss = 0.0
         env.clear_rollout()
         if hasattr(self.actor, "_aux_loss"):
           self.actor._aux_loss = next(self.actor.parameters()).new_empty(0)
@@ -402,15 +438,15 @@ class BeliefActorCriticPolicyLearner:
   def state_dict(self):
     return copy.deepcopy(
       {
-        "version": "belief_policy_learner_v1",
+        "version": "belief_policy_learner_v2",
         "config": asdict(self.cfg),
         "contract": self._contract(),
         "model_version": self.wm_env.dynamics.model_version,
         "bootstrap_value_cap": self._v_max if self.cfg.value_clipping else None,
         "actor_steps": self.actor_steps,
         "critic_steps": self.critic_steps,
-        "actor_optimizer": self.actor_optimizer.state_dict(),
-        "critic_optimizer": self.critic_optimizer.state_dict(),
+        "actor_optimizers": [opt.state_dict() for opt in self.actor_optimizers],
+        "critic_optimizers": [opt.state_dict() for opt in self.critic_optimizers],
         "rng": {
           name: generator.get_state() for name, generator in self.generators.items()
         },
@@ -420,19 +456,21 @@ class BeliefActorCriticPolicyLearner:
   def validate_state_dict(self, state):
     if (
       not isinstance(state, dict)
-      or state.get("version") != "belief_policy_learner_v1"
+      or state.get("version") != "belief_policy_learner_v2"
       or state.get("config") != asdict(self.cfg)
       or state.get("contract") != self._contract()
       or state.get("model_version") != self.wm_env.dynamics.model_version
     ):
       raise ValueError("Belief policy checkpoint contract mismatch")
-    for name, optimizer in (
-      ("actor", self.actor_optimizer),
-      ("critic", self.critic_optimizer),
+    for name, optimizers in (
+      ("actor", self.actor_optimizers),
+      ("critic", self.critic_optimizers),
     ):
-      validate_optimizer_state(
-        optimizer, state.get(f"{name}_optimizer"), state.get(f"{name}_steps")
-      )
+      saved = state.get(f"{name}_optimizers", [])
+      if len(saved) != len(optimizers):
+        raise ValueError("Policy optimizer count mismatch")
+      for optimizer, supplied in zip(optimizers, saved, strict=True):
+        validate_optimizer_state(optimizer, supplied, state.get(f"{name}_steps"))
     rng = state.get("rng")
     if not isinstance(rng, dict) or set(rng) != set(self.generators):
       raise ValueError("Policy RNG streams mismatch")
@@ -448,15 +486,15 @@ class BeliefActorCriticPolicyLearner:
 
   def load_state_dict(self, state):
     self.validate_state_dict(state)
-    for name, optimizer in (
-      ("actor", self.actor_optimizer),
-      ("critic", self.critic_optimizer),
+    for name, optimizers in (
+      ("actor", self.actor_optimizers),
+      ("critic", self.critic_optimizers),
     ):
-      supplied = copy.deepcopy(state[f"{name}_optimizer"])
-      for values in supplied["state"].values():
-        values["step"] = values["step"].cpu()
-      optimizer.load_state_dict(supplied)
-      optimizer.zero_grad(set_to_none=True)
+      for optimizer, supplied in zip(
+        optimizers, state[f"{name}_optimizers"], strict=True
+      ):
+        optimizer.load_state_dict(copy.deepcopy(supplied))
+        optimizer.zero_grad(set_to_none=True)
     for name, generator in self.generators.items():
       generator.set_state(state["rng"][name].cpu())
     self.actor_steps, self.critic_steps = state["actor_steps"], state["critic_steps"]

@@ -2,6 +2,7 @@
 
 import json
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
 import torch
@@ -614,8 +615,6 @@ def test_censored_validation_and_missing_profile_are_pending(tmp_path, monkeypat
   path = tmp_path / "evaluation/validation.json"
   data = json.loads(path.read_text())
   task_path = data["trained"][0]["tasks"][0]["file"]
-  from pathlib import Path
-
   task = json.loads(Path(task_path).read_text())
   task["result"]["episodes"][0].update(
     reason="evaluation_truncated", censored=True, metric_steps=2
@@ -649,8 +648,6 @@ def test_raw_task_identity_is_checked_even_when_summary_claims_complete(
 ):
   fixture(tmp_path, monkeypatch)
   validation = json.loads((tmp_path / "evaluation/validation.json").read_text())
-  from pathlib import Path
-
   path = Path(validation["trained"][0]["tasks"][0]["file"])
   data = json.loads(path.read_text())
   data["result"]["seed"] = 999  # Summary flags remain unchanged.
@@ -1001,3 +998,101 @@ def test_online_null_sections_do_not_crash_audit(tmp_path, monkeypatch, field):
   write(path, value)
   result = build_report(tmp_path)
   assert result["status"] in ("pending", "failed")
+
+
+def test_current_step_report_checks_actual_updates_and_profiles(tmp_path, monkeypatch):
+  from supermimic.scripts.run_eit_pilot import protocol
+  from tests.test_estimator_eit_training import training
+
+  monkeypatch.setenv("WANDB_MODE", "disabled")
+  motion = tmp_path / "motion.npz"
+  motion.write_bytes(b"fixture")
+  p = protocol(motion, 2026, "cpu", "cpu")
+  p.update(
+    num_envs=2,
+    max_iterations=4,
+    resume_after_step=3,
+    covariance_pair_budget=4,
+    updates_per_training_group={"mean": 1, "covariance": 2, "actor": 1, "critic": 1},
+  )
+  write(tmp_path / "protocol.json", p)
+  loop = training()
+  loop.training_seed = p["training_seed"]
+  loop.run(4, tmp_path / "B")
+  write(tmp_path / "resume/B.json", {"status": "passed", "collected_steps": 3})
+  write(tmp_path / "evaluation/validation.json", {"complete": True})
+  report = build_report(tmp_path)
+  assert "Missing manifest.json" in report["pending"]
+  assert "B: missing midpoint reference or verification receipt" in report["pending"]
+  assert report["version"] == "eit_pilot_report_v2" and report["status"] == "pending"
+  group = report["groups"]["B"]
+  assert group["collected_steps"] == 4 and group["updates"]["covariance"] == 2
+  assert group["phase_seconds"]["covariance_fit_seconds"] > 0
+  assert group["cuda_peak_allocated_bytes"] is None
+  checkpoint = tmp_path / "B/training.pt"
+  saved = torch.load(checkpoint, weights_only=True)
+  torch.save({"group": "A", "collected_steps": 3}, tmp_path / "resume/B-reference.pt")
+  assert any(
+    "midpoint reference, checkpoint or verification receipt mismatched" in issue
+    for issue in build_report(tmp_path)["failures"]
+  )
+  (tmp_path / "resume/B-reference.pt").unlink()
+  saved["learner"]["mean"]["steps"] += 1
+  torch.save(saved, checkpoint)
+  assert build_report(tmp_path)["status"] == "failed"
+
+
+def test_step_validation_requires_the_raw_final_episodes_and_actor_updates(
+  tmp_path, monkeypatch
+):
+  p = fixture(tmp_path, monkeypatch)
+  manifest_path = tmp_path / "manifest.json"
+  manifest = json.loads(manifest_path.read_text())
+  final_frames = 8
+  for run in manifest["runs"]:
+    run["frames"] = [final_frames]
+  del manifest["manifest_digest"]
+  manifest["manifest_digest"] = batch_eval_eit.digest(manifest)
+  write(manifest_path, manifest)
+  candidates = [
+    candidate
+    for candidate in batch_eval_eit.candidates(manifest)
+    if candidate["collected_frames"] == final_frames
+  ]
+  monkeypatch.setattr(batch_eval_eit, "candidates", lambda _: candidates)
+  records = [
+    batch_eval_eit.evaluate_candidate(
+      c, manifest["validation"], tmp_path / "evaluation", False
+    )
+    for c in candidates
+  ]
+  aggregate = dict(
+    manifest_digest=manifest["manifest_digest"],
+    complete=True,
+    trained=records,
+    baselines=[],
+    unavailable=[],
+    selected=batch_eval_eit.select(records),
+  )
+
+  def audit_sources():
+    audit = report_eit_pilot.Audit(tmp_path)
+    report_eit_pilot._validated_sources(audit, p, aggregate, frames=[final_frames])
+    return audit
+
+  good = audit_sources()
+  assert good.failures == [] and good.pending == []
+  warmup = aggregate["trained"].pop()
+  warmup["candidate"]["actor_steps"] = 0
+  aggregate["baselines"].append(warmup)
+  aggregate["selected"] = batch_eval_eit.select(records)
+  assert audit_sources().failures == []
+  aggregate["unavailable"].append({"candidate": {"error": "bad counters"}})
+  assert (
+    "Validation aggregate includes unavailable candidates" in audit_sources().pending
+  )
+  aggregate["unavailable"].clear()
+  Path(records[0]["tasks"][0]["file"]).unlink()
+  assert any(
+    "raw validation tasks are missing" in item for item in audit_sources().pending
+  )

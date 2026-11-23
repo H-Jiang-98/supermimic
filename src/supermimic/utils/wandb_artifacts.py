@@ -92,7 +92,7 @@ def log_model_artifact(
     artifact = wandb.Artifact(f"model-{run.id}", type="model", metadata=metadata)
     for path in files:
       artifact.add_file(path)
-    run.log_artifact(artifact, aliases=aliases)
+    run.log_artifact(artifact, **({"aliases": aliases} if aliases is not None else {}))
     if run.offline:
       return True
     collection = f"{run.entity}/{run.project}/model-{run.id}"

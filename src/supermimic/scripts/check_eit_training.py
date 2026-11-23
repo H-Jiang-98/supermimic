@@ -1,4 +1,4 @@
-"""Real continuous-round EIT acceptance and fixed-input model and policy continuation.
+"""Real step-driven EIT acceptance and fixed-input model and policy continuation.
 
 Use --device cuda:0 --full-width for the production network benchmark.
 """
@@ -12,7 +12,6 @@ import subprocess
 import tempfile
 import time
 from copy import deepcopy
-from itertools import pairwise
 from pathlib import Path
 
 import mjlab.tasks  # noqa: F401
@@ -61,7 +60,7 @@ def parse_args(argv=None):
   parser.add_argument("--full-width", action="store_true")
   parser.add_argument("--policy-horizon", "--horizon", type=int, default=4)
   parser.add_argument("--samples", type=int, default=2)
-  parser.add_argument("--rounds", type=int, default=3)
+  parser.add_argument("--max-iterations", type=int, default=12)
   parser.add_argument("--posterior-save-stride", type=int, default=1)
   parser.add_argument("--output", type=Path)
   return parser.parse_args(argv)
@@ -100,7 +99,8 @@ def main():
           actor_hidden_dims=(2048, 1024, 512, 256) if args.full_width else (32, 16),
           critic_hidden_dims=(256, 128) if args.full_width else (32, 16),
           mean=MeanFitCfg(batch_size=4, window_frames=3, num_batches=2),
-          cov=CovarianceFitCfg(batch_size=4),
+          cov=CovarianceFitCfg(batch_size=4, validation_pairs=8),
+          replay_ratio=3,
           buffer_size=12,
           sampling_mode="start",
         )
@@ -111,7 +111,6 @@ def main():
         training = EITTraining(
           runner,
           EITTrainingCfg(
-            collection_steps=8,
             validation_stride=2,
             validation_batch_size=2,
             posterior_save_stride=args.posterior_save_stride,
@@ -139,7 +138,17 @@ def main():
         if cuda:
           torch.cuda.synchronize(args.device)
         begin = time.perf_counter()
-        logs = training.run(args.rounds, directory / group)
+        from supermimic.runners.eit_resume_reference import write_live_reference
+        from supermimic.scripts.check_eit_resume import verify
+
+        reference = directory / f"{group}-reference.pt"
+
+        def capture(path, state, training=training, reference=reference):
+          if state["collected_steps"] == args.max_iterations:
+            write_live_reference(training, path, state, reference)
+
+        training.before_checkpoint_commit = capture
+        logs = training.run(args.max_iterations, directory / group)
         if cuda:
           torch.cuda.synchronize(args.device)
         elapsed = time.perf_counter() - begin
@@ -152,58 +161,19 @@ def main():
           assert any(
             not torch.equal(v, before[name][k]) for k, v in module.state_dict().items()
           ), name
-        for previous, current in pairwise(logs):
-          assert (
-            current["collection_actor_version"] == previous["trained_actor_version"]
-          )
-          assert (
-            current["collection_model_version"] == previous["trained_model_version"]
-          )
-        assert runner.imagined_posterior_provider.state is None
-        train_ids, _ = training.episode_split()
-        starts = runner.wm_env.sample_policy_starts(2, training.policy_episode_ids())
-        noises = training.policy.draw_noises(starts)
-        saved = torch.load(
-          directory / group / "training.pt", map_location=args.device, weights_only=True
+        verify(
+          directory / group / "training.pt",
+          directory / "motion.npz",
+          args.device,
+          reference,
         )
-        replay = runner.replay_buffer
-        length = training.learner.mean_cfg.window_frames
-        windows = replay.model_windows(
-          replay.model_window_starts(train_ids, length)[:4], length
-        )
-        pairs = replay.model_windows(replay.model_window_starts(train_ids, 2)[:4], 2)
-        keys = (starts.batch["episode_id"].clone(), starts.batch["time_index"].clone())
-        expected_logs = training.policy.update_from(starts, *noises)
-        expected = (
-          deepcopy(training.actor.state_dict()),
-          deepcopy(training.policy.critic.state_dict()),
-          training.policy.state_dict(),
-        )
-        expected_model = next_model_update(training.learner, windows, pairs)
-        # Supply exactly the same raw replay fixture after normal restore clears it.
-        training.load_state_dict(saved)
-        runner.replay_buffer = runner.wm_env.replay_buffer = replay
-        restored_starts = runner.wm_env.prepare_policy_starts(*keys)
-        restored_noises = training.policy.draw_noises(restored_starts)
-        equal_tree(noises, restored_noises)
-        actual_logs = training.policy.update_from(restored_starts, *restored_noises)
-        equal_tree(expected_logs, actual_logs)
-        equal_tree(
-          expected,
-          (
-            training.actor.state_dict(),
-            training.policy.critic.state_dict(),
-            training.policy.state_dict(),
-          ),
-        )
-        equal_tree(expected_model, next_model_update(training.learner, windows, pairs))
         reports.append(
           {
             "group": group,
             "critic_contract": training.policy.critic.contract(),
-            "rounds": args.rounds,
+            "collected_steps": args.max_iterations,
             "posterior_save_stride": args.posterior_save_stride,
-            "round_seconds": elapsed,
+            "training_seconds": elapsed,
             "fixed_input_policy_resume_exact": True,
             "fixed_input_model_resume_exact": True,
             "metrics": logs,
@@ -265,7 +235,7 @@ def main():
     "seed": 2026,
     "cpu_threads": 1,
     "dtype": "float32",
-    "timing_scope": "full training rounds including checkpoint save and any first-use compilation; separate evaluation excluded",
+    "timing_scope": "physical collection and all training updates including checkpoint save and any first-use compilation; separate evaluation excluded",
     "memory_scope": "cumulative peak including initialization, training and restore validation",
     "full_width": args.full_width,
     "policy_horizon": args.policy_horizon,

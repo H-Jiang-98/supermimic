@@ -1,5 +1,7 @@
 # 第四步 Belief critic 与随机想象策略训练
 
+本文保留 Step 4 的原始设计与历史验收。当前 `eit_training_v5` 已改用逐步 Ratio 调度、公共 Muon＋Adam、5×4 critic 更新及公共离线保存流程；运行配置以 [当前训练说明](docs/train_eit_pro6000.md) 为准。
+
 **实施状态：已实现。** A/B/C 使用同一版本的 critic 输入契约。文末列有输入维度和 A/B/C 轮次验收命令。
 
 本步承接已实现的 [step1](plan_step1.md)、[step2](plan_step2.md) 和 [step3](plan_step3.md)，将固定 actor 的模型学习扩展为“真实采集 → 拟合均值 → 拟合过程 covariance → 冻结模型进行策略与 critic 更新 → 下一轮采集”。完成后，A/B/C 三组都能从共同初值启动完整 EIT 训练，并保存、恢复和执行短程闭环评估。
@@ -170,7 +172,7 @@ actor 对所有 microbatch 累积按 `1/(N×K)` 缩放的梯度，只执行一�
 | `replay_buffer.py`、`envs/world_model_env.py`、`envs/multi_task_world_model_env.py` | 训练起点筛选、完整起点对象、K 展开、microbatch reset、完整 critic 输入和 clip 边界 |
 | 新增 `learners/belief_policy_learner.py` | 随机 SVG actor loss、λ-return critic、梯度累积和阶段冻结 |
 | `runners/belief_training.py`、`runners/supermimic_runner.py`，新增 `runners/eit_training.py` | 抽取共用轮次操作，接通新 learner、输入归一化、共同初始化和联合 checkpoint |
-| `scripts/train_eit.py`、`scripts/check_eit_training.py` | 训练 CLI、A/B/C 三轮真实采集与更新、固定输入恢复及独立评估。验收轮数可用 `--rounds` 指定。 |
+| `scripts/train_eit.py`、`scripts/check_eit_training.py` | 训练 CLI、A/B/C 三轮真实采集与更新、固定输入恢复及独立评估。当前验收累计采集步数用 `--max-iterations` 指定。 |
 | 新增 critic/policy/EIT 测试，扩展现有 replay/filter/integration 测试 | 信息权限、随机时序、梯度、终止与恢复契约；保留旧入口回归 |
 | `docs/validation/`、README | 保存 CPU/GPU JSON、实际源码指纹、计时配置和可复现命令 |
 

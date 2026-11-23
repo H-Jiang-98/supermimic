@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+import os
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
@@ -8,6 +10,7 @@ from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Literal
+from uuid import uuid4
 
 import torch
 import torch.nn as nn
@@ -457,7 +460,24 @@ def load_wandb_checkpoint(wandb_run_path: str, wm: WorldModel, device: str) -> N
 class Ratio:
   def __init__(self, ratio: float) -> None:
     self._ratio = ratio
-    self._prev: int | None = None
+    self._prev: float | None = None
+
+  def state_dict(self):
+    return {"ratio": self._ratio, "prev": self._prev}
+
+  def load_state_dict(self, state):
+    if (
+      not isinstance(state, dict)
+      or state.keys() != {"ratio", "prev"}
+      or state["ratio"] != self._ratio
+    ):
+      raise ValueError("Ratio configuration mismatch")
+    previous = state["prev"]
+    if previous is not None and (
+      type(previous) not in (int, float) or not math.isfinite(previous) or previous < 0
+    ):
+      raise ValueError("Invalid Ratio balance")
+    self._prev = previous
 
   def __call__(self, step: int) -> int:
     step = int(step)
@@ -860,11 +880,19 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     print(f"[INFO] Logging to {log_dir}")
     return log_dir
 
-  def _init_wandb(self, log_dir: Path, name_suffix: str = "") -> None:
+  def _init_wandb(
+    self,
+    log_dir: Path,
+    name_suffix: str = "",
+    *,
+    extra_config: dict | None = None,
+    fresh_run: bool = False,
+  ) -> None:
     """Initialize the W&B run and link the registry artifacts."""
     wandb_config = {
       "env_cfg": asdict(self.env.cfg),
       "runner_cfg": asdict(self.cfg),
+      **(extra_config or {}),
     }
 
     default_name = f"{self.task_id}{name_suffix}-{log_dir.name}"
@@ -873,9 +901,14 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       name=self.cfg.run_name or default_name,
       dir=str(log_dir),
       config=wandb_config,
+      id=uuid4().hex[:8] if fresh_run else None,
+      resume="never" if fresh_run else None,
     )
 
-    if self.registry_name:
+    if self.registry_name and os.environ.get("WANDB_MODE", "online") not in (
+      "offline",
+      "disabled",
+    ):
       api = wandb.Api()
       for name in self.registry_name.split(","):
         name = name.strip()
@@ -888,9 +921,11 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
   def _cleanup(self) -> None:
     """Close environment and finish W&B run."""
     env_close_fn = getattr(self.env, "close", None)
-    if env_close_fn:
-      env_close_fn()
-    wandb.finish()
+    try:
+      if env_close_fn:
+        env_close_fn()
+    finally:
+      wandb.finish()
 
 
 class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
@@ -900,6 +935,22 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
   task's encoder. Motion-tracking reward is the only reward path; tasks differ
   only in what goal modality their encoder consumes.
   """
+
+  def save_weights(self, log_dir: Path) -> list[str]:
+    """Common weight files, including a versioned input contract when provided."""
+    world_model_path, actor_path = log_dir / "world_model.pt", log_dir / "actor.pt"
+    torch.save(self._wm.bundle(), world_model_path)
+    torch.save(actor_checkpoint(self.policy_learner.actor, self.cfg), actor_path)
+    files = [str(world_model_path), str(actor_path)]
+    critic = getattr(self.policy_learner, "critic", None)
+    if critic is not None:
+      critic_path = log_dir / "critic.pt"
+      torch.save(
+        critic.checkpoint() if hasattr(critic, "checkpoint") else critic.state_dict(),
+        critic_path,
+      )
+      files.append(str(critic_path))
+    return files
 
   _pending_collection: _CollectionStep | None = None
 
@@ -1377,16 +1428,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         # The previous version must be logged before its files are overwritten.
         if upload is not None:
           upload.result()
-        world_model_path = str(log_dir / "world_model.pt")
-        actor_path = str(log_dir / "actor.pt")
-        torch.save(self._wm.bundle(), world_model_path)
-        torch.save(actor_checkpoint(self.policy_learner.actor, self.cfg), actor_path)
-        checkpoint_files = [world_model_path, actor_path]
-        critic = getattr(self.policy_learner, "critic", None)
-        if critic is not None:
-          critic_path = str(log_dir / "critic.pt")
-          torch.save(critic.state_dict(), critic_path)
-          checkpoint_files.append(critic_path)
+        checkpoint_files = self.save_weights(log_dir)
         # Skip ONNX export on huge datasets.
         if (
           self._representation.actor_obs_mode == "proprio"

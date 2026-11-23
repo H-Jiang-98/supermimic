@@ -13,6 +13,7 @@ from supermimic.learners.learner_utils import (
   CapturedUpdate,
   _optimize_step,
   build_optimizers,
+  fit_critic,
   graph_state,
 )
 
@@ -192,17 +193,8 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
       self.cfg.lam,
     ).clamp(max=self._v_max)
     obs, returns = steps["critic"].flatten(0, 1), returns.flatten(0, 1)
-    perm = torch.randperm(len(returns) // 4 * 4, device=returns.device)
-    self.critic.requires_grad_(True)
-    losses = []
-    for _ in range(5):
-      for idx in perm.view(4, -1):
-        loss = (returns[idx] - self.critic(obs[idx])).pow(2).mean()
-        _optimize_step(
-          self.critic_optimizers, loss, self.critic.parameters(), max_norm=1.0
-        )
-        losses.append(loss.detach())
-    return {"value_function": torch.stack(losses).mean()}
+    loss, _, _ = fit_critic(self.critic, self.critic_optimizers, obs, returns)
+    return {"value_function": loss}
 
   def _graph_state(self) -> list[torch.Tensor]:
     return super()._graph_state() + graph_state([self.critic], self.critic_optimizers)

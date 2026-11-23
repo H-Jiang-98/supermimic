@@ -21,10 +21,11 @@ from filelock import FileLock
 from supermimic.belief import GaussianStatePrior
 from supermimic.estimator_inputs import GaussianMeasurementConfig
 from supermimic.motion_loader import MotionLoader, motion_content_digest
+from supermimic.runners.eit_inference import load_hashed_checkpoint
 from supermimic.runners.eit_snapshots import file_sha256
 from supermimic.runners.run_config import validate_eit_checkpoint_contract
 
-VERSION = "eit_batch_full_clip_v2"
+VERSION = "eit_batch_full_clip_v3"
 TRACKING = ("mpkpe", "r_mpkpe", "joint_vel_error", "ee_pos_error", "ee_ori_error")
 SCORES = ("success_rate", "progress", "return", "length", *TRACKING)
 
@@ -235,23 +236,21 @@ def admit(state, run, index, training):
     f["sha256"] for f in training
   ]:
     raise ValueError("Actual expanded training motion files differ from manifest")
-  round_num, frames = state["rounds"], state["collected_frames"]
+  round_num, frames = state["update_groups"], state["collected_frames"]
   if (
     type(round_num) is not int or round_num < 0 or type(frames) is not int or frames < 0
   ):
-    raise ValueError("Invalid snapshot round or frames")
-  if (round_num == 0) != (frames == 0) or any(
+    raise ValueError("Invalid checkpoint update groups or frames")
+  if frames != state["collected_steps"] * state["num_envs"] or any(
     type(n) is not int or n < 0 or (n == 0) != (round_num == 0)
     for n in counters.values()
   ):
-    raise ValueError(
-      "Round and collected frames require matching actual optimization steps"
-    )
+    raise ValueError("Checkpoint counters disagree with actual optimization steps")
   optimizers = [
     *((opt, counters["mean_steps"]) for opt in state["learner"]["mean"]["optimizers"]),
     (state["learner"]["cov"]["optimizer"], counters["cov_steps"]),
-    (state["policy"]["actor_optimizer"], counters["actor_steps"]),
-    (state["policy"]["critic_optimizer"], counters["critic_steps"]),
+    *((opt, counters["actor_steps"]) for opt in state["policy"]["actor_optimizers"]),
+    *((opt, counters["critic_steps"]) for opt in state["policy"]["critic_optimizers"]),
   ]
   for optimizer, steps in optimizers:
     # Muon has momentum buffers only. Adam saves a step counter for every parameter.
@@ -263,7 +262,8 @@ def admit(state, run, index, training):
       raise ValueError("Actual optimizer state differs from checkpoint update count")
   metadata = dict(
     group=group,
-    round=round_num,
+    update_groups=round_num,
+    collected_steps=state["collected_steps"],
     collected_frames=frames,
     stage="policy",
     initialization_digest=init,
@@ -273,7 +273,7 @@ def admit(state, run, index, training):
     training_seed=state["training_seed"],
     **counters,
   )
-  if any(index.get(k) != v for k, v in metadata.items()):
+  if index is not None and any(index.get(k) != v for k, v in metadata.items()):
     raise ValueError("Snapshot index metadata differs from checkpoint contents")
   return dict(
     **metadata,
@@ -296,19 +296,15 @@ def candidates(manifest):
         group=run["group"], training_seed=run["training_seed"], collected_frames=frames
       )
       try:
-        index = read_json(directory / "snapshots/index.json")
-        if index["version"] != "eit_snapshots_v1":
-          raise ValueError("Unknown snapshot index version")
-        rows = [r for r in index["snapshots"] if r["collected_frames"] == frames]
-        if len(rows) != 1:
-          raise ValueError("Missing or duplicate snapshot index entry")
-        row = rows[0]
-        path = directory / row["path"]
-        identity = file_sha256(path)
-        if identity != row["sha256"]:
-          raise ValueError("Snapshot SHA-256 differs from published index")
-        state = torch.load(path, weights_only=True, map_location="cpu", mmap=True)
-        meta = admit(state, run, row, manifest["training"])
+        # The trainer overwrites current weights. Historical candidates must be
+        # explicit immutable checkpoint paths (for example downloaded artifacts).
+        path = directory / run.get("checkpoints", {}).get(str(frames), "training.pt")
+        state, identity = load_hashed_checkpoint(path, "cpu")
+        if state["collected_frames"] != frames:
+          raise ValueError(
+            "Requested frame count is unavailable in this checkpoint; specify an explicit checkpoints path"
+          )
+        meta = admit(state, run, None, manifest["training"])
         record.update(meta, path=str(path), sha256=identity)
         init_by_seed[run["training_seed"]].add(meta["initialization_digest"])
         del state
@@ -581,8 +577,10 @@ def select(records):
     groups[(c["group"], c["training_seed"])].append(row)
   winners = []
   for _, group in sorted(groups.items()):
-    trained = [r for r in group if r["candidate"]["collected_frames"] > 0]
-    if not trained or not all(r["complete"] for r in group):
+    if not all(r["complete"] for r in group):
+      continue
+    trained = [r for r in group if r["candidate"]["actor_steps"] > 0]
+    if not trained:
       continue
 
     def priority(row):
@@ -611,13 +609,15 @@ def study(manifest, output, split, run):
     else [evaluate_candidate(c, manifest["test"], output, run) for c in winners]
   )
   pending = [t for r in val for t in r["tasks"] if t["status"] != "complete"]
+  admitted = [r for r in records if "error" not in r["candidate"]]
   result = dict(
     manifest_digest=manifest["manifest_digest"],
     split=split,
     selected=winners,
     pending_validation=pending,
-    baselines=[r for r in records if not r["candidate"]["collected_frames"]],
-    trained=[r for r in records if r["candidate"]["collected_frames"]],
+    baselines=[r for r in admitted if r["candidate"]["actor_steps"] == 0],
+    trained=[r for r in admitted if r["candidate"]["actor_steps"] > 0],
+    unavailable=[r for r in records if "error" in r["candidate"]],
   )
   result["complete"] = (
     not pending

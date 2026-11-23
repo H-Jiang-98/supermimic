@@ -1,5 +1,7 @@
 # Step 6　单 seed 试验与算力预算
 
+本文记录原始轮次协议的历史实验；其预算、快照及性能结果不适用于当前 `eit_training_v5`。当前 pilot 使用累计物理步和公共保存流程，见 [运行协议](docs/eit_pilot.md) 与 [训练说明](docs/train_eit_pro6000.md)。
+
 使用 Step 5 的整段评估协议、不可变快照和独立诊断，完成 A/B/C 各 10 轮真实 walking 训练及第 5 轮后的新物理轨迹续训。原始试验用于锁定预算，修订后的恢复验收要求第 5 轮训练进程保存独立参考。当前控制效果和在线时延未达部署要求。[评估协议](plan_step5.md) · [总体规划](plan_sketch.md)
 
 ## 试验配置与预算
@@ -29,9 +31,7 @@
 
 ## 审查后的恢复复验
 
-后续存储调整：正式训练默认每 10 轮发布历史快照，`--snapshot-interval` 可调整间隔，
-每轮仍保存最新 `training.pt`。上节的全部轮次存档体积属于原预算记录；新安排见
-[PRO 6000 训练说明](docs/train_eit_pro6000.md)。pilot 继续显式使用间隔 1。
+当前存储流程由 `runner.cfg.save_interval` 控制，按累计物理步保存最新权重和 `training.pt`，每个保存点形成一个离线 model artifact。EIT 已移除 `snapshot_interval` 及独立历史快照发布。下述历史复验的逐轮存档保留作原始证据；当前配置见 [训练说明](docs/train_eit_pro6000.md)。
 
 在新目录 `artifacts/step6/pilot_verified/` 按同一实采及更新预算复跑 A/B/C。
 第 5 轮先从训练进程内的模型及优化器生成固定输入参考，再发布快照。独立验证进程

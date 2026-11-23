@@ -1,202 +1,23 @@
-# Step 6：单 seed 预算、恢复与性能验收
+# EIT v5 pilot
 
-`run_eit_pilot` 使用真实 walking motion，在固定训练 seed 下依次运行 A/B/C。
-三组显式加载同一个 B 组生成的 v3 初始化包。默认网络宽度、8 环境、64 步采集、
-buffer 128、10 × 2048 个 8 帧均值窗口、covariance batch 256/epoch 1，
-以及策略 N=4、K=2、H=4、microbatch=2、每轮一次 actor 更新和两次 critic 更新，
-均写入 `protocol.json`。当前 pilot 协议为 `eit_pilot_v3`，策略 checkpoint 为
-`eit_training_v4`。每个训练进程内跨轮连续采集，环境在各自的 episode 结束时 reset。
-pilot 使用默认的 `posterior_save_stride=1`，每个采集步都保存动作前的后验。
+当前 `run_eit_pilot` 使用 `eit_pilot_v4` 元数据与 `eit_training_v5` checkpoint。它按累计物理步运行 A/B/C，共享初始化；默认 1024 环境、1000 容量、replay ratio 16、mean 10×2048×8、policy 4096×1×32、critic 5×4。covariance 每组抽样 143,360 对，8192 batch，18 次更新；验证独立抽 8192 对。
 
-pilot 显式传入 `--snapshot-interval 1`，保持第 0 轮及全部训练轮次的快照和逐轮验收。
-同时显式使用 `--wandb-mode disabled`，保持 pilot 耗时验收不包含 W&B 开销。
-直接使用 `train_eit` 新训练时，历史快照间隔默认改为 10，可用同名参数调整；
-最新 `training.pt` 仍每轮更新。历史 pilot 结果和原锁定预算文件保持原样，
-正式训练的新存储安排见 [PRO 6000 训练说明](train_eit_pro6000.md)。
+pilot 的默认目标为累计 100 步，在 50 步保存现场下一次更新参考，独立验证优化器恢复后继续到 100。这个短流程不代表收敛实验，也不能测量满 replay 的稳态索引成本。warmup 及恢复后跳过的机会由实际计数报告，不按 round 推算优化次数。
 
 ```bash
-OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.run_eit_pilot \
-  --motion-file data/motions/walk1_subject1.npz \
-  --output artifacts/step6/pilot_incremental --seed 2026 --device cuda:0 --online-device cpu
-```
-
-可以分开执行 `--phase train` 和 `--phase evaluate`。重复命令从已完成轮次继续，
-验证集复用 Step 5 的摘要校验和任务缓存。任何子命令失败都会写入 `status.json`
-并返回非零；具体命令、耗时和退出码保存在 `commands.jsonl`，完整输出在 `commands/`。
-大体积快照、逐 episode 记录、图和日志位于本地忽略的 `artifacts/`。
-
-若已有第 0 轮 checkpoint，重试会从它恢复。若第 5 或第 10 轮刚写完 checkpoint 就中断，
-重试会先核对并补齐该轮的快照、索引和指标。未完整写出的 profiling 行会单独保存；
-无法还原的保存后计时在报告中列为缺失。
-若第 5 轮缺少现场参照，需在新目录运行训练才能生成完整的恢复证据。
-历史 pilot v1/v2 目录可按冻结协议执行 `--phase evaluate`。对配置匹配的 pilot v2，
-若至少有一组已有 checkpoint，且所有已有组均通过 v4 增量格式、组别和预算检查，
-重启训练会更新 `protocol.json` 并继续。v3 策略 checkpoint 可用于评估及导出。
-
-## 预算和恢复
-
-训练先运行五轮，使用第 5 轮不可变快照检查恢复，再在新进程恢复至第 10 轮。
-恢复读取 checkpoint 中的模型、优化器、RNG、计数和保存间隔，以空 replay 和新 episode 开始采集。
-每组实采帧数为 5,120，均值更新 100 次、actor 更新 10 次、critic 更新 20 次。
-均值窗口允许重复抽样，实际抽取 204,800 个窗口，不能把它解释成相互独立的样本。
-covariance 遍历全部有效训练一步对，每轮更新数为 epochs × ⌈pairs / batch size⌉；
-失败次数、replay 留存和恢复时清空 replay 会改变有效对数，因此三组的 covariance
-实际更新数可以不同。
-
-`metrics.jsonl` 的 `budget` 记录当轮可用及抽取窗口、训练/验证一步对、四类更新增量、
-物理终止频率和策略 N/K/H。`effective_posterior_count` 是仍有原始帧的后验数（含验证帧），
-`available_policy_starts` 是其中可供策略采样的训练帧数，`normalization_samples` 是本轮新采、
-已保存且用于 actor/critic 归一化的训练帧数。每轮有放回抽取的实际起点数见 `policy_starts_drawn`。
-`imagined_steps` 是按 clip 剩余动作截短后
-实际计算的想象步数；`survival_weighted_imagined_steps` 是各步进入时 soft survival
-权重之和，不含折扣。两者均不是实采帧数。
-
-固定输入验收以第 5 轮训练进程内的模型和优化器为基准。训练进程记录同一批固定输入下
-下一次 actor、critic、均值和 covariance 更新的预期结果。验证进程再加载该轮快照，
-重放输入并逐位比较。现场参照 `eit_live_update_reference_v2` 包含各起点的缓存后验、
-来源修订号及本次 rollout 的模型身份。成功收据 `eit_fixed_input_resume_v2` 通过
-`reference_version` 和 SHA-256 关联参照。pilot 可复用身份、数值设置及摘要均匹配的现有收据。
-训练和恢复验证进程在导入 PyTorch 前设置 `PYTORCH_JIT=0`，CUDA 同时使用
-`CUBLAS_WORKSPACE_CONFIG=:4096:8`。固定更新使用确定性算子。两侧均在隔离副本上
-用相同输入做一次策略预热，丢弃副本后比较下一次更新。网络、采样和更新预算沿用原协议。
-数值设置写入 `protocol.json` 和恢复工件，预热及验收开销在 profiling 中单列。
-
-```bash
-OMP_NUM_THREADS=1 PYTORCH_JIT=0 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
-  .venv/bin/python -m supermimic.scripts.check_eit_resume \
-  --checkpoint artifacts/step6/pilot_incremental/B/snapshots/frames_2560.pt \
-  --reference artifacts/step6/pilot_incremental/resume/B-reference.pt \
+WANDB_MODE=offline OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.run_eit_pilot \
   --motion-file data/motions/walk1_subject1.npz --device cuda:0 \
-  --output artifacts/step6/pilot_incremental/resume/B.json
+  --online-device cpu --output artifacts/eit-pilot-v5
+.venv/bin/python -m supermimic.scripts.report_eit_pilot \
+  --pilot artifacts/eit-pilot-v5 --output artifacts/eit-pilot-v5/report
 ```
 
-## 独立评分
+每次训练启动/恢复均创建新离线 run；可用 `WANDB_MODE=disabled` 做无 SDK 的本地训练检查，报告中应保留模式。`--phase train` 只训练和验证恢复，`--phase evaluate` 只评估；已存在的协议必须完全匹配，不迁移旧 round 协议。
 
-验证 seed 为 17031，每个候选两条从片头开始的首 episode，使用整段协议且无外部步数
-预算。每组的第 0 轮和全部十个训练快照都进入验证；测试 seed 17032 只写入冻结清单，
-本阶段不读取测试结果。独立诊断使用 seed 4795，逐帧记录和完整 Monte Carlo critic
-误差位于 `diagnostics/<group>/<frames>/`。均值/过程噪声与后验的跨模型比较使用同一条
-固定物理记录，A 的真值 actor 输入另行评分。
+保存复用公共 `runner.cfg.save_interval`，初始、周期和结束保存最新四文件和同一 model artifact。每组第二段启动前，pilot 在 `resume/<组别>-midpoint.pt` 保留中点 checkpoint，并用对应现场参考验证恢复。第二段即使在采到新的一步之前中断，重启也可复用中点和验证回执。最终候选为各组 `training.pt`，验证采用独立 seed，保留测试集供后续使用。
 
-```bash
-.venv/bin/python -m supermimic.scripts.report_eit_pilot --pilot artifacts/step6/pilot_incremental
-```
+独立诊断保留最终策略梯度、A 的 truth-input critic、共同策略记录和 reference-controller 记录。共同记录仅用于 process/posterior 比较，不计为独立闭环表现。记录、评分及 benchmark 各自运行在子进程；失败时保留命令日志和源码摘要。
 
-汇总在 `PILOT/report/` 生成 `report.json`、`learning_curves.png` 和 `learning_curves.pdf`，核对预算、
-快照身份、恢复、逐候选验证、独立评分与在线测量。缺少数据为 `pending`，身份或预算
-冲突为 `failed`；图中的缺值保持为空。真实回报来自独立验证，训练想象回报来自 replay
-采样起点，两条曲线的差值不能直接解释成模型偏差；模型误差需看固定输入诊断。
+v4 pilot 报告从 v5 checkpoint 核对累计物理预算、实际训练组及每组更新数，汇总 `Logger` 曲线、阶段时间、CUDA peak 和本地离线存储字节数。报告校验各组的中点参考和回执摘要，并按冻结清单从原始 episode 重算验证分数及入选 checkpoint。可在报告的 `pending` 和 `failures` 中查看缺失的证据和身份不匹配的文件。
 
-审计会从原始 episode 重算候选成绩，分别核对初始快照和训练快照的完整名单。
-它也从在线逐帧样本重算两个 pass 的统计量，核对设备、motion 文件、线程和 checkpoint。
-缺字段、结构损坏或含非有限值的诊断会在下次评估时重新计算。
-
-`diagnose_eit --actor-gradients` 在记录的固定片头及固定噪声上，按 checkpoint 的
-H/K/microbatch、soft survival 和 V 上限分别计算奖励项与 bootstrap 项的 actor 梯度。
-报告范数、夹角和噪声摘要，零梯度时夹角为 null，不改变优化器或 RNG。
-`Policy/bootstrap_fraction` 仍表示回报的数值比例，不能替代梯度比例。
-
-短 walking episode 的校准只能说明失败前的行为。使用其他连续参考补测漂移时，必须
-标注来源、时长和状态分布；例如 [Step 5 的 5 s 仰卧固定记录](eit_diagnostics.md#固定后验漂移样例)
-仅用于模型/滤波方法诊断，不能作为 walking 长时控制性能。
-
-下面的入口在新目录中生成同款 250 帧 fixture，重新记录真实 MuJoCo 轨迹，并将三组
-冻结模型应用于同一份测量与动作。它要求记录连续到片尾，否则保留原始数据并返回失败。
-
-```bash
-OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.record_eit_drift \
-  --checkpoint artifacts/step6/pilot_incremental/B/snapshots/frames_5120.pt \
-  --checkpoints artifacts/step6/pilot_incremental/A/snapshots/frames_5120.pt \
-    artifacts/step6/pilot_incremental/B/snapshots/frames_5120.pt \
-    artifacts/step6/pilot_incremental/C/snapshots/frames_5120.pt \
-  --output artifacts/step6/pilot_incremental/drift --device cuda:0
-```
-
-`drift/report.json` 并列有符号均值偏差、多步 MSE、白化残差均值范数、二阶矩及去均值
-covariance 的对角均值，以及逐秒后验误差和覆盖率；完整二阶矩在各组 `*_process.json`。
-该证据用于定位问题，不自动推断更换训练目标
-或其他方法设计一定有效。
-
-## 时间与显存
-
-`metrics.jsonl` 的 `profiling` 记录物理采集、均值 rollout/更新、残差提取、完整
-covariance 拟合、模型验证、缓存读取、输入归一化、策略 rollout/反传及 critic 回归。
-`posterior_cache_read_seconds` 包含在 `posterior_cache_normalization_seconds` 内。
-每轮还记录 dtype、CPU 线程、进程内预热轮数以及 CUDA 分配器的已分配、已预留字节数和峰值。
-缓存张量的实际字节数见 `budget.posterior_storage_bytes` 和 `budget.boundary_history_storage_bytes`。
-
-保存后的耗时写入单独 `profiling.jsonl`，包含 checkpoint 保存、快照发布、
-指标写入及完整轮次。这样不需要为补写保存时间而再次改写 checkpoint，保持
-`last_metrics` 和 `metrics.jsonl` 的恢复一致性。`runtime_after_save` 另含保存深拷贝的峰值。
-
-```bash
-OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.benchmark_eit_online \
-  --checkpoint artifacts/step6/pilot_incremental/C/snapshots/frames_5120.pt \
-  --motion-file data/motions/walk1_subject1.npz --device cpu \
-  --warmup 10 --samples 100 --cpu-threads 1 \
-  --output artifacts/step6/online_recheck/C.json
-```
-
-在线 benchmark 用 batch=1 的真实闭环观测，关闭离线诊断。一个 pass 不插入分阶段
-计时，测量完整 `advance + act` 控制路径；另一个 pass 测量测量/历史、完整滤波/Jacobian、特征、actor 和
-限幅。后者额外的 CUDA 同步会增加开销，不能替代前者的端到端延迟。
-`filter_and_jacobian` 包含 provider 的版本核验；`clamp_and_commit` 还包括后验提交、
-模型内容指纹核验与输出复制，不能把该阶段耗时全部归因于动作限幅。
-各项给出均值、p95、p99、20 ms 余量和超期比例，并分开连续滤波帧与 reset prior 帧。
-模型构建后的首次显式评估 reset、adapter reset 和首次动作单列。这里的 CPU 指本机主机，GPU 指本机
-RTX 5090；未经目标机器人设备实测，不能据此宣称已满足部署周期。
-
-在线测量在预热前释放反序列化的训练 checkpoint 及其优化器张量。显存统计来自
-PyTorch 分配器，包括仍在使用的推理模型和仿真张量；Warp 和 MuJoCo 自行分配的显存需另行测量。
-
-## 本机验收与预算决定
-
-增量后验 replay 的验收记录使用 CPU 上的小型 B 组，保存间隔 1、2、4 各运行三轮，
-列出逐轮起点数、存储字节、耗时及固定输入恢复结果。该次验收没有可用 CUDA 设备。
-[增量 replay 验收记录](validation/incremental_posterior_replay.json)
-
-以下 GPU、在线延迟和正式预算数据来自历史 Step 6 pilot。复验目录
-`artifacts/step6/pilot_verified/` 的最终审计为 `complete`，缺项和失败项均为空。
-RTX 5090 上 A/B/C 各训练 10 轮、采集 5,120 帧。三组均通过第 5 轮预热后的逐位恢复检查。
-33 个快照共完成 66 条未截断的验证轨迹，全部以物理失败结束。最终快照的平均长度为
-32 / 31.5 / 33 步，单线程 CPU 连续滤波帧的在线均值为 50.75 / 49.98 / 51.53 ms。
-代码回归为 949 项通过、5 项跳过。[复验记录](validation/eit_step6_recheck.json)
-
-下表与[原始试验摘要](validation/eit_step6_pilot.json)对应 `artifacts/step6/pilot/`，
-是锁定正式预算时的实测数据；第 5 轮固定输入恢复验收以复验记录为准。
-该次 GPU 在线显存也包含训练 checkpoint 和优化器。
-使用同一 A 组快照，修复后的 GPU 在线测量将 PyTorch 已分配显存从 310.4 MiB 降至
-142.1 MiB。错设备、篡改延迟统计和缺失候选的实际注入结果见[审查复验记录](validation/eit_step6_recheck.json)。
-三组各完成 10 轮；33 个快照的 66 条验证 episode 均因 `anchor_pos`
-物理失败结束，没有预算截断。三组最后快照的平均长度仅为 32 / 29 / 34 步。
-独立后验覆盖率明显低于名义 95%，共同 walking 记录同时显示均值偏差与过大的白化残差
-二阶矩。250 帧仰卧记录也完整保留，但只作为另一状态分布上的方法诊断。
-
-| 本机测量（A / B / C） | 结果 |
-| --- | --- |
-| RTX 5090 平均完整训练轮次 | 20.90 / 21.11 / 21.23 s |
-| Ryzen 9950X，单线程完整在线均值 | 49.81 / 50.08 / 50.71 ms |
-| 同上，p99 | 50.70 / 51.50 / 51.72 ms |
-| RTX 5090，完整在线均值 | 60.04 / 60.10 / 60.99 ms |
-| 同上，p99 | 62.45 / 63.19 / 64.60 ms |
-
-在线值取不插入分阶段计时的连续滤波帧，预热 10 步、测量 100 步，reset 子集另存。
-GPU 在线对照位于 `online_gpu/`，CPU 数据位于 `online/`。两个设备均未达到 20 ms；
-没有测量机器人目标设备。原始试验时的代码回归为 569 项通过、5 项跳过，Ruff 通过；默认 Pyright
-在所检新增模块中仍报告 18 项 PyTorch/MuJoCo 依赖类型声明问题，未关闭检查规则。
-
-[正式统一预算](validation/eit_step6_budget.json) 已锁定为新 seed
-2027–2031，每组 100 轮、51,200 实采帧，统一在第 50 轮恢复一次。保留本次网络、
-采样规则和 H=4，每 10 轮评估一次预先列出的候选，测试结果在验证选模封存后读取。
-这是相对 pilot 增加十倍的数据和更新预算；固定片头的 bootstrap 梯度未主导奖励梯度，
-目前没有据此增大 H。该观察不保证其他起点也有相同的梯度比例。
-
-15 条训练线的纯训练估计约 8.78 h，全部轮次存档及当前 checkpoint 约 248.5 GiB，
-建议预留 260–300 GiB。本次复验的第 5 轮现场参照占 174.6–178.6 MiB/组，
-按 15 条训练线各保留一份估计，另需约 2.6 GiB。纯训练时间不包含启动、恢复验收、独立评估、诊断和备份；若控制开始
-完成长 clip，评估成本会明显上升。Step 7 尚未运行。工程流程通过不等于控制方法有效，
-也不证明训练已经收敛或满足实时部署要求。
-
-![单 seed pilot 学习曲线](validation/eit_step6_learning_curves.png)
-
-[矢量 PDF](validation/eit_step6_learning_curves.pdf)
+[PRO 6000 配置与完整长跑](train_eit_pro6000.md) · [批量评估](eit_batch.md) · [离线 W&B](eit_wandb.md)

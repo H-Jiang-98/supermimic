@@ -9,7 +9,7 @@ on, so a hard motion that is learned keeps some practice.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 import torch
 
@@ -62,6 +62,48 @@ class ReturnSampler:
     self._clip_end = torch.zeros(shape, dtype=torch.bool, device=device)
     self._timed_out = torch.zeros(shape, dtype=torch.bool, device=device)
     self._step = 0
+    self.weights = torch.full((bin_count,), 1.0 / bin_count, device=device)
+
+  def state_dict(self):
+    """Persistent reset statistics; unfinished physical return windows are transient."""
+    return {
+      "config": asdict(self.cfg),
+      "frame_count": self.frame_count,
+      "v_max": self.v_max,
+      **{
+        name: getattr(self, name).clone()
+        for name in ("value", "count", "effort", "weights")
+      },
+    }
+
+  def load_state_dict(self, state):
+    expected = self.state_dict()
+    if not isinstance(state, dict) or state.keys() != expected.keys():
+      raise ValueError("ReturnSampler state contract mismatch")
+    for name, value in expected.items():
+      supplied = state[name]
+      if isinstance(value, torch.Tensor):
+        if (
+          not isinstance(supplied, torch.Tensor)
+          or supplied.shape != value.shape
+          or supplied.dtype != value.dtype
+          or not torch.isfinite(supplied).all()
+        ):
+          raise ValueError(f"Invalid ReturnSampler {name}")
+      elif supplied != value:
+        raise ValueError(f"ReturnSampler {name} mismatch")
+    if (
+      (state["count"] < 0).any()
+      or (state["effort"] < 0).any()
+      or (state["weights"] < 0).any()
+      or not torch.isclose(state["weights"].sum(), state["weights"].new_tensor(1.0))
+    ):
+      raise ValueError("Invalid ReturnSampler statistics")
+    for name in ("value", "count", "effort", "weights"):
+      getattr(self, name).copy_(state[name])
+    self._step = 0
+    for name in ("_frames", "_rewards", "_terminated", "_clip_end", "_timed_out"):
+      getattr(self, name).zero_()
 
   def _bins(self, frames: torch.Tensor) -> torch.Tensor:
     """Frame -> bin, as the motion command bins its adaptive-sampling failures."""
@@ -160,4 +202,5 @@ class ReturnSampler:
     self.effort += focus.double().square()
     keep = (self.effort / self.effort.sum()).float()
     explore = cfg.explore / self.bin_count
-    return explore + (1.0 - cfg.explore - cfg.keep) * focus + cfg.keep * keep
+    self.weights = explore + (1.0 - cfg.explore - cfg.keep) * focus + cfg.keep * keep
+    return self.weights

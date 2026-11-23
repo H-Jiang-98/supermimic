@@ -29,9 +29,8 @@ OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.eval_eit \
 
 | 本地训练快照 | 支持的用途 |
 |---|---|
-| `eit_training_v4`，`stage=policy` | `train_eit` 续训、评估、播放和 ONNX actor 导出 |
-| `eit_training_v3`，`stage=policy` | 评估、播放和 ONNX actor 导出 |
-| `eit_training_v3`，`stage=model` | `train_belief` 续训、固定 actor 的评估、播放和 ONNX actor 导出 |
+| `eit_training_v5`，`stage=policy` | `train_eit` 续训、评估、播放和 ONNX actor 导出 |
+| `eit_model_training_v4`，`stage=model` | `train_belief` 续训、固定 actor 的评估、播放和 ONNX actor 导出 |
 
 策略快照须声明 full replay 并包含本组的 `eit_rpv_belief_critic_v2` 契约。推理加载器核对契约与世界模型的 context 宽度及 critic 首层的输入宽度。启动训练、生成共享初始化包及继续训练的命令见[训练说明](README.md#estimator-第四步完整策略与模型交替训练)。
 
@@ -63,17 +62,18 @@ EIT viewer 的蓝紫色半透明模型标为 `online_posterior`，显示当前�
 
 ## 共同初始化、快照与批量选模
 
-下面的命令在 CPU 上运行一个 40 个实采帧的小网络验收。先用 B 组和固定配置生成初始化包，然后用相同参数启动各组。每个输出目录的 `snapshots/index.json` 记录候选摘要、实际更新步数和共同初始化指纹。第 0 轮也有独立快照。本例显式使用 `--snapshot-interval 1` 保留第 1 轮；新训练默认间隔为 10，最新 `training.pt` 仍每轮更新。
+下面的命令在 CPU 上运行 5 个环境、累计 8 步（40 个实采帧）的小网络验收。
+同一初始化用于各组，候选为各输出目录的 `training.pt`。当前 v5 不维护历史快照索引；
+若需要多个历史候选，使用明确保留的 artifact 文件路径。旧 v3/v4 checkpoint 不兼容。
 
 ```bash
 PY=.venv/bin/python
-export OMP_NUM_THREADS=1
+export OMP_NUM_THREADS=1 WANDB_MODE=disabled
 motion=data/motions/walk1_subject1.npz
 shared=logs/step5/shared_364.pt
 args=(--motion-file "$motion" --device cpu --seed 364 --num-envs 5
-      --collection-steps 8 --buffer-size 7 --rounds 1
-      --snapshot-interval 1 --wandb-mode disabled
-      --mean-window-frames 3 --mean-updates 1 --mean-batch-size 4 --cov-batch-size 8
+      --max-iterations 8 --buffer-size 7 --replay-ratio 1 --sampling-mode uniform
+      --mean-window-frames 3 --mean-updates 1 --mean-batch-size 4 --cov-batch-size 8 --cov-validation-pairs 8
       --policy-batch-size 1 --samples 1 --policy-horizon 2 --policy-microbatch-size 1
       --critic-epochs 1 --hidden-dims 24 16 --actor-hidden-dims 16 --critic-hidden-dims 16)
 "$PY" -m supermimic.scripts.train_eit "${args[@]}" --group B \
@@ -91,7 +91,7 @@ done
 ```bash
 PY=.venv/bin/python
 motion=data/motions/walk1_subject1.npz
-ckpt=logs/step5/B/snapshots/frames_40.pt
+ckpt=logs/step5/B/training.pt
 out=logs/step5/diagnostics
 "$PY" -m supermimic.scripts.eval_eit --checkpoint "$ckpt" --motion-file "$motion" \
   --num-envs 1 --seed 4795 --posterior-bin-steps 50 --record "$out/episodes.pt" \

@@ -13,8 +13,8 @@ from supermimic.estimator_inputs import EITInputConfig, GaussianMeasurementConfi
 from supermimic.runners.eit_snapshots import checkpoint_snapshot_interval
 from supermimic.runners.supermimic_runner import SuperMimicRunnerCfg
 
-EIT_TRAINING_VERSION = "eit_training_v3"
-EIT_POLICY_TRAINING_VERSION = "eit_training_v4"
+EIT_TRAINING_VERSION = "eit_model_training_v4"
+EIT_POLICY_TRAINING_VERSION = "eit_training_v5"
 EIT_INITIALIZATION_VERSION = "eit_initialization_v3"
 
 
@@ -24,11 +24,19 @@ def validate_eit_checkpoint_contract(saved: dict, *, stage: str | None = None) -
     EIT_TRAINING_VERSION,
     EIT_POLICY_TRAINING_VERSION,
   ):
-    raise ValueError(f"Expected {EIT_TRAINING_VERSION} checkpoint")
-  checkpoint_snapshot_interval(saved)
+    raise ValueError(
+      f"Expected {EIT_TRAINING_VERSION} or {EIT_POLICY_TRAINING_VERSION} checkpoint"
+    )
+  if saved["version"] == EIT_TRAINING_VERSION:
+    checkpoint_snapshot_interval(saved)
   kind = saved.get("stage")
   if kind not in ("model", "policy") or (stage is not None and kind != stage):
     raise ValueError(f"Unexpected EIT training stage: {kind!r}")
+  expected_kind = (
+    "policy" if saved["version"] == EIT_POLICY_TRAINING_VERSION else "model"
+  )
+  if kind != expected_kind:
+    raise ValueError("Checkpoint version and training stage disagree")
   replay_mode = saved.get("replay_mode")
   if replay_mode not in ("model", "full") or (
     kind == "policy" and replay_mode != "full"

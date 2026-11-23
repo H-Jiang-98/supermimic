@@ -59,66 +59,11 @@ def _option(arguments, name):
 
 
 @pytest.mark.parametrize("version", ["eit_pilot_v1", "eit_pilot_v2", "eit_pilot_v3"])
-def test_pilot_keeps_frozen_collection_protocol_for_evaluation(
-  tmp_path, monkeypatch, version
-):
+def test_pilot_rejects_previous_round_protocol(tmp_path, monkeypatch, version):
   from supermimic.scripts.run_eit_pilot import main
 
   current = _pilot(tmp_path).p
-  assert current["collection_continues_across_rounds"]
-  saved = {**current, "version": version}
-  if version != current["version"]:
-    del saved["collection_continues_across_rounds"]
-    saved["continuous_collection_limit_s"] = 1.28
-  if version == "eit_pilot_v1":
-    del saved["training_process_environment"]
-  write_json(tmp_path / "protocol.json", saved)
-  argv = [
-    "run_eit_pilot",
-    "--motion-file",
-    current["motion_file"],
-    "--device",
-    "cpu",
-    "--output",
-    str(tmp_path),
-    "--phase",
-    "evaluate",
-  ]
-  monkeypatch.setattr(sys, "argv", argv)
-  evaluated = []
-  monkeypatch.setattr(Pilot, "evaluate", lambda pilot: evaluated.append(pilot.p))
-  main()
-  assert evaluated == [saved]
-  if version != current["version"]:
-    argv[-1] = "train"
-    with pytest.raises(ValueError, match="Pilot configuration changed"):
-      main()
-
-
-@pytest.mark.parametrize("legacy_checkpoint", [False, True])
-def test_v2_pilot_resumes_only_incremental_checkpoints(
-  tmp_path, monkeypatch, legacy_checkpoint
-):
-  from supermimic.runners.run_config import EIT_TRAINING_VERSION
-  from supermimic.scripts.run_eit_pilot import main
-  from tests.test_estimator_eit_training import training
-
-  current = _pilot(tmp_path).p
-  legacy = {
-    k: v for k, v in current.items() if k != "collection_continues_across_rounds"
-  }
-  legacy.update(version="eit_pilot_v2", continuous_collection_limit_s=1.28)
-  protocol_path = tmp_path / "protocol.json"
-  write_json(protocol_path, legacy)
-  state = training().state_dict()
-  state["training_seed"] = current["training_seed"]
-  checkpoint = tmp_path / "B/training.pt"
-  checkpoint.parent.mkdir()
-  torch.save(state, checkpoint)
-  if legacy_checkpoint:
-    checkpoint = tmp_path / "C/training.pt"
-    checkpoint.parent.mkdir()
-    torch.save({**state, "version": EIT_TRAINING_VERSION}, checkpoint)
+  write_json(tmp_path / "protocol.json", {**current, "version": version})
   monkeypatch.setattr(
     sys,
     "argv",
@@ -131,20 +76,25 @@ def test_v2_pilot_resumes_only_incremental_checkpoints(
       "--output",
       str(tmp_path),
       "--phase",
-      "train",
+      "evaluate",
     ],
   )
-  restarted = []
-  monkeypatch.setattr(Pilot, "train", lambda pilot: restarted.append(pilot.p))
-  if legacy_checkpoint:
-    with pytest.raises(ValueError, match="Pilot configuration changed"):
-      main()
-    assert not restarted
-    assert json.loads(protocol_path.read_text()) == legacy
-  else:
+  with pytest.raises(ValueError, match="Pilot configuration changed"):
     main()
-    assert restarted == [current]
-    assert json.loads(protocol_path.read_text()) == current
+
+
+def test_pilot_passes_approved_budgets_to_training(tmp_path):
+  from supermimic.scripts.run_eit_pilot import training_arguments
+
+  p = _pilot(tmp_path).p
+  args = training_arguments(p)
+  assert _option(args, "--num-envs") == "1024"
+  assert _option(args, "--replay-ratio") == "16"
+  assert _option(args, "--critic-epochs") == "5"
+  assert _option(args, "--critic-minibatches") == "4"
+  assert "--collection-steps" not in args and "--snapshot-interval" not in args
+  assert "--cov-epochs" not in args and "--wandb-mode" not in args
+  assert p["covariance_pair_budget"] == 143360
 
 
 def test_pilot_evaluates_all_snapshots_and_final_gradient_truth_and_common_records(
@@ -156,10 +106,9 @@ def test_pilot_evaluates_all_snapshots_and_final_gradient_truth_and_common_recor
     (name, module, list(map(str, args)))
   )
   for group in "ABC":
-    folder = tmp_path / group / "snapshots"
+    folder = tmp_path / group
     folder.mkdir(parents=True)
-    for frames in range(0, 5121, 512):
-      (folder / f"frames_{frames}.pt").write_bytes(f"{group}:{frames}".encode())
+    (folder / "training.pt").write_bytes(group.encode())
   pilot.evaluate()
   validation = next(args for name, _, args in calls if name == "validation")
   assert _option(validation, "--split") == "validation"
@@ -168,10 +117,10 @@ def test_pilot_evaluates_all_snapshots_and_final_gradient_truth_and_common_recor
   )
   gradients = [(name, args) for name, _, args in calls if "--actor-gradients" in args]
   assert {name for name, _ in gradients} == {
-    f"diagnose-{group}-5120" for group in "ABC"
+    f"diagnose-{group}-102400" for group in "ABC"
   }
   for _, args in gradients:
-    assert _option(args, "--checkpoint").endswith("snapshots/frames_5120.pt")
+    assert _option(args, "--checkpoint").endswith("training.pt")
   truth = next(args for name, _, args in calls if name == "record-A-truth")
   assert "--truth-actor" in truth and "--steps" not in truth
   truth_score = next(args for name, _, args in calls if name == "diagnose-A-truth")
@@ -180,14 +129,12 @@ def test_pilot_evaluates_all_snapshots_and_final_gradient_truth_and_common_recor
   assert "--reference-controller" in reference
   assert _option(reference, "--steps") == "250"
   common = [
-    (name, args)
-    for name, _, args in calls
-    if name.startswith("common-policy-baseline-")
+    (name, args) for name, _, args in calls if name.startswith("common-policy-final-")
   ]
   assert len(common) == 6
   assert {_option(args, "--mode") for _, args in common} == {"process", "posterior"}
   assert {_option(args, "--recording") for _, args in common} == {
-    str(tmp_path / "diagnostics/B/0/episodes.pt")
+    str(tmp_path / "diagnostics/B/102400/episodes.pt")
   }
   for name, _, args in calls:
     if name.startswith("record-") and name != "record-common-reference":
@@ -306,19 +253,9 @@ def test_exact_resume_comparison_reports_nested_key_without_relaxing_tolerance()
     )
 
 
-@pytest.mark.parametrize(
-  "version", ["eit_live_update_reference_v1", "eit_live_update_reference_v2"]
-)
-def test_resume_cache_requires_successful_exact_checks_and_valid_json(
-  tmp_path, version
-):
-  from supermimic.runners.eit_snapshots import file_sha256
-  from supermimic.scripts.run_eit_pilot import resume_result_matches
+def write_midpoint_evidence(checkpoint, reference, path, identity=None):
+  from supermimic.runners.eit_resume_contract import REFERENCE_VERSION
 
-  checkpoint, path, reference = (
-    tmp_path / name for name in ("checkpoint.pt", "resume.json", "reference.pt")
-  )
-  checkpoint.write_bytes(b"unchanged")
   execution = {
     "torch_compile": "force_eager",
     "torchscript_optimized_execution": False,
@@ -329,24 +266,78 @@ def test_resume_cache_requires_successful_exact_checks_and_valid_json(
     "cublas_workspace_config": None,
     "expected_optimizer_origin": "deepcopy_of_live_parameter_optimizer_graph",
   }
-  live = {"version": version, "device": "cpu", "verification_execution": execution}
+  live = {
+    "version": REFERENCE_VERSION,
+    "device": "cpu",
+    "verification_execution": execution,
+    "source": "live_training_before_checkpoint_commit",
+    "checkpoint_sha256": file_sha256(checkpoint),
+    "group": "A",
+    "collected_steps": 5,
+  }
+  live.update(identity or {})
   torch.save(live, reference)
   row = {
     "version": "eit_fixed_input_resume_v2",
     "status": "passed",
     "checkpoint_sha256": file_sha256(checkpoint),
     "group": "A",
-    "round": 5,
+    "collected_steps": 5,
     "device": "cpu",
     "fixed_input_policy_resume_exact": True,
     "fixed_input_model_resume_exact": True,
     "live_optimizer_reference": True,
     "expected_source": "live_training_before_checkpoint_commit",
-    "reference_version": version,
+    "reference_version": REFERENCE_VERSION,
     "reference_sha256": file_sha256(reference),
     "verification_execution": execution,
   }
   write_json(path, row)
+  return live, row
+
+
+def test_interrupted_resume_rechecks_original_midpoint_after_republication(tmp_path):
+  # Launching the second leg can atomically replace training.pt before the
+  # first new physical step. The original proof must survive that interruption.
+  pilot = _pilot(tmp_path)
+  pilot.p["resume_after_step"] = 5
+  checkpoint = tmp_path / "A-training.pt"
+  checkpoint_state = {"initialization_digest": "shared", "motion_digest": "walk"}
+  torch.save(checkpoint_state, checkpoint)
+  reference = tmp_path / "A-reference.pt"
+  path = tmp_path / "A.json"
+  live, row = write_midpoint_evidence(checkpoint, reference, path, checkpoint_state)
+  pilot.command = lambda *args: pytest.fail(f"Unexpected invocation: {args}")
+  pilot.verify_midpoint("A", checkpoint, reference, 5)
+  midpoint = tmp_path / "A-midpoint.pt"
+  assert midpoint.samefile(checkpoint)
+  replacement = checkpoint.with_suffix(".tmp")
+  torch.save({**checkpoint_state, "logger": "restarted"}, replacement)
+  replacement.replace(checkpoint)
+  assert file_sha256(checkpoint) != live["checkpoint_sha256"]
+  pilot.verify_midpoint("A", checkpoint, reference, 5)
+  path.unlink()
+
+  def reverify(name, module, args):
+    assert name == "resume-A" and module == "check_eit_resume"
+    assert _option(args, "--checkpoint") == midpoint
+    assert file_sha256(midpoint) == live["checkpoint_sha256"]
+    write_json(path, row)
+
+  pilot.command = reverify
+  pilot.verify_midpoint("A", checkpoint, reference, 5)
+  assert json.loads(path.read_text()) == row
+
+
+def test_resume_cache_requires_successful_exact_checks_and_valid_json(tmp_path):
+  from supermimic.scripts.run_eit_pilot import resume_result_matches
+
+  checkpoint, path, reference = (
+    tmp_path / name for name in ("checkpoint.pt", "resume.json", "reference.pt")
+  )
+  checkpoint.write_bytes(b"unchanged")
+  live, row = write_midpoint_evidence(checkpoint, reference, path)
+  execution = live["verification_execution"]
   environment = {"PYTORCH_JIT": "0"}
 
   def matches():
@@ -361,12 +352,7 @@ def test_resume_cache_requires_successful_exact_checks_and_valid_json(
     ("fixed_input_model_resume_exact", False),
     ("group", "B"),
     ("device", "cuda:0"),
-    (
-      "reference_version",
-      "eit_live_update_reference_v2"
-      if version.endswith("v1")
-      else "eit_live_update_reference_v1",
-    ),
+    ("reference_version", "eit_live_update_reference_v2"),
   ):
     write_json(path, {**row, key: invalid})
     assert not matches()
@@ -430,8 +416,8 @@ def test_resume_rejects_foreign_or_overbudget_training_checkpoints(
   state = {
     "runner_config": {"estimator_inputs": {"group": "A"}},
     "training_seed": 2026,
-    "rounds": 5,
-    "collected_frames": 2560,
+    "collected_steps": 5,
+    "collected_frames": 5120,
   }
   assert module.checkpoint_progress(state, p, "A") == 5
   if change == "group":
@@ -439,7 +425,7 @@ def test_resume_rejects_foreign_or_overbudget_training_checkpoints(
   elif change == "seed":
     state["training_seed"] = 700
   elif change == "rounds":
-    state["rounds"] = 11
+    state["collected_steps"] = 101
   else:
     state["collected_frames"] = 42
   with pytest.raises(ValueError):
@@ -466,18 +452,18 @@ def test_existing_round_zero_resumes_and_requests_live_reference(tmp_path, monke
   pilot = _pilot(tmp_path)
   checkpoint = tmp_path / "A/training.pt"
   checkpoint.parent.mkdir()
-  torch.save({"rounds": 0}, checkpoint)
+  torch.save({"collected_steps": 0}, checkpoint)
   monkeypatch.setattr(
-    module, "checkpoint_progress", lambda state, *_args: state["rounds"]
+    module, "checkpoint_progress", lambda state, *_args: state["collected_steps"]
   )
   monkeypatch.setattr(
-    EITTraining, "reconcile_output", lambda *_args, **_kwargs: {"round": 0}
+    EITTraining, "reconcile_output", lambda *_args, **_kwargs: {"collected_steps": 0}
   )
   calls = []
 
   def command(name, module, arguments):
     calls.append((name, list(map(str, arguments))))
-    if name == "train-A-to-5":
+    if name == "train-A-to-50":
       raise InterruptedError("stop after inspecting first training command")
 
   pilot.command = command
@@ -498,19 +484,19 @@ def test_completed_legacy_run_without_live_reference_is_not_relabelled(
   pilot = _pilot(tmp_path)
   checkpoint = tmp_path / "A/training.pt"
   checkpoint.parent.mkdir()
-  torch.save({"rounds": 10}, checkpoint)
+  torch.save({"collected_steps": 100}, checkpoint)
   monkeypatch.setattr(
-    module, "checkpoint_progress", lambda state, *_args: state["rounds"]
+    module, "checkpoint_progress", lambda state, *_args: state["collected_steps"]
   )
   monkeypatch.setattr(
-    EITTraining, "reconcile_output", lambda *_args, **_kwargs: {"round": 10}
+    EITTraining, "reconcile_output", lambda *_args, **_kwargs: {"collected_steps": 100}
   )
   calls = []
   pilot.command = lambda name, *_args: calls.append(name)
   with pytest.raises(ValueError, match="cannot be reconstructed"):
     pilot.train()
   assert calls == ["initialization"]
-  assert torch.load(checkpoint, weights_only=True)["rounds"] == 10
+  assert torch.load(checkpoint, weights_only=True)["collected_steps"] == 100
 
 
 @pytest.mark.parametrize("component", ["process", "fixed_record_posterior", "critic"])
