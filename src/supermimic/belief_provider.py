@@ -203,10 +203,11 @@ class BeliefProvider:
         or previous_action.dtype != measurement.dtype
       ):
         raise ValueError("Previous action must match measurement dtype and device")
-      keep = ~reset_mask
       version = self.model_version
       model_write_generation = self.estimator.dynamics.write_generation
       slots = torch.arange(batch, device=measurement.device)
+      reset_ids = reset_mask.nonzero().flatten()
+      live_ids = (~reset_mask).nonzero().flatten() if len(reset_ids) else slots
       if self.state is None or self.state.time_index.shape != (batch,):
         next_episode = slots
         next_time = torch.zeros_like(slots)
@@ -218,15 +219,19 @@ class BeliefProvider:
       self._check_index(episode_id, batch, measurement.device)
       self._check_index(time_index, batch, measurement.device)
       if not torch.equal(time_index, next_time) or not torch.equal(
-        episode_id[keep], next_episode[keep]
+        episode_id[live_ids], next_episode[live_ids]
       ):
         raise ValueError(
           "Requested frame does not follow the committed episode/time_index"
         )
-      if self.state is not None and self.state.episode_id.shape == (batch,):
-        if (episode_id[reset_mask] == self.state.episode_id[reset_mask]).any():
+      if (
+        len(reset_ids)
+        and self.state is not None
+        and self.state.episode_id.shape == (batch,)
+      ):
+        if (episode_id[reset_ids] == self.state.episode_id[reset_ids]).any():
           raise ValueError("Episode reset requires a new episode_id")
-      if keep.any():
+      if len(live_ids):
         if self.state is None or self.state.time.shape != (batch,):
           raise ValueError("Non-reset slots require a matching initialized provider")
         if self.state.model_version != version and (
@@ -235,7 +240,7 @@ class BeliefProvider:
           raise ValueError(
             "Model/normalization version changed; restore a rebuilt belief"
           )
-        if not torch.equal(context[keep], self.state.context[keep]):
+        if not torch.equal(context[live_ids], self.state.context[live_ids]):
           raise ValueError(
             "Context changed for live slots; reset or restore explicitly"
           )
@@ -243,10 +248,10 @@ class BeliefProvider:
       head_priors = None
       pieces = []
       diagnostics = []
-      if reset_mask.any():
+      if len(reset_ids):
         if self.prior_factory is None:
           raise ValueError("New episodes require an explicit prior_factory")
-        ids = reset_mask.nonzero().flatten()
+        ids = reset_ids
         episodes = episode_id[ids]
         cached = self._pending_prior
         if (
@@ -275,29 +280,41 @@ class BeliefProvider:
         )
         pieces.append((ids, corrected))
         diagnostics.append((ids, diagnostic))
-      if keep.any():
-        ids = keep.nonzero().flatten()
+      if len(live_ids):
+        ids = live_ids
         old = self._belief(self.state.belief.index(ids))
-        predicted = self.estimator.predict(old, previous_action[ids], context[ids])
-        corrected, diagnostic = self.estimator.correct(
-          predicted, measurement[ids], return_diagnostics=True
+        corrected, diagnostic = self.estimator.predict_correct(
+          old,
+          previous_action[ids],
+          context[ids],
+          measurement[ids],
+          return_diagnostics=True,
         )
         pieces.append((ids, corrected))
         diagnostics.append((ids, diagnostic))
 
-      # index_copy is differentiable and preserves both partial-reset graphs.
-      fields = {}
-      for name in _FIELDS:
-        exemplar = getattr(pieces[0][1].mean, name)
-        value = exemplar.new_zeros((batch, *exemplar.shape[1:]))
+      if len(pieces) == 1:
+        # All slots are in row order and belong to the same filter batch.
+        belief = pieces[0][1]
+      else:
+        # index_copy is differentiable and preserves both partial-reset graphs.
+        fields = {}
+        for name in _FIELDS:
+          exemplar = getattr(pieces[0][1].mean, name)
+          value = exemplar.new_zeros((batch, *exemplar.shape[1:]))
+          for ids, piece in pieces:
+            value = value.index_copy(0, ids, getattr(piece.mean, name))
+          fields[name] = value
+        covariance = measurement.new_zeros(batch, 70, 70)
         for ids, piece in pieces:
-          value = value.index_copy(0, ids, getattr(piece.mean, name))
-        fields[name] = value
-      covariance = measurement.new_zeros(batch, 70, 70)
-      for ids, piece in pieces:
-        covariance = covariance.index_copy(0, ids, piece.covariance)
-      belief = BeliefState(LieState(**fields), covariance)
-      belief.validate()
+          covariance = covariance.index_copy(0, ids, piece.covariance)
+        belief = BeliefState(LieState(**fields), covariance)
+      # correct() validated every output row. Gathering those rows changes no
+      # values. The general belief contract can be stricter for float64 or a
+      # loose user-configured filter. Its eigenvalue threshold scales by >= 1.
+      config = self.estimator.config
+      if config.covariance_atol + config.covariance_rtol > belief.covariance_rtol:
+        belief.validate()
       if not track_grad:
         belief, context = belief.detach(), context.detach()
       summary = {

@@ -34,7 +34,7 @@ from supermimic.estimator_inputs import (
   EpisodeAlignment,
   PosteriorInput,
   PosteriorProvider,
-  build_actor_features,
+  build_actor_critic_goals,
   sample_proprio,
 )
 from supermimic.motion_loader import motion_content_digest, motion_tensor_versions
@@ -220,6 +220,10 @@ class WorldModelEnv(ABC):
 
   def _build_task_goals(self) -> None:  # noqa: B027
     """Build extra per-task goal tensors after a goal update. Default: none."""
+
+  def _observations_with_critic(self, history, critic) -> TensorDict:
+    """Adapters can reuse the critic features validated before frame commit."""
+    return self.get_observations()
 
   # ------------------------------------------------------------------
   # Template methods
@@ -905,10 +909,11 @@ class WorldModelEnv(ABC):
     finished = reference_finished
     if finished is None:
       finished = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+    critic = None
     if self.eit_critic:
       if candidate is None:
         raise ValueError("Full critic reset requires a complete keyed belief")
-      self._build_eit_critic(
+      critic = self._build_eit_critic(
         aux,
         rep,
         goals.critic,
@@ -932,6 +937,8 @@ class WorldModelEnv(ABC):
     self._commit_estimator_goals(goals)
     self._pending_belief_step = None
     self._reference_finished = finished
+    if critic is not None:
+      return self._observations_with_critic(self._sensor_history(), critic)
     return self.get_observations()
 
   def _step_belief_inputs(self, actions, process_noise, measurement_noise):
@@ -1046,11 +1053,13 @@ class WorldModelEnv(ABC):
       posterior,
     )
     finished = self.motion_times >= self._last_reference_frame(self.motion_times)
+    past = self._past_sensors
+    if self.history_length > 1:
+      past = torch.cat((past[:, 1:], self._latest_sensor.unsqueeze(1)), dim=1)
+    frame_features = None
     if self.eit_critic:
-      history = torch.cat(
-        (self._sensor_history()[:, 1:], pending["sensor"].unsqueeze(1)), dim=1
-      )
-      self._build_eit_critic(
+      history = torch.cat((past, pending["sensor"].unsqueeze(1)), dim=1)
+      critic = self._build_eit_critic(
         pending["aux"],
         pending["rep"],
         goals.critic,
@@ -1060,11 +1069,9 @@ class WorldModelEnv(ABC):
         candidate.state.belief,
         finished,
       )
+      frame_features = (history, critic)
     self._commit_belief_frame(candidate)
-    if self.history_length > 1:
-      self._past_sensors = torch.cat(
-        [self._past_sensors[:, 1:], self._latest_sensor.unsqueeze(1)], dim=1
-      )
+    self._past_sensors = past
     self.aux_state, self.rep_state = pending["aux"], pending["rep"]
     self.joint_state, self.last_actions = pending["joints"], pending["actions"]
     if self.eit_critic:
@@ -1072,7 +1079,12 @@ class WorldModelEnv(ABC):
     self.motion_times, self._latest_sensor = pending["times"], pending["sensor"]
     self._commit_estimator_goals(goals)
     self._pending_belief_step = None
-    return self.get_observations(), pending["rewards"], pending["term_prob"], {}
+    obs = (
+      self._observations_with_critic(*frame_features)
+      if frame_features is not None
+      else self.get_observations()
+    )
+    return obs, pending["rewards"], pending["term_prob"], {}
 
   def _step_estimator_inputs(
     self, actions: torch.Tensor, posterior: PosteriorInput | None
@@ -1184,14 +1196,14 @@ class WorldModelEnv(ABC):
       return latest
     return torch.cat([self._past_sensors, latest], dim=1)
 
-  def _critic_obs(self) -> torch.Tensor:
+  def _critic_obs(self, history: torch.Tensor | None = None) -> torch.Tensor:
     """The privileged critic input — full WM state, not the actor's sensor obs."""
     if self.eit_critic:
       return self._build_eit_critic(
         self.aux_state,
         self.rep_state,
         self._wm_goal_obs,
-        self._sensor_history(),
+        self._sensor_history() if history is None else history,
         self.sim_ctx,
         self.motion_times,
         self.posterior_provider.state.belief,
@@ -1342,13 +1354,12 @@ class WorldModelEnv(ABC):
     alignment: EpisodeAlignment,
     posterior: PosteriorInput | None,
   ) -> _EstimatorGoals:
+    assert self.estimator_input_config is not None
     reference = self.representation.reference_window(self.motion, times, alignment)
     truth = self.representation.true_rpv(aux, rep)
-    actor, uncertainty = build_actor_features(
+    actor, uncertainty, critic = build_actor_critic_goals(
       self.estimator_input_config, truth, posterior, reference
     )
-    # Complete B/C belief critics remain a later integration step.
-    critic, _ = build_actor_features(EITInputConfig(group="A"), truth, None, reference)
     bodies = self._aligned_reference_bodies(self.motion.body_state(times), alignment)
     return _EstimatorGoals(bodies, actor, critic, uncertainty)
 

@@ -274,11 +274,13 @@ def _validate_state(state: RpvState) -> None:
   batch = state.position.shape[0]
   if state.rotation.shape != (batch, 3, 3) or state.velocity.shape != (batch, 3):
     raise ValueError("RpvState rotation/velocity shapes must be (batch,3,3)/(batch,3)")
-  for value in (state.rotation, state.position, state.velocity):
-    if value.device != state.position.device or value.dtype != state.position.dtype:
-      raise ValueError("RpvState components must share dtype and device")
-    if not torch.isfinite(value).all():
-      raise ValueError("RpvState must contain finite values")
+  values = (state.rotation, state.position, state.velocity)
+  if any(
+    v.device != state.position.device or v.dtype != state.position.dtype for v in values
+  ):
+    raise ValueError("RpvState components must share dtype and device")
+  if not torch.stack([torch.isfinite(v).all() for v in values]).all():
+    raise ValueError("RpvState must contain finite values")
   validate_rotation(state.rotation)
 
 
@@ -291,6 +293,11 @@ def build_motion_goal(
   Joint count is generic; G1's 29 joints give 700 channels.
   """
   _validate_state(state)
+  _validate_reference(state, reference)
+  return _motion_goal(state, reference)
+
+
+def _validate_reference(state: RpvState, reference: ReferenceWindow) -> None:
   batch = state.position.shape[0]
   shape = (batch, NUM_REFERENCE_FRAMES)
   if (
@@ -304,18 +311,25 @@ def build_motion_goal(
     raise ValueError(
       "ReferenceWindow must contain ten consistent frames per environment"
     )
-  for value in (
+  values = (
     reference.joint_pos,
     reference.joint_vel,
     reference.rotation,
     reference.position,
     reference.velocity,
+  )
+  if any(
+    v.device != state.position.device or v.dtype != state.position.dtype for v in values
   ):
-    if value.dtype != state.position.dtype or value.device != state.position.device:
-      raise ValueError("Reference and state must share dtype and device")
-    if not torch.isfinite(value).all():
-      raise ValueError("ReferenceWindow must contain finite values")
+    raise ValueError("Reference and state must share dtype and device")
+  if not torch.stack([torch.isfinite(v).all() for v in values]).all():
+    raise ValueError("ReferenceWindow must contain finite values")
   validate_rotation(reference.rotation)
+
+
+def _motion_goal(
+  state: RpvState, reference: ReferenceWindow
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
   inverse = state.rotation.transpose(-1, -2)[:, None]
   position = (
     inverse @ (reference.position - state.position[:, None]).unsqueeze(-1)
@@ -335,6 +349,30 @@ def build_motion_goal(
     dim=-1,
   )
   return goal, position, velocity
+
+
+def normalization_motion_goals(
+  truth: RpvState, posterior: RpvState | None, reference: ReferenceWindow
+) -> tuple[torch.Tensor, torch.Tensor]:
+  """Actor and critic motion goals for the same recorded reference window."""
+  true_goal = build_motion_goal(truth, reference)[0]
+  if posterior is None:
+    return true_goal, true_goal
+  return _goal_with_checked_reference(posterior, reference), true_goal
+
+
+def _goal_with_checked_reference(
+  state: RpvState, reference: ReferenceWindow
+) -> torch.Tensor:
+  """Build a second goal against a reference already validated for the first."""
+  _validate_state(state)
+  if (
+    state.position.shape[0] != reference.position.shape[0]
+    or state.position.dtype != reference.position.dtype
+    or state.position.device != reference.position.device
+  ):
+    raise ValueError("Reference and state must share batch, dtype and device")
+  return _motion_goal(state, reference)[0]
 
 
 def skew(vector: torch.Tensor) -> torch.Tensor:
@@ -436,7 +474,8 @@ def build_actor_features(
   reference: ReferenceWindow,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
   state = select_actor_state(config, truth, posterior)
-  goal, position_error, velocity_error = build_motion_goal(state, reference)
+  _validate_reference(state, reference)
+  goal, position_error, velocity_error = _motion_goal(state, reference)
   if not config.uses_uncertainty:
     # Deliberately do not even validate covariance on A/B actor paths.
     return goal, None
@@ -449,3 +488,23 @@ def build_actor_features(
     covariance, std_floor=config.covariance_std_floor, scales=config.covariance_scales
   )
   return goal, encoded.flatten(1)
+
+
+def build_actor_critic_goals(
+  config: EITInputConfig,
+  truth: RpvState,
+  posterior: PosteriorInput | None,
+  reference: ReferenceWindow,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+  """Build both goals against one reference, using privilege only for the critic
+  and actors configured for true-state input.
+  """
+  actor, uncertainty = build_actor_features(config, truth, posterior, reference)
+  # Actor observations can be handed to a caller separately from the stored
+  # privileged goal. Preserve independent storage even when values agree.
+  critic = (
+    _goal_with_checked_reference(truth, reference)
+    if config.uses_posterior
+    else actor.clone()
+  )
+  return actor, uncertainty, critic

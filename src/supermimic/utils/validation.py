@@ -45,25 +45,31 @@ def check_covariance(
     or not matrix.is_floating_point()
   ):
     raise ValueError(f"{name} must be a square floating-point matrix")
-  if not torch.isfinite(matrix).all():
-    raise ValueError(f"{name} contains non-finite values")
   variance = matrix.diagonal(dim1=-2, dim2=-1)
-  if (variance < 0).any():
-    raise ValueError(
-      f"{name} must be positive semidefinite (negative marginal variance)"
-    )
   # A deterministic coordinate has zero covariance with every coordinate.
   zero = variance == 0
-  if ((zero.unsqueeze(-1) | zero.unsqueeze(-2)) & (matrix != 0)).any():
-    raise ValueError(
-      f"{name} must be positive semidefinite (nonzero deterministic row)"
-    )
   std = torch.where(zero, 1.0, variance.double()).sqrt()
   correlation = matrix.double() / std.unsqueeze(-1) / std.unsqueeze(-2)
-  if ((correlation - correlation.mT).abs() > atol + rtol).any():
-    raise ValueError(f"{name} is asymmetric")
-  if (correlation.abs() > 1 + atol + rtol).any():
-    raise ValueError(f"{name} must be positive semidefinite (correlation exceeds one)")
+  # Inspect the preconditions together before passing a matrix to the solver.
+  # The success path needs just one host decision for all five predicates.
+  invalid = torch.stack(
+    (
+      ~torch.isfinite(matrix).all(),
+      (variance < 0).any(),
+      ((zero.unsqueeze(-1) | zero.unsqueeze(-2)) & (matrix != 0)).any(),
+      ((correlation - correlation.mT).abs() > atol + rtol).any(),
+      (correlation.abs() > 1 + atol + rtol).any(),
+    )
+  )
+  if invalid.any():
+    reasons = (
+      "contains non-finite values",
+      "must be positive semidefinite (negative marginal variance)",
+      "must be positive semidefinite (nonzero deterministic row)",
+      "is asymmetric",
+      "must be positive semidefinite (correlation exceeds one)",
+    )
+    raise ValueError(f"{name} {reasons[invalid.tolist().index(True)]}")
   eig = torch.linalg.eigvalsh((correlation + correlation.mT) * 0.5)
   if (eig[..., 0] < -(atol + rtol * eig[..., -1].clamp_min(1))).any():
     raise ValueError(f"{name} must be positive semidefinite")

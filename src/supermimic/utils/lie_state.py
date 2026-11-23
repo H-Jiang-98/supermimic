@@ -230,7 +230,17 @@ class LieState:
   def validate(self) -> None:
     """Validate an API boundary, outside jacrev/vmap and differentiable kernels."""
     batch = self.position.shape[:-1]
-    for f in fields(self):
+    state_fields = fields(self)
+    finite = []
+
+    def check_values():
+      if finite:
+        flags = torch.stack(finite)
+        if not flags.all():
+          name = state_fields[flags.tolist().index(False)].name
+          raise ValueError(f"LieState {name} must be finite")
+
+    for f in state_fields:
       value = getattr(self, f.name)
       tail = (
         (3, 3)
@@ -238,11 +248,13 @@ class LieState:
         else ((NUM_JOINTS,) if f.name in ("joint_pos", "joint_vel") else (3,))
       )
       if value.shape != (*batch, *tail) or not value.is_floating_point():
+        check_values()
         raise ValueError(f"Invalid {f.name} shape or dtype in LieState")
       if value.device != self.position.device or value.dtype != self.position.dtype:
+        check_values()
         raise ValueError("All LieState fields must have identical device and dtype")
-      if not torch.isfinite(value.detach()).all():
-        raise ValueError(f"LieState {f.name} must be finite")
+      finite.append(torch.isfinite(value.detach()).all())
+    check_values()
     validate_rotation(self.rotation)
 
 

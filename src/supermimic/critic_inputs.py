@@ -104,6 +104,21 @@ def encode_rpv_covariance(
   return features
 
 
+def critic_state_features(truth: LieState) -> torch.Tensor:
+  """The critic's 68 privileged state channels, also used by its normalizer."""
+  return torch.cat(
+    (
+      truth.position[..., 2:3],
+      -truth.rotation[..., 2, :],
+      (truth.rotation.mT @ truth.velocity.unsqueeze(-1)).squeeze(-1),
+      truth.omega,
+      truth.joint_pos,
+      truth.joint_vel,
+    ),
+    -1,
+  )
+
+
 def build_critic_features(
   truth: LieState,
   true_goal: torch.Tensor,
@@ -144,20 +159,8 @@ def build_critic_features(
       raise ValueError(f"Invalid critic {name} shape, dtype, device or values")
   if (remaining_time < 0).any():
     raise ValueError("Critic remaining_time must be nonnegative")
-  inverse = truth.rotation.mT
-  rep = torch.cat(
-    (
-      truth.position[..., 2:3],
-      -truth.rotation[..., 2, :],
-      (inverse @ truth.velocity.unsqueeze(-1)).squeeze(-1),
-      truth.omega,
-      truth.joint_pos,
-      truth.joint_vel,
-    ),
-    -1,
-  )
   pieces = [
-    rep,
+    critic_state_features(truth),
     true_goal,
     history.flatten(-2),
     remaining_time / cfg.remaining_time_scale,
@@ -174,6 +177,7 @@ def build_critic_features(
       or mean.position.device != truth.position.device
     ):
       raise ValueError("Critic belief must match truth batch, dtype and device")
+    inverse = truth.rotation.mT
     rotation = inverse @ mean.rotation
     mean_features = torch.cat(
       (

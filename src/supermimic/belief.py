@@ -65,6 +65,10 @@ class BeliefState:
       self.covariance[..., :9, :9],
     )
 
+  @property
+  def covariance_rtol(self) -> float:
+    return 128 * torch.finfo(self.covariance.dtype).eps
+
   def validate(self) -> None:
     """Check a boundary without modifying covariance or its computation graph."""
     if self.state_layout_version != STATE_LAYOUT_VERSION:
@@ -83,9 +87,7 @@ class BeliefState:
       raise ValueError(
         "Belief mean and covariance must have identical device and dtype"
       )
-    check_covariance(
-      covariance, "Belief covariance", rtol=128 * torch.finfo(covariance.dtype).eps
-    )
+    check_covariance(covariance, "Belief covariance", rtol=self.covariance_rtol)
 
 
 def to_actor_input(belief: BeliefState) -> PosteriorInput:

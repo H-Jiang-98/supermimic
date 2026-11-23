@@ -38,8 +38,8 @@ class FilterConfig:
 
   First try the unmodified covariance, then at most ``jitter_attempts``
   geometrically increasing values, never exceeding ``jitter_max``. Decisions
-  are made on detached matrices; the successful factorization retains its
-  full gradient. Jitter is explicitly reported, never silently accumulated.
+  use integer factorization status codes. The successful factorization retains
+  its full gradient. Jitter is explicitly reported, never silently accumulated.
   """
 
   jitter_initial: float = 1e-8
@@ -125,43 +125,31 @@ def _validate_covariance(matrix: torch.Tensor, config: FilterConfig, name: str) 
 
 def _cholesky(
   matrix: torch.Tensor,
+  std: torch.Tensor,
   config: FilterConfig,
-  name: str,
-  *,
-  std: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-  """Factor in the requested coordinates, adding jitter in physical units."""
-  _validate_covariance(matrix, config, name)
+  """Factor rows of the already validated innovation, retaining the successful graph."""
   matrix = _symmetric(matrix)
-  eye = torch.eye(matrix.shape[-1], device=matrix.device, dtype=matrix.dtype)
-
-  def coordinates(candidate):
-    return _standardized(candidate, std) if std is not None else candidate
-
-  def unresolved(candidate):
-    _, info = torch.linalg.cholesky_ex(coordinates(candidate))
-    return info != 0
-
-  with torch.no_grad():
-    jitter = matrix.new_zeros(matrix.shape[:-2])
-    attempts = torch.ones(matrix.shape[:-2], device=matrix.device, dtype=torch.long)
-    failed = unresolved(matrix.detach())
-    for attempt in range(config.jitter_attempts):
-      if not bool(failed.any()):
-        break
-      amount = min(
-        config.jitter_initial * config.jitter_multiplier**attempt,
-        config.jitter_max,
-      )
-      jitter = torch.where(failed, jitter.new_tensor(amount), jitter)
-      attempts = attempts + failed.to(attempts.dtype)
-      failed = unresolved(matrix.detach() + jitter[..., None, None] * eye)
-    if bool(failed.any()):
-      raise ValueError(
-        f"{name} is not positive definite after bounded jitter "
-        f"(maximum {config.jitter_max:g}, retries {config.jitter_attempts})"
-      )
-  factor = torch.linalg.cholesky(coordinates(matrix + jitter[..., None, None] * eye))
+  jitter = matrix.new_zeros(matrix.shape[:-2])
+  attempts = torch.ones_like(jitter, dtype=torch.long)
+  factor, info = torch.linalg.cholesky_ex(_standardized(matrix, std))
+  for retry in range(config.jitter_attempts):
+    failed = info != 0
+    if not failed.any():
+      return factor, jitter, attempts
+    amount = min(
+      config.jitter_initial * config.jitter_multiplier**retry, config.jitter_max
+    )
+    jitter = torch.where(failed, jitter.new_tensor(amount), jitter)
+    attempts = attempts + failed.to(attempts.dtype)
+    eye = torch.eye(matrix.shape[-1], device=matrix.device, dtype=matrix.dtype)
+    candidate = matrix + jitter[..., None, None] * eye
+    factor, info = torch.linalg.cholesky_ex(_standardized(candidate, std))
+  if (info != 0).any():
+    raise ValueError(
+      "innovation covariance is not positive definite after bounded jitter "
+      f"(maximum {config.jitter_max:g}, retries {config.jitter_attempts})"
+    )
   return factor, jitter, attempts
 
 
@@ -185,22 +173,23 @@ def _innovation_gain(cross, covariance, config):
   full = rank.reshape(-1) == size
   matrices = covariance.reshape(-1, size, size)
   rhs = (cross / std.unsqueeze(-2)).reshape(-1, cross.shape[-2], size)
-  gain = torch.zeros_like(rhs)
-  jitter = matrices.new_zeros(len(matrices))
-  attempts = torch.zeros_like(full, dtype=torch.long)
-  if full.any():
-    factor, added, count = _cholesky(
-      matrices[full], config, "innovation covariance", std=std.reshape(-1, size)[full]
-    )
-    gain[full] = torch.cholesky_solve(rhs[full].mT, factor).mT
-    jitter[full], attempts[full] = added, count
-  if (~full).any():
+  if full.all():
+    factor, jitter, attempts = _cholesky(matrices, std.reshape(-1, size), config)
+    gain = torch.cholesky_solve(rhs.mT, factor).mT
+  else:
+    # Mixed ranks require independent solves for the observable subspaces.
+    gain = torch.zeros_like(rhs)
+    jitter = matrices.new_zeros(len(matrices))
+    attempts = torch.zeros_like(full, dtype=torch.long)
+    if full.any():
+      factor, added, count = _cholesky(
+        matrices[full], std.reshape(-1, size)[full], config
+      )
+      gain[full] = torch.cholesky_solve(rhs[full].mT, factor).mT
+      jitter[full], attempts[full] = added, count
     rtol = size * torch.finfo(covariance.dtype).eps
     observable_inverse = torch.linalg.pinv(
-      standardized.reshape(-1, size, size)[~full],
-      hermitian=True,
-      atol=rtol,
-      rtol=rtol,
+      standardized.reshape(-1, size, size)[~full], hermitian=True, atol=rtol, rtol=rtol
     )
     gain[~full] = rhs[~full] @ observable_inverse
   return (
@@ -367,6 +356,28 @@ class LieBeliefFilter:
     *,
     return_diagnostics: bool = False,
   ) -> BeliefState | tuple[BeliefState, PredictionDiagnostics]:
+    result, jacobian, process = self._prediction(belief, action, context)
+    self._validate_belief(result)
+    if return_diagnostics:
+      return result, PredictionDiagnostics(jacobian, process)
+    return result
+
+  def predict_correct(
+    self,
+    belief: BeliefState,
+    action: torch.Tensor,
+    context: torch.Tensor,
+    measurement: torch.Tensor,
+    *,
+    return_diagnostics: bool = False,
+  ) -> BeliefState | tuple[BeliefState, CorrectionDiagnostics]:
+    """Advance a live frame; correct validates this fresh prediction exactly once."""
+    predicted = self._prediction(belief, action, context)[0]
+    return self.correct(predicted, measurement, return_diagnostics=return_diagnostics)
+
+  def _prediction(
+    self, belief: BeliefState, action: torch.Tensor, context: torch.Tensor
+  ) -> tuple[BeliefState, torch.Tensor, torch.Tensor]:
     self._validate_belief(belief)
     batch_shape = belief.mean.position.shape[:-1]
     if action.shape != (*batch_shape, 29):
@@ -381,11 +392,7 @@ class LieBeliefFilter:
     covariance = _symmetric(
       jacobian @ belief.covariance @ jacobian.transpose(-1, -2) + process
     )
-    result = BeliefState(nominal, covariance)
-    self._validate_belief(result)
-    if return_diagnostics:
-      return result, PredictionDiagnostics(jacobian, process)
-    return result
+    return BeliefState(nominal, covariance), jacobian, process
 
   def correct(
     self,

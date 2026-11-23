@@ -12,18 +12,26 @@ import json
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
+from tensordict import TensorDict
 
-from supermimic.critic_inputs import BeliefCritic
+from supermimic.critic_inputs import BeliefCritic, critic_state_features
 from supermimic.envs.world_model_env import BeliefRolloutStart
+from supermimic.estimator_inputs import (
+  EpisodeAlignment,
+  RpvState,
+  normalization_motion_goals,
+)
 from supermimic.learners.belief_policy_learner import (
   BeliefActorCriticPolicyLearner,
   BeliefPolicyLearnerCfg,
   policy_metrics_for_json,
 )
-from supermimic.posterior_replay import POSTERIOR_REPLAY_VERSION
+from supermimic.models import _CudaGraphNormalization
+from supermimic.posterior_replay import POSTERIOR_REPLAY_VERSION, unpack_mean
+from supermimic.representations import GenCoordRepresentation
 from supermimic.runners.belief_training import (
   BeliefModelTraining,
   BeliefTrainingCfg,
@@ -41,7 +49,9 @@ from supermimic.runners.supermimic_runner import (
   build_actor,
   load_actor_checkpoint,
 )
+from supermimic.utils.lie_state import LieState
 from supermimic.utils.profiling import StreamTimer
+from supermimic.utils.validation import validate_rotation
 
 if TYPE_CHECKING:
   from supermimic.utils.eit_wandb import EITOfflineWandb
@@ -194,36 +204,76 @@ class EITTraining(BeliefModelTraining):
     if not count:
       return starts
 
-    # Stage statistics so an invalid later chunk cannot partially update live models.
-    candidate_actor = deepcopy(self.actor)
-    candidate_critic = deepcopy(self.policy.critic)
-    candidate_actor.train()
-    candidate_critic.train()
+    replay.finish_collection_round()
+    inputs = env.estimator_input_config
+    assert inputs is not None
+    live = (
+      self.actor.obs_normalizer,
+      cast(_CudaGraphNormalization, self.actor.goal_normalizers["motion"]),
+      *cast(BeliefCritic, self.policy.critic).normalizers(),
+    )
+    staged = deepcopy(live)
+    for module in staged:
+      module.train()
+    storage = replay._storage.select(
+      "state", "actor_obs", "motion_time", "alignment_rotation", "alignment_translation"
+    )
     batch_size = self.cfg.normalization_batch_size
-    batches = env.iter_cached_policy_starts(fresh_locations, batch_size=batch_size)
     try:
-      for _ in range(0, count, batch_size):
+      for offset in range(0, count, batch_size):
+        selection = slice(offset, offset + batch_size)
+        rows, slots, pslots = (index[selection] for index in fresh_locations)
         with timer.measure("posterior_cache_read_seconds"):
-          chunk = next(batches)
-        obs = env.reset_prepared(chunk)
-        candidate_actor.update_normalization(obs)
-        candidate_critic.update_normalization(obs["critic"])
-      for module in (candidate_actor.obs_normalizer, candidate_actor.goal_normalizers):
-        if not all(torch.isfinite(t).all() for t in module.buffers()):
-          raise ValueError("Non-finite actor normalization statistics")
-      self.actor.obs_normalizer.load_state_dict(
-        candidate_actor.obs_normalizer.state_dict()
-      )
-      self.actor.goal_normalizers.load_state_dict(
-        candidate_actor.goal_normalizers.state_dict()
-      )
-      # Critic candidates differ only in their explicit normalizer buffers.
-      self.policy.critic.load_checkpoint(candidate_critic.checkpoint())
+          batch = cast(TensorDict, storage[rows, slots])
+          posterior = None
+          if inputs.uses_posterior:
+            mean = unpack_mean(cache.storage["posterior_mean"][rows, pslots]).to(
+              dtype=batch["state"].dtype
+            )
+            posterior = RpvState(mean.rotation, mean.position, mean.velocity)
+        values = self._normalization_inputs(batch, posterior)
+        for module, value in zip(staged, values, strict=True):
+          module.update(value)
+      if not torch.stack(
+        [value.isfinite().all() for module in staged for value in module.buffers()]
+      ).all():
+        raise ValueError("Non-finite actor or critic normalization statistics")
+      for destination, source in zip(live, staged, strict=True):
+        destination.load_state_dict(source.state_dict())
       return starts
     finally:
       env.clear_rollout()
       self.actor.eval()
       self.policy.critic.eval()
+
+  def _normalization_inputs(self, batch, posterior):
+    """Construct the five fitted channels in actor/critic normalizer order."""
+    env = self.runner.wm_env
+    representation, motion = (
+      cast(GenCoordRepresentation, env.representation),
+      env.motion,
+    )
+    times = batch["motion_time"]
+    if ((times < 0) | (times >= motion.motion_ends[-1])).any():
+      raise ValueError("Invalid normalization reference frame")
+    state, sensor = batch["state"], batch["actor_obs"]
+    alignment = EpisodeAlignment(
+      batch["alignment_rotation"], batch["alignment_translation"]
+    )
+    validate_rotation(alignment.rotation)
+    if not torch.stack(
+      [v.isfinite().all() for v in (state, sensor, alignment.translation)]
+    ).all():
+      raise ValueError("Non-finite replay input to actor/critic normalization")
+    reference = representation.reference_window(motion, times, alignment)
+    aux = representation.extract_aux_state(state)
+    rep = representation.represent(state)
+    actor_goal, critic_goal = normalization_motion_goals(
+      representation.true_rpv(aux, rep), posterior, reference
+    )
+    critic_state = critic_state_features(LieState.from_rep(aux, rep))
+    # Both history normalizers count only the latest physical measurement.
+    return sensor, actor_goal, critic_state, critic_goal, sensor
 
   def policy_episode_ids(self) -> list[int]:
     """Include every retained training episode, even a single-frame fragment."""

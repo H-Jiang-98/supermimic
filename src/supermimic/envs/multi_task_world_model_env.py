@@ -75,9 +75,13 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
 
   def get_observations(self) -> TensorDict:
     self._check_belief_frame()
-    obs = build_actor_obs_td(
-      self._task_goal_obs, self._sensor_history(), critic=self._critic_obs()
+    history = self._sensor_history()
+    return self._observations_with_critic(history, self._critic_obs(history))
+
+  def _observations_with_critic(self, history, critic) -> TensorDict:
+    return build_actor_obs_td(
+      self._task_goal_obs,
+      history,
+      critic=critic,
+      task_uncertainty=self._task_uncertainty,
     )
-    if self._task_uncertainty is not None:
-      obs["task_uncertainty"] = self._task_uncertainty
-    return obs
