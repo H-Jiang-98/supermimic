@@ -3,20 +3,20 @@
 [paths]
 environment_root = "/mnt/cpfs/zbl-cpfs-new/USERS/leojiang/supermimic_ws" # 使用 .venv/bin/python
 dataset_root = "/mnt/cpfs/zbl-cpfs-new/dataset/leojiang/supermimic_ws"
-motion_file = "motions/walk1_subject1.npz" # 相对 dataset_root，也可用 "motions/*.npz"
+motion_file = "motions/*.npz" # 相对 dataset_root，也可用 "motions/*.npz"
 checkpoint_root = "/mnt/cpfs/zbl-cpfs-new/CKPT/leojiang/supermimic_ws"
-experiment = "eit_v5_walk" # 输出：checkpoint_root/experiment/seed<seed>/<方法>/
+experiment = "eit_v5_Lafan_compiled_plc_micb_512" # 输出：checkpoint_root/experiment/seed<seed>/<方法>/
 
 [training]
 eager = false # CUDA 默认编译训练热点，true 用于 eager 对照。
-num_envs = 1024
-max_iterations = 1_000_000 # 每个环境的累计物理步数
+num_envs = 2048
+max_iterations = 300_000 # 每个环境的累计物理步数
 buffer_size = 1000
 replay_ratio = 16
 sampling_mode = "return"
 log_interval = 10
 save_interval = 1000
-posterior_save_stride = 1
+posterior_save_stride = 2
 
 mean_lr = 2e-4
 mean_updates = 10
@@ -31,17 +31,17 @@ policy_lr = 2e-4
 critic_lr = 2e-4
 policy_updates = 1
 policy_batch_size = 4096
-policy_microbatch_size = 16
+policy_microbatch_size = 512
 policy_horizon = 32
 samples = 1
 critic_epochs = 5
 critic_minibatches = 4
 # critic_microbatch_size = 128
-exploration = 0.1
+exploration = 0.0 # std of action noise
 hidden_dims = [2048, 2048, 2048]
 actor_hidden_dims = [2048, 1024, 512, 256]
 critic_hidden_dims = [256, 128]
-jacobian_batch_chunk_size = 32
+jacobian_batch_chunk_size = 512
 
 [env.sim.mujoco]
 iterations = 20 # 当前任务默认：10； 约束求解器的外层迭代上限。
@@ -49,14 +49,18 @@ ls_iterations = 50 # 当前任务默认：20；每次线搜索的迭代上限。
 
 # 使用 nvidia-smi 的物理 GPU 编号。每个方法的 seeds 按顺序轮流分给 gpus。
 # 方法可共用 GPU；每张卡同时只跑一个进程。删除整个方法表即可跳过该方法。
+
 [methods.A]
 gpus = [1]
-seeds = [2027, 2028, 2029, 2030, 2031]
+seeds = [2027]
+#seeds = [2027, 2028, 2029, 2030, 2031]
 
 [methods.B]
 gpus = [2]
-seeds = [2027, 2028, 2029, 2030, 2031]
+seeds = [2027]
+#seeds = [2027, 2028, 2029, 2030, 2031]
 
 [methods.C]
 gpus = [6]
-seeds = [2027, 2028, 2029, 2030, 2031]
+seeds = [2027]
+#seeds = [2027, 2028, 2029, 2030, 2031]
