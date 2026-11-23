@@ -7,12 +7,14 @@ already corrected *full* posterior; history padding is never a filter update.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, replace
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field, replace
 
 import torch
 
 from supermimic.belief import BeliefState, GaussianStatePrior
 from supermimic.estimator import LieBeliefFilter
+from supermimic.estimator_inputs import GaussianMeasurementConfig
 from supermimic.utils.lie_state import STATE_LAYOUT_VERSION, TANGENT_VERSION, LieState
 
 _FIELDS = ("rotation", "position", "velocity", "omega", "joint_pos", "joint_vel")
@@ -43,6 +45,7 @@ class PreparedBelief:
   model_version: str | int
   model_write_generation: int
   diagnostics: dict[str, torch.Tensor] | None = None
+  _validation: tuple | None = field(default=None, repr=False, compare=False)
 
   @property
   def head_priors(self):
@@ -87,6 +90,8 @@ class BeliefProvider:
     self.state: ProviderState | None = None
     self.diagnostics: dict[str, torch.Tensor] | None = None
     self._generation = 0
+    self._rollout: object | None = None
+    self._validation: tuple | None = None
     self._pending_prior: tuple[torch.Tensor, torch.Tensor, BeliefState] | None = None
 
   @property
@@ -100,6 +105,7 @@ class BeliefProvider:
     self.state = None
     self.diagnostics = None
     self._pending_prior = None
+    self._validation = None
     self._generation += 1
 
   @property
@@ -113,7 +119,24 @@ class BeliefProvider:
   def _belief(self, value: BeliefState) -> BeliefState:
     return value.clone() if self.differentiable else value.detach().clone()
 
-  def _validate_context(self, context, batch, reference):
+  def _validation_stamp(self, belief: BeliefState, generation: int) -> tuple | None:
+    if self._rollout is None:
+      return None
+    tensors = (*(getattr(belief.mean, name) for name in _FIELDS), belief.covariance)
+    if any(t.is_inference() for t in tensors):
+      return None
+    config = self.estimator.config
+    return (
+      self._rollout,
+      generation,
+      config.covariance_atol,
+      config.covariance_rtol,
+      belief.state_layout_version,
+      belief.tangent_version,
+      tuple((id(t), t._version) for t in tensors),
+    )
+
+  def _check_context_layout(self, context, batch, reference):
     model = self.estimator.dynamics
     spec = model.action_scale
     if (
@@ -122,11 +145,17 @@ class BeliefProvider:
       or context.dtype != spec.dtype
       or reference.device != spec.device
       or reference.dtype != spec.dtype
-      or not torch.isfinite(context).all()
     ):
       raise ValueError(
         "Context and belief must match model context width, dtype and device"
       )
+
+  @staticmethod
+  def _check_finite(**inputs: torch.Tensor) -> None:
+    valid = torch.stack([torch.isfinite(value).all() for value in inputs.values()])
+    if not valid.all():
+      name = tuple(inputs)[valid.tolist().index(False)]
+      raise ValueError(f"Provider {name} must be finite")
 
   @staticmethod
   def _check_index(value, batch, device):
@@ -187,22 +216,20 @@ class BeliefProvider:
         )
       if reset_mask.shape != (batch,) or reset_mask.dtype != torch.bool:
         raise ValueError("reset_mask must be a boolean batch vector")
-      if (
-        not torch.isfinite(measurement).all()
-        or not torch.isfinite(previous_action).all()
-      ):
-        raise ValueError("Provider inputs must be finite")
       if context is None:
         if self.state is None:
           raise ValueError("Initial provider call requires explicit context")
         context = self.state.context
       context = self._ordinary(context)
-      self._validate_context(context, batch, measurement)
+      self._check_context_layout(context, batch, measurement)
       if (
         previous_action.device != measurement.device
         or previous_action.dtype != measurement.dtype
       ):
         raise ValueError("Previous action must match measurement dtype and device")
+      self._check_finite(
+        measurement=measurement, previous_action=previous_action, context=context
+      )
       version = self.model_version
       model_write_generation = self.estimator.dynamics.write_generation
       slots = torch.arange(batch, device=measurement.device)
@@ -275,21 +302,46 @@ class BeliefProvider:
           prior.validate()
           self._pending_prior = (ids, episodes, prior)
         head_priors = (episodes, prior.detach())
-        corrected, diagnostic = self.estimator.correct(
-          prior, measurement[ids], return_diagnostics=True
-        )
+        if self._rollout is None:
+          corrected, diagnostic = self.estimator.correct(
+            prior, measurement[ids], return_diagnostics=True
+          )
+        else:
+          corrected, diagnostic = self.estimator._correct(
+            prior, measurement[ids], return_diagnostics=True, measurement_checked=True
+          )
         pieces.append((ids, corrected))
         diagnostics.append((ids, diagnostic))
       if len(live_ids):
         ids = live_ids
-        old = self._belief(self.state.belief.index(ids))
-        corrected, diagnostic = self.estimator.predict_correct(
-          old,
-          previous_action[ids],
-          context[ids],
-          measurement[ids],
-          return_diagnostics=True,
-        )
+        committed = self.state.belief
+        old = committed.index(ids)
+        if self._rollout is None:
+          corrected, diagnostic = self.estimator.predict_correct(
+            old,
+            previous_action[ids],
+            context[ids],
+            measurement[ids],
+            return_diagnostics=True,
+          )
+        else:
+          trusted = (
+            self._validation is not None
+            and self._validation == self._validation_stamp(committed, self._generation)
+          )
+          predicted = self.estimator._prediction(
+            old,
+            previous_action[ids],
+            context[ids],
+            belief_checked=trusted,
+            inputs_checked=True,
+          )[0]
+          corrected, diagnostic = self.estimator._correct(
+            predicted,
+            measurement[ids],
+            return_diagnostics=True,
+            measurement_checked=True,
+          )
         pieces.append((ids, corrected))
         diagnostics.append((ids, diagnostic))
 
@@ -335,6 +387,7 @@ class BeliefProvider:
         version,
         model_write_generation,
         summary,
+        self._validation_stamp(belief, self._generation + 1),
       )
 
   def prepare_restore(
@@ -368,7 +421,8 @@ class BeliefProvider:
       if belief.covariance.ndim != 3:
         raise ValueError("Provider restore requires one batch dimension")
       batch = belief.covariance.shape[0]
-      self._validate_context(context, batch, belief.covariance)
+      self._check_context_layout(context, batch, belief.covariance)
+      self._check_finite(context=context)
       if episode_id is None:
         raise ValueError("Restoring a posterior requires its episode_id")
       episode_id = episode_id.detach().clone()
@@ -413,6 +467,7 @@ class BeliefProvider:
     ):
       raise ValueError("Model changed before committing posterior")
     self.state = candidate.state
+    self._validation = candidate._validation
     self.diagnostics = candidate.diagnostics
     self._pending_prior = None
     self._generation += 1
@@ -485,9 +540,10 @@ class BeliefProvider:
       or data.get("tangent_version") != TANGENT_VERSION
     ):
       raise ValueError("Unsupported provider state/tangent layout")
+    noise = data.get("measurement_config")
     if (
       data.get("filter_config") != asdict(self.estimator.config)
-      or data.get("measurement_config") != asdict(self.estimator.measurement_config)
+      or GaussianMeasurementConfig.from_dict(noise) != self.estimator.measurement_config
       or not torch.equal(data["default_joint_pos"], self.estimator.default_joint_pos)
     ):
       raise ValueError("Provider/filter configuration mismatch")
@@ -543,3 +599,28 @@ class BeliefProvider:
 
   def load_state_dict(self, data: dict) -> None:
     self.commit(self.prepare_load_state_dict(data))
+
+
+@contextmanager
+def belief_rollout(provider):
+  """Reuse validated results within a runner-owned series of read-only posterior inputs.
+
+  The runner owns the tensors for this scope, including their backing storage.
+  Each new scope, restored state or ordinary in-place write requires revalidation.
+  """
+  if (
+    type(provider) is not BeliefProvider
+    or type(provider.estimator) is not LieBeliefFilter
+    or {"correct", "predict_correct"}.intersection(vars(provider.estimator))
+  ):
+    # Custom filtering methods own the validation of their outputs.
+    yield
+    return
+  previous = provider._rollout
+  provider._rollout = object()
+  provider._validation = None
+  try:
+    yield
+  finally:
+    provider._rollout = previous
+    provider._validation = None

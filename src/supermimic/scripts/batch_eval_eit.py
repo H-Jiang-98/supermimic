@@ -396,6 +396,7 @@ def validate_scene(scene):
   """Reject changed inputs before running a task or reusing a cached episode."""
   from supermimic.scripts.eval_eit import evaluation_env_config
 
+  GaussianMeasurementConfig.from_dict(scene["measurement_noise"])
   if file_sha256(Path(scene["path"])) != scene["sha256"]:
     raise ValueError("Raw motion file differs from frozen scenario")
   cfg = evaluation_env_config(Path(scene["path"]), scene["seed"], "full_clip")

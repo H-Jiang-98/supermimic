@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass, field, fields
+from functools import lru_cache
 from typing import Any, Literal, Protocol
 
 import torch
@@ -39,28 +40,72 @@ class GaussianMeasurementConfig:
   joint_velocity_std: float = 0.5 / math.sqrt(3.0)
 
   def __post_init__(self) -> None:
-    if any(not math.isfinite(x) or x < 0 for x in asdict(self).values()):
-      raise ValueError("Measurement standard deviations must be finite and nonnegative")
+    for name, value in asdict(self).items():
+      if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"Measurement {name} must be finite and strictly positive")
+
+  @classmethod
+  def from_dict(cls, values: object) -> GaussianMeasurementConfig:
+    if not isinstance(values, dict) or values.keys() != {
+      item.name for item in fields(cls)
+    }:
+      raise ValueError("Checkpoint measurement noise configuration is incomplete")
+    return cls(**values)
+
+  def _tensors(self, num_joints: int, *, device=None, dtype=None):
+    if num_joints <= 0:
+      raise ValueError("num_joints must be positive")
+    # Resolve implicit devices before caching, including the current CUDA index.
+    if (
+      dtype is None
+      or not isinstance(device, torch.device)
+      or (device.type != "cpu" and device.index is None)
+    ):
+      reference = torch.empty(0, device=device, dtype=dtype)
+      device, dtype = reference.device, reference.dtype
+    return _measurement_tensors(self, num_joints, device, dtype)
 
   def standard_deviations(
     self, num_joints: int, *, device=None, dtype=None
   ) -> torch.Tensor:
-    if num_joints <= 0:
-      raise ValueError("num_joints must be positive")
-    return torch.tensor(
-      [self.gravity_std] * 3
-      + [self.angular_velocity_std] * 3
-      + [self.joint_position_std] * num_joints
-      + [self.joint_velocity_std] * num_joints,
-      device=device,
-      dtype=dtype,
-    )
+    return self._tensors(num_joints, device=device, dtype=dtype)[0].clone()
 
   def covariance(self, num_joints: int, *, device=None, dtype=None) -> torch.Tensor:
     """The exact observation covariance V, excluding previous actions."""
-    return torch.diag(
-      self.standard_deviations(num_joints, device=device, dtype=dtype).square()
+    return torch.diag(self._tensors(num_joints, device=device, dtype=dtype)[1])
+
+
+@lru_cache(maxsize=32)
+@torch.inference_mode(False)
+def _measurement_tensors(
+  config: GaussianMeasurementConfig,
+  num_joints: int,
+  device: torch.device,
+  dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+  """Private constants shared by collection and autograd-enabled imagination."""
+  if not dtype.is_floating_point:
+    raise ValueError("Measurement standard deviations require a floating-point dtype")
+  # Cached constants must outlive every torch.func transform that requests them.
+  # Disabling inference mode alone still creates transform-wrapped tensors.
+  with torch._C._DisableFuncTorch():
+    std = torch.tensor(
+      [config.gravity_std] * 3
+      + [config.angular_velocity_std] * 3
+      + [config.joint_position_std] * num_joints
+      + [config.joint_velocity_std] * num_joints,
+      device=device,
+      dtype=dtype,
     )
+    variance = std.square()
+    valid = variance.isfinite() & (variance > 0)
+    if not valid.all():
+      group_valid = valid[[0, 3, 6, 6 + num_joints]].tolist()
+      name = fields(config)[group_valid.index(False)].name
+      raise ValueError(
+        f"Measurement {name} variance must be finite and positive in {dtype}"
+      )
+  return std, variance
 
 
 @dataclass(frozen=True)
@@ -123,11 +168,8 @@ class EITInputConfig:
         f"Checkpoint lacks estimator input configuration: {sorted(missing)}"
       )
     if isinstance(values.get("measurement_noise"), dict):
-      required_noise = {item.name for item in fields(GaussianMeasurementConfig)}
-      if required_noise != values["measurement_noise"].keys():
-        raise ValueError("Checkpoint measurement noise configuration is incomplete")
-      values["measurement_noise"] = GaussianMeasurementConfig(
-        **values["measurement_noise"]
+      values["measurement_noise"] = GaussianMeasurementConfig.from_dict(
+        values["measurement_noise"]
       )
     if "covariance_scales" in values:
       values["covariance_scales"] = tuple(values["covariance_scales"])
@@ -239,7 +281,7 @@ def sample_proprio(
   joints = (width - 6) // 3
   sensor_width = 6 + 2 * joints
   config = config or GaussianMeasurementConfig()
-  std = config.standard_deviations(joints, device=frame.device, dtype=frame.dtype)
+  std, _ = config._tensors(joints, device=frame.device, dtype=frame.dtype)
   noise = torch.randn(
     frame.shape[:-1] + (sensor_width,),
     device=frame.device,

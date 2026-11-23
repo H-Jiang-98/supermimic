@@ -9,7 +9,7 @@ from typing import Any, Union, get_args, get_origin, get_type_hints
 import torch
 
 from supermimic.critic_inputs import CRITIC_INPUT_VERSION, CriticInputConfig
-from supermimic.estimator_inputs import EITInputConfig
+from supermimic.estimator_inputs import EITInputConfig, GaussianMeasurementConfig
 from supermimic.runners.eit_snapshots import checkpoint_snapshot_interval
 from supermimic.runners.supermimic_runner import SuperMimicRunnerCfg
 
@@ -34,6 +34,16 @@ def validate_eit_checkpoint_contract(saved: dict, *, stage: str | None = None) -
     kind == "policy" and replay_mode != "full"
   ):
     raise ValueError(f"Invalid replay mode {replay_mode!r} for {kind} checkpoint")
+  # Batch evaluation can reuse cached results without constructing the filter.
+  for component, section, key in (
+    ("runner_config", "estimator_inputs", "measurement_noise"),
+    ("actor", "input_config", "measurement_noise"),
+    ("world_model", "estimator", "measurement_config"),
+  ):
+    bundle = saved.get(component)
+    settings = bundle.get(section) if isinstance(bundle, dict) else None
+    if isinstance(settings, dict) and isinstance(noise := settings.get(key), dict):
+      GaussianMeasurementConfig(**noise)
   if saved["version"] == EIT_POLICY_TRAINING_VERSION:
     from supermimic.posterior_replay import POSTERIOR_REPLAY_VERSION
 

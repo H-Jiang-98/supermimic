@@ -164,8 +164,10 @@ def test_three_rounds_keep_live_belief_and_filter_each_new_measurement_once(stri
 
   with (
     patch.object(loop, "_update_policy", side_effect=counted_update),
-    patch.object(estimator, "correct", wraps=estimator.correct) as correct,
-    patch.object(estimator, "predict", wraps=estimator.predict) as predict,
+    patch.object(estimator, "_correct", wraps=estimator._correct) as correct,
+    patch.object(
+      estimator, "transition_jacobian", wraps=estimator.transition_jacobian
+    ) as predict,
     patch.object(
       loop.runner._dynamics,
       "_content_digest",

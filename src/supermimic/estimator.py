@@ -109,6 +109,26 @@ def _effective_rank(standardized: torch.Tensor) -> torch.Tensor:
   return (eigenvalues > rtol * eigenvalues[..., -1:].clamp_min(1)).sum(-1)
 
 
+@torch.no_grad()
+def _certifies_full_rank(covariance, standardized, config) -> bool:
+  """Bound the spectrum of the symmetric innovation in the rank solver's units."""
+  if (
+    config.covariance_atol != FilterConfig.covariance_atol
+    or config.covariance_rtol != FilterConfig.covariance_rtol
+  ):
+    return False
+  matrix = standardized.double()
+  diagonal = matrix.diagonal(dim1=-2, dim2=-1)
+  radius = matrix.abs().sum(-1) - diagonal.abs()
+  lower = (diagonal - radius).amin(-1)
+  upper = (diagonal + radius).amax(-1)
+  # A fourfold margin keeps borderline eigenvalues on the spectral path.
+  margin = 4 * matrix.shape[-1] * torch.finfo(standardized.dtype).eps
+  valid = (covariance.diagonal(dim1=-2, dim2=-1) > 0).all()
+  # An infinite or NaN entry also makes its row fail these finite bounds.
+  return bool(valid & (lower > margin * upper.clamp_min(1)).all())
+
+
 def _validate_versions(belief: BeliefState) -> None:
   if belief.state_layout_version != STATE_LAYOUT_VERSION:
     raise ValueError("Unsupported belief state layout version")
@@ -127,12 +147,17 @@ def _cholesky(
   matrix: torch.Tensor,
   std: torch.Tensor,
   config: FilterConfig,
+  standardized: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
   """Factor rows of the already validated innovation, retaining the successful graph."""
-  matrix = _symmetric(matrix)
+  # Collection reuses the values already inspected by the rank check. In AD
+  # keep the original factorization graph and its gradient accumulation order.
+  if standardized is None or matrix.requires_grad:
+    matrix = _symmetric(matrix)
+    standardized = _standardized(matrix, std)
   jitter = matrix.new_zeros(matrix.shape[:-2])
   attempts = torch.ones_like(jitter, dtype=torch.long)
-  factor, info = torch.linalg.cholesky_ex(_standardized(matrix, std))
+  factor, info = torch.linalg.cholesky_ex(standardized)
   for retry in range(config.jitter_attempts):
     failed = info != 0
     if not failed.any():
@@ -154,42 +179,43 @@ def _cholesky(
 
 
 def _innovation_gain(cross, covariance, config):
-  """Solve in the numerically observable subspace of each innovation.
-
-  A 3D noiseless gravity observation has at most two independent directions.
-  Roundoff can produce a successful Cholesky even on that null direction.
-  """
-  _validate_covariance(covariance, config, "innovation covariance")
+  """Solve the symmetric innovation in its numerically observable subspace."""
   size = covariance.shape[-1]
   variance = covariance.diagonal(dim1=-2, dim2=-1)
-  # The three projected-gravity coordinates form one Euclidean vector. A
-  # common scale preserves its radial null direction and the tangent-plane
-  # projection for a noiseless sensor. Scale each scalar sensor separately.
+  # A common gravity scale preserves its radial and tangent directions.
   gravity = variance[..., :3].mean(-1, keepdim=True)
   variance = torch.cat((gravity.expand_as(variance[..., :3]), variance[..., 3:]), -1)
   std = torch.where(variance > 0, variance, torch.ones_like(variance)).sqrt()
   standardized = _standardized(covariance, std)
-  rank = _effective_rank(standardized)
-  full = rank.reshape(-1) == size
+  if _certifies_full_rank(covariance, standardized, config):
+    rank = std.new_full(std.shape[:-1], size, dtype=torch.int64)
+    all_full = True
+  else:
+    _validate_covariance(covariance, config, "innovation covariance")
+    rank = _effective_rank(standardized)
+    all_full = bool((rank == size).all())
   matrices = covariance.reshape(-1, size, size)
   rhs = (cross / std.unsqueeze(-2)).reshape(-1, cross.shape[-2], size)
-  if full.all():
-    factor, jitter, attempts = _cholesky(matrices, std.reshape(-1, size), config)
+  scales = std.reshape(-1, size)
+  normalized = standardized.reshape_as(matrices)
+  if all_full:
+    factor, jitter, attempts = _cholesky(matrices, scales, config, normalized)
     gain = torch.cholesky_solve(rhs.mT, factor).mT
   else:
     # Mixed ranks require independent solves for the observable subspaces.
+    full = rank.reshape(-1) == size
     gain = torch.zeros_like(rhs)
     jitter = matrices.new_zeros(len(matrices))
     attempts = torch.zeros_like(full, dtype=torch.long)
     if full.any():
       factor, added, count = _cholesky(
-        matrices[full], std.reshape(-1, size)[full], config
+        matrices[full], scales[full], config, normalized[full]
       )
       gain[full] = torch.cholesky_solve(rhs[full].mT, factor).mT
       jitter[full], attempts[full] = added, count
     rtol = size * torch.finfo(covariance.dtype).eps
     observable_inverse = torch.linalg.pinv(
-      standardized.reshape(-1, size, size)[~full], hermitian=True, atol=rtol, rtol=rtol
+      normalized[~full], hermitian=True, atol=rtol, rtol=rtol
     )
     gain[~full] = rhs[~full] @ observable_inverse
   return (
@@ -376,15 +402,24 @@ class LieBeliefFilter:
     return self.correct(predicted, measurement, return_diagnostics=return_diagnostics)
 
   def _prediction(
-    self, belief: BeliefState, action: torch.Tensor, context: torch.Tensor
+    self,
+    belief: BeliefState,
+    action: torch.Tensor,
+    context: torch.Tensor,
+    *,
+    belief_checked: bool = False,
+    inputs_checked: bool = False,
   ) -> tuple[BeliefState, torch.Tensor, torch.Tensor]:
-    self._validate_belief(belief)
+    if not belief_checked:
+      self._validate_belief(belief)
     batch_shape = belief.mean.position.shape[:-1]
     if action.shape != (*batch_shape, 29):
       raise ValueError("Action must have shape (*belief_batch, 29)")
     if context.shape[:-1] != batch_shape:
       raise ValueError("Context batch shape must match the belief")
-    if not bool(torch.isfinite(action).all() and torch.isfinite(context).all()):
+    if not inputs_checked and not bool(
+      torch.isfinite(action).all() & torch.isfinite(context).all()
+    ):
       raise ValueError("Action and context must be finite")
     nominal, factor = self.dynamics.distribution_lie(belief.mean, action, context)
     jacobian = self.transition_jacobian(belief.mean, action, context, nominal)
@@ -401,22 +436,37 @@ class LieBeliefFilter:
     *,
     return_diagnostics: bool = False,
   ) -> BeliefState | tuple[BeliefState, CorrectionDiagnostics]:
+    result, diagnostics = self._correct(
+      belief, measurement, return_diagnostics=return_diagnostics
+    )
+    return (result, diagnostics) if diagnostics is not None else result
+
+  def _correct(
+    self,
+    belief: BeliefState,
+    measurement: torch.Tensor,
+    *,
+    return_diagnostics: bool,
+    measurement_checked: bool = False,
+  ) -> tuple[BeliefState, CorrectionDiagnostics | None]:
     self._validate_belief(belief)
     predicted = self.observation(belief.mean)
     if measurement.shape != predicted.shape:
       raise ValueError("Measurement must have shape (*belief_batch, 64)")
     if measurement.device != predicted.device or measurement.dtype != predicted.dtype:
       raise ValueError("Measurement and belief must share dtype and device")
-    if not bool(torch.isfinite(measurement).all()):
+    if not measurement_checked and not bool(torch.isfinite(measurement).all()):
       raise ValueError("Measurement contains non-finite values")
     h = self.observation_jacobian(belief.mean)
     covariance = _symmetric(belief.covariance)
-    v = self.measurement_config.covariance(
+    _, variance = self.measurement_config._tensors(
       29, device=measurement.device, dtype=measurement.dtype
     )
     innovation = measurement - predicted
     cross = covariance @ h.transpose(-1, -2)
-    innovation_covariance = _symmetric(h @ cross + v)
+    innovation_covariance = h @ cross
+    innovation_covariance.diagonal(dim1=-2, dim2=-1).add_(variance)
+    innovation_covariance = _symmetric(innovation_covariance)
     gain, rank, jitter, attempts = _innovation_gain(
       cross, innovation_covariance, self.config
     )
@@ -424,28 +474,16 @@ class LieBeliefFilter:
     mean = boxplus(belief.mean, correction)
     identity = torch.eye(TANGENT_DIM, device=covariance.device, dtype=covariance.dtype)
     residual_map = identity - gain @ h
-    measurement_identity = torch.eye(64, device=v.device, dtype=v.dtype)
     # Jitter is effective measurement variance in BOTH gain and Joseph update.
-    effective_v = v + jitter[..., None, None] * measurement_identity
+    effective_v = (variance + jitter[..., None]).diag_embed()
     joseph = residual_map @ covariance @ residual_map.transpose(
       -1, -2
     ) + gain @ effective_v @ gain.transpose(-1, -2)
-    # H observes omega, q and qdot directly. When an exact scalar constraint
-    # is resolved, Joseph's squared residual leaves at most roundoff variance.
-    # Keep any variance remaining along a mode omitted by the rank cutoff.
-    exact = effective_v.diagonal(dim1=-2, dim2=-1)[..., 3:] == 0
-    prior_variance = covariance.diagonal(dim1=-2, dim2=-1)[..., 9:]
-    remaining = joseph.diagonal(dim1=-2, dim2=-1)[..., 9:].abs()
-    roundoff = h.shape[-2] * torch.finfo(covariance.dtype).eps ** 2 * prior_variance
-    resolved = exact & (remaining <= roundoff)
-    keep = torch.cat(
-      (torch.ones_like(correction[..., :9], dtype=torch.bool), ~resolved), -1
-    )
-    joseph = joseph * keep.unsqueeze(-2) * keep.unsqueeze(-1)
     reset = reset_jacobian(correction)
     result = BeliefState(mean, _symmetric(reset @ joseph @ reset.transpose(-1, -2)))
     self._validate_belief(result)
     if return_diagnostics:
+      measurement_identity = torch.eye(64, device=variance.device, dtype=variance.dtype)
       return result, CorrectionDiagnostics(
         rank,
         innovation,
@@ -457,7 +495,7 @@ class LieBeliefFilter:
         jitter,
         attempts,
       )
-    return result
+    return result, None
 
   @staticmethod
   def to_actor_input(belief: BeliefState) -> PosteriorInput:

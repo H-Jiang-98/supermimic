@@ -1,12 +1,13 @@
 """Online belief lifecycle, reset causality, transactions and restoration."""
 
 from dataclasses import fields, replace
+from unittest.mock import patch
 
 import pytest
 import torch
 
 from supermimic.belief import BeliefState
-from supermimic.belief_provider import BeliefProvider, FixedBeliefPrior
+from supermimic.belief_provider import BeliefProvider, FixedBeliefPrior, belief_rollout
 from supermimic.estimator import LieBeliefFilter
 from supermimic.estimator_inputs import GaussianMeasurementConfig
 from supermimic.utils.lie_state import LieState, local_error
@@ -126,6 +127,125 @@ def test_prepare_retry_does_not_mutate_state_or_consume_randomness():
   with pytest.raises(ValueError, match="Stale or foreign"):
     other.commit(retry)
   assert other.state is None
+
+
+def test_provider_preserves_stricter_covariance_contract_after_filter_rows_merge(
+  monkeypatch,
+):
+  provider, _, measurement, action, context = setup_provider()
+  advance(provider, measurement, action, context, [True] * 3)
+  committed = provider.state
+  estimator = provider.estimator
+  estimator.config = replace(estimator.config, covariance_rtol=1e-2)
+  correct = estimator.correct
+
+  def marginally_indefinite(*args, **kwargs):
+    posterior, diagnostics = correct(*args, **kwargs)
+    covariance = (
+      torch.eye(70, dtype=measurement.dtype).expand_as(posterior.covariance).clone()
+    )
+    covariance[..., 0, 1] = covariance[..., 1, 0] = 1.0001
+    loose = replace(posterior, covariance=covariance)
+    estimator._validate_belief(loose)
+    return loose, diagnostics
+
+  monkeypatch.setattr(estimator, "correct", marginally_indefinite)
+  with (
+    belief_rollout(provider),
+    pytest.raises(ValueError, match="positive semidefinite"),
+  ):
+    advance(provider, measurement, action, context, [False, True, False])
+  assert provider.state is committed
+
+
+def test_rollout_reuses_only_committed_results_with_current_tolerances():
+  provider, _, measurement, action, context = setup_provider()
+  live = [False] * 3
+
+  def step(resets):
+    return advance(provider, measurement, action, context, resets)
+
+  estimator = provider.estimator
+  with (
+    belief_rollout(provider),
+    patch.object(
+      estimator, "_validate_belief", wraps=estimator._validate_belief
+    ) as validate,
+  ):
+    step([True] * 3)
+    validate.reset_mock()
+    step(live)
+    assert validate.call_count == 2  # new prediction and corrected posterior
+    validate.reset_mock()
+    step([False, True, False])
+    assert validate.call_count == 4  # reset prior and posterior, plus two live checks
+    validate.reset_mock()
+    estimator.config = replace(estimator.config, covariance_rtol=2e-5)
+    step(live)
+    assert validate.call_count == 3
+    state = provider.state
+    provider.restore(
+      state.belief,
+      state.context,
+      model_version=provider.model_version,
+      episode_id=state.episode_id,
+      time_index=state.time_index,
+    )
+    validate.reset_mock()
+    step(live)
+    assert validate.call_count == 3
+  # The preceding scope's result is also external at the next rollout boundary.
+  with (
+    belief_rollout(provider),
+    patch.object(
+      estimator, "_validate_belief", wraps=estimator._validate_belief
+    ) as validate,
+  ):
+    step(live)
+    assert validate.call_count == 3
+
+
+@pytest.mark.parametrize("when", ["prepared", "committed"])
+@pytest.mark.parametrize(
+  "corrupt,error", [("covariance", "semidefinite"), ("rotation", "orthonormal")]
+)
+def test_mutating_posterior_forces_full_revalidation(when, corrupt, error):
+  provider, _, measurement, action, context = setup_provider()
+  with belief_rollout(provider):
+    candidate = provider.prepare(
+      measurement=measurement,
+      previous_action=action,
+      reset_mask=torch.ones(3, dtype=torch.bool),
+      context=context,
+    )
+    if when == "committed":
+      provider.commit(candidate)
+    belief = candidate.state.belief
+    if corrupt == "covariance":
+      belief.covariance.detach()[0, 0, 0] = -1
+    else:
+      belief.mean.rotation.detach()[0].zero_()
+    if when == "prepared":
+      provider.commit(candidate)
+    generation = provider.generation
+    with pytest.raises(ValueError, match=error):
+      advance(provider, measurement, action, context, [False] * 3)
+    assert provider.generation == generation
+
+
+@pytest.mark.parametrize("name", ["measurement", "previous_action", "context"])
+def test_provider_reports_each_nonfinite_input_before_publishing(name):
+  provider, _, measurement, action, context = setup_provider()
+  inputs = dict(
+    measurement=measurement,
+    previous_action=action,
+    context=context,
+    reset_mask=torch.ones(3, dtype=torch.bool),
+  )
+  inputs[name][0, 0] = torch.nan
+  with belief_rollout(provider), pytest.raises(ValueError, match=name):
+    provider.prepare(**inputs)
+  assert provider.state is None and provider.generation == 0
 
 
 def test_restore_continues_from_full_corrected_posterior_and_preserves_time():

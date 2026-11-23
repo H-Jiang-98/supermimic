@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, cast
 import torch
 from filelock import FileLock
 
+from supermimic.belief_provider import belief_rollout
 from supermimic.learners.two_stage_wm import TwoStageWorldModelLearner
 from supermimic.models import MultiEncoderAE
 from supermimic.motion_loader import motion_content_digest
@@ -166,7 +167,7 @@ class BeliefModelTraining:
       completed += int((flags["terminated"] | flags["truncated"]).sum())
 
     collect_start = timer.now()
-    with runner._dynamics.readonly():
+    with runner._dynamics.readonly(), belief_rollout(runner.posterior_provider):
       staged = self._collect_round_steps(steps, replay, learner, count_endings, staged)
     remaining = (steps - 1) % replay.buffer_size + 1
     count_endings(remaining)

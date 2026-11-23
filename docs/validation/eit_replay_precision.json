@@ -1,0 +1,265 @@
+{
+  "version": "eit_replay_precision_audit_v1",
+  "storage_scope": "Mean and packed covariance payload for 1024 frames. Factor cases include row scales, fallback tags and exact triangles for failed decompositions. Main replay, allocator overhead and temporary tensors are excluded.",
+  "input": "All collection and optimization used FP32. float64 measures promotion of these saved FP32 values.",
+  "gpu_source": {
+    "group": "B",
+    "device": "RTX 5090",
+    "round": 5,
+    "seed": 2026,
+    "frames": 1024,
+    "buffer_size": 128,
+    "num_envs": 8,
+    "posterior_save_stride": 1,
+    "ring_sha256": "29cbabde09444bc9308807078bc4dbceb0e74030affabd888a188af05b9cab9c",
+    "measurements": "Error, frame validation and payload size on the complete captured ring, decoded on CPU. Nonzero entries lost counts both sides of each symmetric matrix."
+  },
+  "cpu_source": {
+    "B": {
+      "checkpoint_sha256": "92a4f153558554429309579fbaa0ce0a8cd0de0ae287e9fe46eebc6c38521280",
+      "motion_sha256": "bdbd3200585aa661f5c8a76744241e342ea0d6401b8d8159495b6c64dc0c0ab7",
+      "group": "B",
+      "num_envs": 4,
+      "steps": 32,
+      "seed": 2026,
+      "retained_frames": 128,
+      "source_dtype": "torch.float32",
+      "policy_starts": 4,
+      "policy_samples_per_start": 2,
+      "policy_horizon": 4,
+      "torch_version": "2.14.0+cu130",
+      "main_replay_half_alignment_failures": {
+        "float16": 128,
+        "bfloat16": 128
+      }
+    },
+    "C": {
+      "checkpoint_sha256": "fa0a5a817c1fdfc0a55945c4eb5f1c6ee3fa70040f147853da156d31180cbd08",
+      "motion_sha256": "bdbd3200585aa661f5c8a76744241e342ea0d6401b8d8159495b6c64dc0c0ab7",
+      "group": "C",
+      "num_envs": 4,
+      "steps": 32,
+      "seed": 2026,
+      "retained_frames": 128,
+      "source_dtype": "torch.float32",
+      "policy_starts": 4,
+      "policy_samples_per_start": 2,
+      "policy_horizon": 4,
+      "torch_version": "2.14.0+cu130",
+      "main_replay_half_alignment_failures": {
+        "float16": 128,
+        "bfloat16": 128
+      }
+    }
+  },
+  "policy_probe": "Full-width saved models, physical walking data collected afresh on CPU, four common training starts with at least four remaining steps, two fixed noise trajectories each. Compare mean imagined return gradient over actor parameters to FP32 using L2 norm; row also gives maximum absolute return error. Entries absent when any sampled matrix violated the raw storage contract.",
+  "formats": {
+    "float64": {
+      "mean_cov_payload_bytes": 20979712,
+      "invalid_rotations": 0,
+      "invalid_covariances": 0,
+      "invalid_filter_covariances": 0,
+      "cov_relative_frobenius": 0.0,
+      "nonzero_cov_entries_lost": 0,
+      "mean_max_abs_error": 0.0,
+      "fp32_fallback_frames": 0,
+      "actor_gradient_relative_error_cpu_B": 0.0,
+      "max_abs_return_error_cpu_B": 0.0,
+      "actor_gradient_relative_error_cpu_C": 0.0,
+      "max_abs_return_error_cpu_C": 0.0
+    },
+    "float32": {
+      "mean_cov_payload_bytes": 10489856,
+      "invalid_rotations": 0,
+      "invalid_covariances": 0,
+      "invalid_filter_covariances": 0,
+      "cov_relative_frobenius": 0.0,
+      "nonzero_cov_entries_lost": 0,
+      "mean_max_abs_error": 0.0,
+      "fp32_fallback_frames": 0,
+      "actor_gradient_relative_error_cpu_B": 0.0,
+      "max_abs_return_error_cpu_B": 0.0,
+      "actor_gradient_relative_error_cpu_C": 0.0,
+      "max_abs_return_error_cpu_C": 0.0
+    },
+    "bfloat16": {
+      "mean_cov_payload_bytes": 5244928,
+      "invalid_rotations": 1024,
+      "invalid_covariances": 0,
+      "invalid_filter_covariances": 0,
+      "cov_relative_frobenius": 0.0017390213880882084,
+      "nonzero_cov_entries_lost": 0,
+      "mean_max_abs_error": 0.03029155731201172,
+      "fp32_fallback_frames": 0
+    },
+    "bfloat16_with_cast_repair": {
+      "mean_cov_payload_bytes": 5244928,
+      "invalid_rotations": 0,
+      "invalid_covariances": 0,
+      "invalid_filter_covariances": 0,
+      "cov_relative_frobenius": 0.0017390213880882084,
+      "nonzero_cov_entries_lost": 0,
+      "mean_max_abs_error": 0.03029155731201172,
+      "fp32_fallback_frames": 0,
+      "actor_gradient_relative_error_cpu_B": 0.00018610587820797506,
+      "max_abs_return_error_cpu_B": 2.2798776626586914e-06,
+      "actor_gradient_relative_error_cpu_C": 0.0004491037525895153,
+      "max_abs_return_error_cpu_C": 4.023313522338867e-06
+    },
+    "fp32_mean_bfloat16_cov": {
+      "mean_cov_payload_bytes": 5400576,
+      "invalid_rotations": 0,
+      "invalid_covariances": 0,
+      "invalid_filter_covariances": 0,
+      "cov_relative_frobenius": 0.0017390213880882084,
+      "nonzero_cov_entries_lost": 0,
+      "mean_max_abs_error": 0.0,
+      "fp32_fallback_frames": 0,
+      "actor_gradient_relative_error_cpu_B": 5.304016571283649e-06,
+      "max_abs_return_error_cpu_B": 8.940696716308594e-08,
+      "actor_gradient_relative_error_cpu_C": 1.2331216699071135e-05,
+      "max_abs_return_error_cpu_C": 1.7881393432617188e-07
+    },
+    "fp32_mean_bfloat16_factor": {
+      "mean_cov_payload_bytes": 5688320,
+      "invalid_rotations": 0,
+      "invalid_covariances": 0,
+      "invalid_filter_covariances": 0,
+      "cov_relative_frobenius": 0.002127006648117109,
+      "nonzero_cov_entries_lost": 0,
+      "mean_max_abs_error": 0.0,
+      "fp32_fallback_frames": 0,
+      "actor_gradient_relative_error_cpu_B": 5.606071133843042e-06,
+      "max_abs_return_error_cpu_B": 7.450580596923828e-08,
+      "actor_gradient_relative_error_cpu_C": 9.765202759131175e-06,
+      "max_abs_return_error_cpu_C": 8.940696716308594e-08
+    },
+    "float16": {
+      "mean_cov_payload_bytes": 5244928,
+      "invalid_rotations": 1024,
+      "invalid_covariances": 0,
+      "invalid_filter_covariances": 0,
+      "cov_relative_frobenius": 0.00021853640799009881,
+      "nonzero_cov_entries_lost": 245246,
+      "mean_max_abs_error": 0.0033864974975585938,
+      "fp32_fallback_frames": 0
+    },
+    "float16_with_cast_repair": {
+      "mean_cov_payload_bytes": 5244928,
+      "invalid_rotations": 0,
+      "invalid_covariances": 0,
+      "invalid_filter_covariances": 0,
+      "cov_relative_frobenius": 0.00021853640799009881,
+      "nonzero_cov_entries_lost": 245246,
+      "mean_max_abs_error": 0.0033864974975585938,
+      "fp32_fallback_frames": 0,
+      "actor_gradient_relative_error_cpu_B": 1.960463186915266e-05,
+      "max_abs_return_error_cpu_B": 3.5762786865234375e-07,
+      "actor_gradient_relative_error_cpu_C": 7.84210092600522e-05,
+      "max_abs_return_error_cpu_C": 1.2218952178955078e-06
+    },
+    "fp32_mean_float16_cov": {
+      "mean_cov_payload_bytes": 5400576,
+      "invalid_rotations": 0,
+      "invalid_covariances": 0,
+      "invalid_filter_covariances": 0,
+      "cov_relative_frobenius": 0.00021853640799009881,
+      "nonzero_cov_entries_lost": 245246,
+      "mean_max_abs_error": 0.0,
+      "fp32_fallback_frames": 0,
+      "actor_gradient_relative_error_cpu_B": 5.28852715178389e-06,
+      "max_abs_return_error_cpu_B": 2.9802322387695312e-08,
+      "actor_gradient_relative_error_cpu_C": 5.3342903857847295e-06,
+      "max_abs_return_error_cpu_C": 8.940696716308594e-08
+    },
+    "fp32_mean_float16_factor": {
+      "mean_cov_payload_bytes": 5688320,
+      "invalid_rotations": 0,
+      "invalid_covariances": 0,
+      "invalid_filter_covariances": 0,
+      "cov_relative_frobenius": 0.00026498732584854666,
+      "nonzero_cov_entries_lost": 108,
+      "mean_max_abs_error": 0.0,
+      "fp32_fallback_frames": 0,
+      "actor_gradient_relative_error_cpu_B": 7.280626663797126e-07,
+      "max_abs_return_error_cpu_B": 2.9802322387695312e-08,
+      "actor_gradient_relative_error_cpu_C": 1.918656389885816e-06,
+      "max_abs_return_error_cpu_C": 5.960464477539063e-08
+    }
+  },
+  "cpu_microbenchmark": {
+    "description": "Median pack and unpack time in ms for 8 posteriors, one CPU thread, 32 batches x 3 timed passes after an untimed pass. FP32 and repaired FP16 include mean. Scaled FP16 factor measures covariance alone. Excludes replay insertion, policy and simulation.",
+    "milliseconds": {
+      "fp32_pack_unpack": 0.14014821499586105,
+      "fp16_pack_widen_with_repair": 2.5926644448190928,
+      "fp16_scaled_factor_covariance_only": 0.296145211905241
+    }
+  },
+  "limits": [
+    "One seed, trained checkpoints and one motion; no long-run training quality measurement. GPU times measure a covariance codec microbenchmark.",
+    "Plain half casts of the full mean skip rotation reprojection; with_cast_repair uses BeliefState.to to reproject and repair at the destination precision.",
+    "Even when all measured covariances pass, raw rounding can break PSD on valid rank-deficient inputs. The committed regression constructs cases for both half formats.",
+    "Validation uses existing model tolerances. Candidate formats are confined to the diagnostic."
+  ],
+  "gpu_microbenchmark": {
+    "covariance_round_trip_ms_per_8_posteriors": {
+      "float32_tril": 0.01652432547416538,
+      "float16_tril": 0.023787626560078934,
+      "float16_scaled_factor_and_fp32_fallback": 0.3051713210879825
+    },
+    "measurement": "RTX 5090, 128 batches of 8 real FP32 posteriors, 1 warm pass + 5 timed passes; synchronized wall time. Includes only covariance encode/decode. Factor prototype also counts fallback rows; excludes mean, cache insertion and policy rollout.",
+    "implementation": "Prototype includes host synchronization to count fallback rows. These times exclude the full training loop."
+  },
+  "main_replay_casts": {
+    "scope": "Allocated main replay tensor bytes in the CPU B/C fixtures, including integer and boolean fields. Field errors cover the 128 retained frames per group. The selected-field size is calculated from tensor shapes. Downstream training with quantized main fields has not been benchmarked.",
+    "current_allocated_bytes": 560128,
+    "selected_fields": [
+      "actor_obs",
+      "action",
+      "prev_action"
+    ],
+    "allocated_bytes_if_selected_fields_are_fp16_or_bf16": 405504,
+    "max_abs_error_by_group": {
+      "B": {
+        "bfloat16": {
+          "state": 0.030565261840820312,
+          "action": 0.0038967132568359375,
+          "sim_ctx": 0.005978584289550781,
+          "prev_action": 0.0038967132568359375,
+          "actor_obs": 0.0311431884765625,
+          "alignment_rotation": 0.0017025470733642578,
+          "alignment_translation": 0.0008687973022460938
+        },
+        "float16": {
+          "state": 0.0038700103759765625,
+          "action": 0.0004812479019165039,
+          "sim_ctx": 0.0018339157104492188,
+          "prev_action": 0.0004812479019165039,
+          "actor_obs": 0.0035085678100585938,
+          "alignment_rotation": 0.0002377033233642578,
+          "alignment_translation": 0.00017189979553222656
+        }
+      },
+      "C": {
+        "bfloat16": {
+          "state": 0.03684425354003906,
+          "action": 0.003896951675415039,
+          "sim_ctx": 0.005978584289550781,
+          "prev_action": 0.003896951675415039,
+          "actor_obs": 0.040737152099609375,
+          "alignment_rotation": 0.0016623139381408691,
+          "alignment_translation": 0.003430008888244629
+        },
+        "float16": {
+          "state": 0.0055942535400390625,
+          "action": 0.0004875659942626953,
+          "sim_ctx": 0.0018339157104492188,
+          "prev_action": 0.0004875659942626953,
+          "actor_obs": 0.006137847900390625,
+          "alignment_rotation": 0.00023794174194335938,
+          "alignment_translation": 0.0004762411117553711
+        }
+      }
+    }
+  }
+}

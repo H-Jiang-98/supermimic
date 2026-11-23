@@ -37,6 +37,20 @@ def candidate(frames):
   )
 
 
+def test_zero_noise_rejected_for_new_and_frozen_scenarios(tmp_path, monkeypatch):
+  monkeypatch.setattr(
+    batch, "probe", lambda path, device: {"evaluation_motion_digest": "loaded"}
+  )
+  config = spec(tmp_path)
+  scene = batch.freeze(config, tmp_path)["validation"][0]
+  scene["measurement_noise"]["gravity_std"] = 0.0
+  with pytest.raises(ValueError, match="gravity_std"):
+    batch.validate_scene(scene)
+  config["measurement_noise"] = {"angular_velocity_std": 0.0}
+  with pytest.raises(ValueError, match="angular_velocity_std"):
+    batch.freeze(config, tmp_path)
+
+
 def rank_row(frames, progress, mpkpe, complete=True, success=0):
   return dict(
     candidate=candidate(frames),

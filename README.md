@@ -470,13 +470,22 @@ OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
 每轮分别用多步均值误差和一步过程残差更新。`forward` 返回确定性均值；随机模型使用下述矩阵积分核心。
 
 `LieBeliefFilter` 是纯函数核心，提供 `initialize`、`predict`、`correct`、
-`observation` 及 `to_actor_input`。64 维观测使用第一步的高斯配置。
-滤波器先将创新 covariance 换算到无量纲坐标，再判定有效秩。重力三轴共用尺度，
-各标量传感器使用各自的尺度。满秩使用 Cholesky，秩亏使用可观测子空间的伪逆，
+`observation` 及 `to_actor_input`。64 维观测的四组标准差必须为有限正数，
+并且平方后在运行精度下仍须为有限正数。训练、恢复和评估都执行这一约束。
+每帧传入的标准正态样本可以取零。滤波器先将创新 covariance 换算到无量纲坐标。
+重力三轴共用尺度，各标量传感器使用各自的尺度。默认容差下，若整批创新矩阵的
+Gershgorin 谱界能确认数值满秩，直接使用 Cholesky。其余情况执行谱检查，
+数值秩亏时使用可观测子空间的伪逆，
 随后执行 Joseph covariance 更新与右局部坐标 reset。调用
 `predict/correct(..., return_diagnostics=True)` 可读取 A、innovation、增益、
 reset Jacobian、effective_rank 和 jitter。增益求解使用的 jitter 同时进入 Joseph 更新的测量 covariance。
 满秩 innovation 求解默认从 `1e-8` 开始尝试 jitter，每次乘 10，最多 5 次，上限 `1e-4`。
+
+在 runner 管理的连续实采或想象段内，provider 可复用上一帧已提交后验的校验，
+并通过张量身份和 PyTorch 原地修改版本识别变化。新段、恢复后的首帧和外部输入均重新校验。
+在 RTX 5090 上以 B 组、8 个环境、每轮 64 步和策略 microbatch 2 对照 `ff7807c`，
+普通帧的 provider 谱分解从 5 次降至 2 次，单环境重置帧从 10 次降至 5 次。
+每轮实采平均用时从 2.36 s 降至 2.04 s。[采集配置、计时与同步次数](docs/validation/eit_filter_positive_noise.json)
 
 下面以已创建的 G1 EIT 并行训练环境 `env` 为例，参考动作采用 `uniform` 采样。示例执行一轮训练，每隔两个采集步保存一次后验。
 
@@ -611,10 +620,20 @@ clip 最后一个评分动作后停止回报，普通策略 horizon 截断保留
 | 训练步骤 | 使用的帧 |
 |---|---|
 | 世界模型拟合 | 从主 replay 的训练 episode 取有效窗口和相邻转移，包括未保存后验的帧。 |
-| actor/critic 归一化 | 直接按设备上的缓存位置读取本轮新采、仍保留且已保存后验的训练帧，每帧计一次。本轮样本数为零时沿用已有统计。 |
+| actor/critic 归一化 | 直接读取本轮新采、仍保留且已保存后验的训练帧。按原分块顺序用最新传感器、真实状态和目标更新统计，B/C 的 actor 目标还读取后验均值。整轮校验通过后提交统计，每帧计一次。本轮样本数为零时沿用已有统计。 |
 | 策略想象 | 从全部仍保留且已保存后验的训练帧均匀有放回抽样，单帧片段也可入选。样本可来自不同模型修订号。若无可用起点则报错。 |
 
 每轮 `budget` 中，`effective_posterior_count` 是全部有效后验数，`available_policy_starts` 是其中属于训练 episode 的数量，`normalization_samples` 是本轮归一化的帧数。`posterior_revision_gap_*` 汇总当前模型与缓存来源的修订号差距。主 replay、后验、边界历史、序号索引和真实首帧先验分别统计存储字节数。
+
+在线预测与校正在同一次传播中共享中间后验的校验，满秩创新协方差复用成功的 Cholesky 分解。想象步在提交前构建 critic 特征，并直接交给本步的策略或价值计算。一次 RTX 5090 的 B 组对照中，两版均用 8 个环境、每轮 64 个采集步、策略 microbatch 2。第 2–4 轮平均耗时从 6.09 s 降至 4.96 s，其中归一化从 0.522 s 降至 0.076 s。
+
+可用已有联合训练 checkpoint 在 CPU 上采一份 replay，比较不同存储精度的旋转及协方差有效性、字节数和固定噪声下的 actor 梯度。下面的命令写出实验报告。正式训练使用 FP32 后验缓存。[精度实验结果](docs/validation/eit_replay_precision.json)
+
+```bash
+OMP_NUM_THREADS=1 PYTORCH_JIT=0 .venv/bin/python -m supermimic.scripts.check_eit_replay_precision \
+  --checkpoint logs/eit-v4/B/training.pt --motion-file data/motions/walk1_subject1.npz \
+  --num-envs 4 --steps 32 --output /tmp/eit-replay-precision.json
+```
 
 `posterior_cache_normalization_seconds` 计入缓存读取和归一化的总耗时，`posterior_cache_read_seconds` 是其中的读取耗时。CUDA 计时在当前 stream 上记录事件，归一化结束时统一读取。默认 5 帧历史、4,096 个环境下，边界观测占约 5.81 MiB，另加索引。S=1、2、4 的实际缓存大小和三轮 CPU 耗时见[增量回放验收记录](docs/validation/incremental_posterior_replay.json)。
 

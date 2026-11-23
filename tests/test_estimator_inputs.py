@@ -13,7 +13,9 @@ from supermimic.estimator_inputs import (
   PosteriorInput,
   ReferenceWindow,
   RpvState,
+  _measurement_tensors,
   apply_alignment,
+  build_actor_critic_goals,
   build_actor_features,
   build_motion_goal,
   create_episode_alignment,
@@ -95,6 +97,80 @@ def test_config_roundtrip_and_permissions():
     EITInputConfig.from_dict({"group": "A"})
   with pytest.raises(ValueError, match="version"):
     EITInputConfig(version="old")
+
+
+@pytest.mark.parametrize(
+  "name",
+  ["gravity_std", "angular_velocity_std", "joint_position_std", "joint_velocity_std"],
+)
+@pytest.mark.parametrize("invalid", [0.0, -0.1, float("nan"), float("inf")])
+def test_invalid_measurement_noise_identifies_field_in_config_and_checkpoint(
+  name, invalid
+):
+  with pytest.raises(ValueError, match=name):
+    GaussianMeasurementConfig(**{name: invalid})
+  saved = EITInputConfig().to_dict()
+  saved["measurement_noise"][name] = invalid
+  with pytest.raises(ValueError, match=name):
+    EITInputConfig.from_dict(saved)
+
+
+@pytest.mark.parametrize("value", [1e-30, 1e20])
+def test_noise_variance_is_representable_at_the_point_of_use(value):
+  config = GaussianMeasurementConfig(joint_velocity_std=value)
+  assert config.covariance(29, dtype=torch.float64)[-1, -1] > 0
+  with pytest.raises(ValueError, match="joint_velocity_std.*float32"):
+    sample_proprio(torch.zeros(1, 93), config)
+  with pytest.raises(ValueError, match="joint_velocity_std.*float32"):
+    config.covariance(29, dtype=torch.float32)
+
+
+def test_noise_cache_isolated_from_callers_and_usable_after_inference():
+  config = GaussianMeasurementConfig(gravity_std=0.1234)
+  with torch.inference_mode():
+    config.standard_deviations(4).zero_()
+    config.covariance(4).zero_()
+  std, variance = config._tensors(4, device="cpu", dtype=torch.float32)
+  assert not torch.is_inference(std) and (std > 0).all()
+  torch.testing.assert_close(config.covariance(4).diag(), variance)
+  differentiable = torch.ones_like(std, requires_grad=True)
+  torch.testing.assert_close(
+    torch.autograd.grad((differentiable * std).sum(), differentiable)[0], std
+  )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("operation", ["sampling", "covariance"])
+def test_noise_cache_supports_repeated_higher_order_transforms(dtype, operation):
+  config = GaussianMeasurementConfig()
+  if operation == "sampling":
+    value = torch.ones(93, dtype=dtype)
+    expected = 2 * torch.eye(93, dtype=dtype)
+
+    def objective(value):
+      return sample_proprio(value, config).square().sum()
+
+    hessian = torch.func.jacrev(torch.func.jacrev(objective))
+  else:
+    value = torch.ones(64, dtype=dtype)
+    expected = 2 * config.covariance(29, dtype=dtype).square()
+
+    def objective(value):
+      covariance = config.covariance(29, device=value.device, dtype=value.dtype)
+      return (covariance @ value).square().sum()
+
+    hessian = torch.func.hessian(objective)
+
+  # The first transformed call must create the constants, without prior warmup.
+  _measurement_tensors.cache_clear()
+  for _ in range(3):
+    torch.testing.assert_close(hessian(value), expected)
+
+  # Constants first requested by torch.func also remain usable by ordinary AD.
+  covariance = config.covariance(29, dtype=dtype)
+  sample = torch.ones(64, dtype=dtype, requires_grad=True)
+  gradient = torch.autograd.grad((covariance @ sample).sum(), sample)[0]
+  torch.testing.assert_close(gradient, covariance.diag())
 
 
 @pytest.mark.parametrize("kind", ["zero", "reflection"])
@@ -192,6 +268,29 @@ def test_actor_information_isolation():
     assert before[1] is after[1] is omitted[1] is None
     torch.testing.assert_close(before[0], after[0], atol=0, rtol=0)
     torch.testing.assert_close(before[0], omitted[0], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+  "group,mode", [("A", "train"), ("A", "eval"), ("B", "train"), ("C", "train")]
+)
+def test_shared_reference_goals_match_standalone_actor_and_privileged_critic(
+  group, mode
+):
+  truth, reference, covariance = _inputs()
+  posterior = PosteriorInput(replace(truth, position=truth.position + 1), covariance)
+  config = EITInputConfig(group=group, mode=mode)
+  actor, uncertainty, critic = build_actor_critic_goals(
+    config, truth, posterior, reference
+  )
+  expected_actor, expected_uncertainty = build_actor_features(
+    config, truth, posterior, reference
+  )
+  torch.testing.assert_close(actor, expected_actor, atol=0, rtol=0)
+  torch.testing.assert_close(uncertainty, expected_uncertainty, atol=0, rtol=0)
+  torch.testing.assert_close(
+    critic, build_motion_goal(truth, reference)[0], atol=0, rtol=0
+  )
+  assert actor.data_ptr() != critic.data_ptr()
 
 
 def test_right_local_jacobian_finite_difference():

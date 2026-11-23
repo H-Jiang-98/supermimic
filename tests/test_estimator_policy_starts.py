@@ -164,6 +164,30 @@ def test_eit_critic_reset_preflight_precedes_provider_commit(monkeypatch):
     torch.testing.assert_close(env.get_observations()[name], value)
 
 
+def test_preflight_critic_is_returned_once_with_action_gradient(monkeypatch):
+  env, _, _ = setup_env()
+  env.eit_critic = True
+  env.dynamics.requires_grad_(False)
+  build = Mock(wraps=env._build_eit_critic)
+  monkeypatch.setattr(env, "_build_eit_critic", build)
+  obs = env.reset_prepared(env.sample_policy_starts(1, [0]))
+  assert build.call_count == 1
+  assert torch.equal(obs["critic"], env.get_observations()["critic"])
+
+  build.reset_mock()
+  action = torch.zeros(1, 29, requires_grad=True)
+  obs, _, _, _ = env.step(
+    action, process_noise=torch.zeros(1, 70), measurement_noise=torch.zeros(1, 64)
+  )
+  assert build.call_count == 1
+  independent = env.get_observations()
+  for key in obs.keys():
+    assert torch.equal(obs[key], independent[key])
+  gradient = torch.autograd.grad(obs["critic"].sum(), action, retain_graph=True)[0]
+  expected = torch.autograd.grad(independent["critic"].sum(), action)[0]
+  torch.testing.assert_close(gradient, expected)
+
+
 def test_eit_critic_step_preflight_preserves_transition_for_retry(monkeypatch):
   env, _, _ = setup_env()
   env.eit_critic = True

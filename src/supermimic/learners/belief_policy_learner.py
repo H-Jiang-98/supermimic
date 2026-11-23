@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass
 import torch
 from torch import nn
 
+from supermimic.belief_provider import belief_rollout
 from supermimic.learners.learner_utils import validate_optimizer_state
 from supermimic.utils.profiling import PhaseTimer
 
@@ -205,23 +206,26 @@ class BeliefActorCriticPolicyLearner:
     observations, rewards, continuations, weights = [], [], [], []
     saturation = process_noise.new_zeros(())
     film_scale = process_noise.new_zeros(2)
-    for t in range(horizon):
-      observations.append(obs["critic"].detach())
-      weights.append(survival.detach())
-      actions = self.actor(obs)
-      with torch.no_grad():
-        saturation += (env.limit_actions(actions) != actions).float().mean()
-        if getattr(self.actor, "film", None) is not None:
-          scale, shift = self.actor.film(obs["task_uncertainty"]).chunk(2, -1)
-          film_scale += torch.stack((scale.abs().mean(), shift.abs().mean()))
-      obs, reward, done, _ = env.step(
-        actions, process_noise=process_noise[t], measurement_noise=measurement_noise[t]
-      )
-      continuation = (1 - done) * (starts.remaining_steps > t + 1)
-      returns = returns + cfg.gamma**t * survival * reward
-      survival = survival * continuation
-      rewards.append(reward.detach())
-      continuations.append(continuation.detach())
+    with belief_rollout(getattr(env, "posterior_provider", None)):
+      for t in range(horizon):
+        observations.append(obs["critic"].detach())
+        weights.append(survival.detach())
+        actions = self.actor(obs)
+        with torch.no_grad():
+          saturation += (env.limit_actions(actions) != actions).float().mean()
+          if getattr(self.actor, "film", None) is not None:
+            scale, shift = self.actor.film(obs["task_uncertainty"]).chunk(2, -1)
+            film_scale += torch.stack((scale.abs().mean(), shift.abs().mean()))
+        obs, reward, done, _ = env.step(
+          actions,
+          process_noise=process_noise[t],
+          measurement_noise=measurement_noise[t],
+        )
+        continuation = (1 - done) * (starts.remaining_steps > t + 1)
+        returns = returns + cfg.gamma**t * survival * reward
+        survival = survival * continuation
+        rewards.append(reward.detach())
+        continuations.append(continuation.detach())
     bootstrap = cfg.gamma**horizon * survival * self._value(obs["critic"])
     reward_return = returns
     returns = returns + bootstrap

@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from supermimic.critic_inputs import BeliefCritic
 from supermimic.learners.belief_policy_learner import BeliefPolicyLearnerCfg
 from supermimic.motion_loader import motion_content_digest
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
@@ -18,6 +19,7 @@ from supermimic.runners.eit_training import (
   EITTrainingCfg,
   initialization_fingerprint,
 )
+from supermimic.runners.supermimic_runner import build_actor
 from supermimic.sim_context import SimContext
 from tests.test_estimator_belief_training import _RoundRunner, assert_tree
 from tests.test_estimator_world_model_env import _env
@@ -82,23 +84,9 @@ def test_two_rounds_update_all_components_and_exclude_validation_normalization()
   model = deepcopy(loop.runner._dynamics.state_dict())
   actor = deepcopy(loop.actor.state_dict())
   critic = deepcopy(loop.policy.critic.state_dict())
-  normalized = []
-  original = loop.update_input_normalization
-  env = loop.runner.wm_env
-  reset = env.reset_prepared
-
-  def record_training_rows(start):
-    normalized.extend(start.batch["episode_id"].tolist())
-    return reset(start)
-
-  def normalize(frames, policy_keys):
-    with patch.object(env, "reset_prepared", side_effect=record_training_rows):
-      return original(frames, policy_keys)
-
-  with patch.object(loop, "update_input_normalization", side_effect=normalize):
-    first, second = loop.run_round(), loop.run_round()
-  assert all(episode % 2 for episode in normalized)
-  assert len(normalized) == 8
+  first, second = loop.run_round(), loop.run_round()
+  assert first["budget"]["normalization_samples"] == 4
+  assert second["budget"]["normalization_samples"] == 4
   assert second["collection_actor_version"] == first["trained_actor_version"]
   assert second["collection_model_version"] == first["trained_model_version"]
   assert first["collection_actor_version"] != first["trained_actor_version"]
@@ -157,6 +145,41 @@ def test_failed_restore_changes_no_component_or_rng(component):
   assert_tree(target.state_dict(), before)
   assert target.runner.posterior_provider is provider
   assert target.runner.replay_buffer is replay
+
+
+@pytest.mark.parametrize(
+  "entry", ["runner", "provider", "initialization", "actor", "world_model_metadata"]
+)
+def test_zero_measurement_noise_rejected_before_loading(entry):
+  loop = training()
+  field = "joint_velocity_std"
+  if entry == "initialization":
+    checkpoint = loop.initialization_bundle()
+    checkpoint["world_model"]["estimator"]["measurement_config"][field] = 0.0
+    load = loop.load_initialization
+  elif entry == "provider":
+    loop.refresh_collection()
+    loop.runner.step(record_episode_stats=False)
+    provider = loop.runner.posterior_provider
+    checkpoint = provider.state_dict()
+    checkpoint["measurement_config"][field] = 0.0
+    load = provider.load_state_dict
+  elif entry == "world_model_metadata":
+    checkpoint = loop.state_dict()
+    checkpoint["world_model"]["estimator"]["measurement_config"][field] = 0.0
+    load = loop._check_checkpoint_version
+  else:
+    loop.run_round()
+    checkpoint = loop.state_dict()
+    inputs = (
+      checkpoint["actor"]["input_config"]
+      if entry == "actor"
+      else checkpoint["runner_config"]["estimator_inputs"]
+    )
+    inputs["measurement_noise"][field] = 0.0
+    load = loop.load_state_dict
+  with pytest.raises(ValueError, match=field):
+    load(checkpoint)
 
 
 def test_restore_reproduces_next_model_and_policy_updates(tmp_path):
@@ -382,7 +405,10 @@ def test_initialization_preflights_all_groups_before_any_mutation(component):
   assert_tree(target.state_dict(), before)
 
 
-def test_normalization_late_failure_preserves_all_live_statistics():
+@pytest.mark.parametrize(
+  "field", ["actor_obs", "alignment_rotation", "alignment_translation", "state"]
+)
+def test_normalization_late_failure_preserves_all_live_statistics(field):
   loop = training()
   loop.refresh_collection()
   for _ in range(4):
@@ -392,23 +418,52 @@ def test_normalization_late_failure_preserves_all_live_statistics():
   frames = frames[frames["episode_id"] == 1]
   actor = deepcopy(loop.actor.state_dict())
   critic = deepcopy(loop.policy.critic.state_dict())
-  original = loop.runner.wm_env.reset_prepared
-  calls = 0
-
-  def reset(start):
-    nonlocal calls
-    result = original(start)
-    calls += 1
-    if calls == 2:
-      result["goal_motion"][0, 0] = float("inf")
-    return result
-
-  with patch.object(loop.runner.wm_env, "reset_prepared", side_effect=reset):
-    with pytest.raises(ValueError, match="Non-finite actor"):
-      loop.update_input_normalization(frames)
+  # A bad field in the second chunk reaches the validator after the first
+  # two training samples have already reached the private normalizers.
+  value = loop.runner.replay_buffer._storage[field][1, 3]
+  value.flatten()[0] = 2.0 if field == "alignment_rotation" else float("inf")
+  with pytest.raises(ValueError, match="Non-finite|Rotation"):
+    loop.update_input_normalization(frames)
   assert_tree(loop.actor.state_dict(), actor)
   assert_tree(loop.policy.critic.state_dict(), critic)
   assert loop.runner.imagined_posterior_provider.state is None
+
+
+@pytest.mark.parametrize("group", ["A", "B", "C"])
+def test_replay_normalization_matches_full_reset_statistics_without_rollout(group):
+  loop = training()
+  loop.refresh_collection()
+  for _ in range(4):
+    loop.runner.step(record_episode_stats=False)
+  loop.runner.finish_collection_round()
+  env, replay = loop.runner.wm_env, loop.runner.replay_buffer
+  cfg = replace(
+    loop.runner.cfg, estimator_inputs=replace(env.estimator_input_config, group=group)
+  )
+  env.estimator_input_config = cfg.estimator_inputs
+  loop.policy.actor = build_actor(cfg, loop.runner._wm, "cpu").double()
+  loop.policy.critic = BeliefCritic(
+    group, loop.runner._dynamics.sim_ctx_dim, (12,)
+  ).double()
+  env.critic_input_config = loop.policy.critic.config
+  expected_actor, expected_critic = deepcopy(loop.actor), deepcopy(loop.policy.critic)
+  expected_actor.train()
+  with torch.no_grad(), env.readonly_policy_motion():
+    locations = replay.posterior_cache.locations(replay, episode_ids=[1])
+    for chunk in env.iter_cached_policy_starts(locations, batch_size=2):
+      obs = env.reset_prepared(chunk)
+      expected_actor.update_normalization(obs)
+      expected_critic.update_normalization(obs["critic"])
+  env.clear_rollout()
+  with (
+    patch.object(env, "reset_prepared", side_effect=AssertionError("rollout reset")),
+    patch.object(
+      replay.posterior_cache, "read", side_effect=AssertionError("full belief read")
+    ),
+  ):
+    loop.update_input_normalization()
+  assert_tree(loop.actor.state_dict(), expected_actor.state_dict())
+  assert_tree(loop.policy.critic.state_dict(), expected_critic.state_dict())
 
 
 def test_normalization_reads_fresh_slots_without_copying_frame_keys_to_python():
