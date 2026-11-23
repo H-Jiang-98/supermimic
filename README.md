@@ -424,7 +424,7 @@ decoder 首层 LayerNorm 后的 FiLM。A/B 完全旁路 FiLM。
 `supermimic.tasks.env_cfgs.configure_estimator_env_cfg(env_cfg)`，以统一测量定义、
 关闭重复 corruption 并启用固定 episode 参考对齐。motion sampling mode 仍需
 与 runner 一致（`return` 对应 `external`）。新路径仅支持 G1 GenCoord、29 个
-关节和 50 Hz，默认 eager 执行。
+关节和 50 Hz。输入阶段 runner 默认使用 eager；联合训练入口 `train_eit` 在 CUDA 上默认编译训练热点，可用 `--eager` 切换。
 
 后验通过 `estimator_inputs.PosteriorInput` 注入：`mean` 是矩阵朝向、世界系
 位置和线速度组成的 `RpvState`；C 还需要按 `[theta, rho, nu]` 排列的右局部
@@ -642,6 +642,9 @@ A/B/C 的训练、评估和播放均要求联合 checkpoint 内嵌 `eit_rpv_beli
 新训练默认在输出目录的父目录创建或读取 `eit_initialization_v3_eit_rpv_belief_critic_v2_seed<seed>.pt`。
 同一 seed 的三组使用同一份初始化包，分别写入各自的训练目录。也可用 `--initialization` 指定当前契约的初始化包。
 各组独立采集与更新。当前默认使用公共 ReturnSampler，保留 `--sampling-mode uniform`。
+
+在服务器仓库根目录运行 `python3 src/supermimic/scripts/launch_eit.py --dry-run` 可预览多卡计划，去掉 `--dry-run` 即开始训练。
+在 [train_eit_config.toml](train_eit_config.toml) 设置 CPFS 路径、训练超参数、各方法的显卡和 seed。[多卡配置说明](docs/train_eit_pro6000.md#使用-toml-分配显卡和-seed)
 
 ```bash
 WANDB_MODE=offline OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \

@@ -167,6 +167,7 @@ def _private_components(training):
     "generators",
   ):
     setattr(policy, name, cloned[name])
+  policy._actor_forward = policy.actor
   policy.wm_env = env
   return wm, learner, policy, env
 

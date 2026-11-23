@@ -21,6 +21,7 @@ from supermimic.learners.learner_utils import (
   validate_optimizer_state,
 )
 from supermimic.learners.policy_learner import gae_returns
+from supermimic.utils.compile import compile_eit_kernel
 from supermimic.utils.profiling import PhaseTimer
 
 
@@ -115,8 +116,13 @@ def _module_modes(modules):
 
 
 class BeliefActorCriticPolicyLearner:
-  def __init__(self, actor, critic, wm_env, cfg=None, device=None):
+  def __init__(
+    self, actor, critic, wm_env, cfg=None, device=None, *, compile_kernels=False
+  ):
     self.actor: nn.Module = actor
+    self._actor_forward = (
+      compile_eit_kernel(actor.forward) if compile_kernels else actor
+    )
     self.critic: nn.Module = critic
     self.wm_env = wm_env
     self.wm_env.eit_critic = True
@@ -230,7 +236,7 @@ class BeliefActorCriticPolicyLearner:
       for t in range(horizon):
         observations.append(obs["critic"].detach())
         weights.append(survival.detach())
-        actions = self.actor(obs)
+        actions = self._actor_forward(obs)
         aux = getattr(self.actor, "auxiliary_loss", lambda: 0.0)()
         aux_loss = aux_loss + (aux.mean() if isinstance(aux, torch.Tensor) else aux)
         with torch.no_grad():

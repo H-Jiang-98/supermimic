@@ -185,6 +185,7 @@ class EITTraining(BeliefModelTraining):
       runner.wm_env,
       policy_cfg or BeliefPolicyLearnerCfg(),
       runner.device,
+      compile_kernels=getattr(runner, "compile_eit", False),
     )
     self.initialization_digest: str | None = None
     self.collected_steps = self.update_groups = self.skipped_update_groups = 0
@@ -200,7 +201,7 @@ class EITTraining(BeliefModelTraining):
     if not math.isfinite(self.should_train._ratio):
       raise ValueError("replay_ratio must be finite")
     if runner.cfg.cuda_graphs:
-      raise ValueError("EIT requires eager execution")
+      raise ValueError("EIT does not support explicit learner CUDA graphs")
 
   @property
   def policy(self) -> BeliefActorCriticPolicyLearner:
@@ -889,6 +890,13 @@ class EITTraining(BeliefModelTraining):
           **{"Perf/" + k: v for k, v in seconds.items()},
         }
         runtime = runtime_metadata(next(self.actor.parameters()))
+        runtime["eit_execution"] = "eager"
+        if getattr(runner, "compile_eit", False):
+          from torch._dynamo.utils import calculate_time_spent, counters
+
+          runtime["eit_execution"] = "inductor"
+          runtime["compile_seconds_total"] = calculate_time_spent()["total_wall_time"]
+          runtime["compiled_graphs_total"] = counters["stats"]["unique_graphs"]
         for name, peak in training_peaks.items():
           runtime[name] = max(runtime[name], peak)
         losses.update(

@@ -157,7 +157,9 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
     ):
       raise ValueError("Estimator input v1 supports only the motion task")
     if self.cuda_graphs:
-      raise ValueError("Estimator input v1 must be validated in eager mode")
+      raise ValueError(
+        "Estimator input v1 does not support explicit learner CUDA graphs"
+      )
 
 
 @dataclass
@@ -521,6 +523,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
   cfg: CfgT
   replay_mode: Literal["full", "model"] = "full"
   posterior_save_stride: int | None = None
+  compile_eit: bool = False
 
   def __init__(
     self,
@@ -574,7 +577,12 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     self.replay_buffer = self._make_replay_buffer()
     if self._dynamics.process_noise_config is not None:
       self.world_model_learner = TwoStageWorldModelLearner(
-        self._dynamics, self._representation, self.cfg.mean, self.cfg.cov, self.device
+        self._dynamics,
+        self._representation,
+        self.cfg.mean,
+        self.cfg.cov,
+        self.device,
+        compile_kernels=self.compile_eit,
       )
     else:
       self.world_model_learner = WorldModelLearner(
@@ -959,6 +967,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     *args,
     posterior_provider: PosteriorProvider | None = None,
     imagined_posterior_provider: PosteriorProvider | None = None,
+    compile_eit: bool = False,
     replay_mode: Literal["full", "model"] = "full",
     **kwargs,
   ):
@@ -969,6 +978,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       raise ValueError(
         "Collection and imagination require independent belief provider state"
       )
+    self.compile_eit = compile_eit
     self.posterior_provider = posterior_provider
     self.imagined_posterior_provider = imagined_posterior_provider
     self.replay_mode = replay_mode
@@ -997,6 +1007,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       self.cfg.estimator_inputs.measurement_noise,
       self._representation._default_joint_pos,
       config=self._wm.filter_config,
+      compile_kernels=self.compile_eit,
     )
     incremental = (
       getattr(getattr(self, "replay_buffer", None), "posterior_cache", None) is not None

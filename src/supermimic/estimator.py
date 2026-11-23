@@ -16,6 +16,7 @@ from torch.func import jacrev, vmap
 
 from supermimic.belief import BeliefState
 from supermimic.estimator_inputs import GaussianMeasurementConfig, PosteriorInput
+from supermimic.utils.compile import compile_eit_kernel
 from supermimic.utils.lie_state import (
   STATE_LAYOUT_VERSION,
   TANGENT_DIM,
@@ -226,6 +227,22 @@ def _innovation_gain(cross, covariance, config):
   )
 
 
+def _padded_rows(part: torch.Tensor, width: int) -> torch.Tensor:
+  # Each Jacobian row is independent. Slicing the result drops the repeated
+  # rows from both the loss and its outer gradient.
+  missing = width - len(part)
+  if missing:
+    part = torch.cat((part, part[-1:].expand(missing, *part.shape[1:])))
+  if part.storage_offset():
+    return part.clone(memory_format=torch.contiguous_format)
+  return part.contiguous()
+
+
+def _propagate_covariance(jacobian, covariance, factor):
+  process = factor @ factor.mT
+  return _symmetric(jacobian @ covariance @ jacobian.mT + process), process
+
+
 class LieBeliefFilter:
   """First-order Gaussian belief filter with differentiable model Jacobians.
 
@@ -240,6 +257,8 @@ class LieBeliefFilter:
     measurement_config: GaussianMeasurementConfig,
     default_joint_pos: torch.Tensor,
     config: FilterConfig | None = None,
+    *,
+    compile_kernels: bool = False,
   ) -> None:
     if not callable(getattr(dynamics, "mean_lie", None)) or not callable(
       getattr(dynamics, "distribution_lie", None)
@@ -253,6 +272,11 @@ class LieBeliefFilter:
     self.measurement_config = measurement_config
     self.default_joint_pos = default_joint_pos.detach().clone()
     self.config = config or FilterConfig()
+    self._compiled_jacobian = None
+    self._propagate = _propagate_covariance
+    if compile_kernels:
+      self._compiled_jacobian = compile_eit_kernel(self._vector_jacobian, dynamic=False)
+      self._propagate = compile_eit_kernel(_propagate_covariance, dynamic=True)
 
   def _validate_belief(self, belief: BeliefState) -> None:
     _validate_versions(belief)
@@ -334,11 +358,6 @@ class LieBeliefFilter:
         residual, zero, create_graph=torch.is_grad_enabled(), vectorize=False
       )
 
-    def single(epsilon, state_values, nominal_values, a, ctx):
-      state = LieState(*state_values)
-      base = LieState(*nominal_values)
-      return local_error(base, self.mean_step(boxplus(state, epsilon), a, ctx))
-
     # Flatten arbitrary leading batch axes. The nominal is constant only for
     # epsilon differentiation; passing its tensors preserves outer gradients.
     def flatten(state):
@@ -357,17 +376,62 @@ class LieBeliefFilter:
     batch_shape = mean.position.shape[:-1]
     state_values, nominal_values = flatten(mean), flatten(nominal)
     count = state_values[0].shape[0]
-    result = vmap(
-      jacrev(single, argnums=0, chunk_size=self.config.jacobian_chunk_size),
-      chunk_size=self.config.jacobian_batch_chunk_size,
-    )(
-      zero.expand(count, TANGENT_DIM),
+    args = (
+      zero.expand(count, -1),
       state_values,
       nominal_values,
       action.reshape(count, action.shape[-1]),
       context.reshape(count, context.shape[-1]),
     )
+    if self._compiled_jacobian is None or count == 0:
+      result = self._vector_jacobian(
+        *args, chunk_size=self.config.jacobian_batch_chunk_size
+      )
+    else:
+      result = self._compiled_jacobian_blocks(*args)
     return result.reshape(*batch_shape, TANGENT_DIM, TANGENT_DIM)
+
+  def _vector_jacobian(
+    self, epsilon, state, nominal, action, context, *, chunk_size=None
+  ):
+    derivatives = jacrev(
+      self._local_transition, argnums=0, chunk_size=self.config.jacobian_chunk_size
+    )
+    return vmap(derivatives, chunk_size=chunk_size)(
+      epsilon, state, nominal, action, context
+    )
+
+  def _compiled_jacobian_blocks(self, epsilon, state, nominal, action, context):
+    # vmap specializes its batch dimension. Real episode resets and short
+    # imagined clips otherwise compile one backward graph per remainder size.
+    block = self.config.jacobian_batch_chunk_size or 256
+    assert self._compiled_jacobian is not None
+    small = min(block, 16)
+    count = len(action)
+    blocks = []
+    start = 0
+    while start < count:
+      width = block if count - start >= block else small
+      stop = min(start + width, count)
+      length = stop - start
+
+      result = self._compiled_jacobian(
+        epsilon[:1].expand(width, -1),
+        tuple(_padded_rows(x[start:stop], width) for x in state),
+        tuple(_padded_rows(x[start:stop], width) for x in nominal),
+        _padded_rows(action[start:stop], width),
+        _padded_rows(context[start:stop], width),
+      )
+      blocks.append(result[:length])
+      start = stop
+    return blocks[0] if len(blocks) == 1 else torch.cat(blocks)
+
+  def _local_transition(self, epsilon, state_values, nominal_values, action, context):
+    state = LieState(*state_values)
+    nominal = LieState(*nominal_values)
+    return local_error(
+      nominal, self.mean_step(boxplus(state, epsilon), action, context)
+    )
 
   def mean_step(
     self, mean: LieState, action: torch.Tensor, context: torch.Tensor
@@ -423,10 +487,7 @@ class LieBeliefFilter:
       raise ValueError("Action and context must be finite")
     nominal, factor = self.dynamics.distribution_lie(belief.mean, action, context)
     jacobian = self.transition_jacobian(belief.mean, action, context, nominal)
-    process = factor @ factor.transpose(-1, -2)
-    covariance = _symmetric(
-      jacobian @ belief.covariance @ jacobian.transpose(-1, -2) + process
-    )
+    covariance, process = self._propagate(jacobian, belief.covariance, factor)
     return BeliefState(nominal, covariance), jacobian, process
 
   def correct(

@@ -75,6 +75,8 @@ class TwoStageWorldModelLearner:
     mean_cfg: MeanFitCfg,
     cov_cfg: CovarianceFitCfg,
     device: str,
+    *,
+    compile_kernels: bool = False,
   ):
     if dynamics.noise_head is None:
       raise ValueError("Two-stage fitting requires a process noise head")
@@ -92,7 +94,7 @@ class TwoStageWorldModelLearner:
       ),
       device,
       cuda_graphs=False,
-      compile_kernels=False,
+      compile_kernels=compile_kernels,
       check_finite=True,
     )
     self.cov_optimizer = torch.optim.Adam(self.noise_head.parameters(), lr=cov_cfg.lr)

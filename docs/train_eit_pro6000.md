@@ -1,12 +1,28 @@
 # PRO 6000 上的 EIT 训练、预算与续训
 
-当前联合训练协议为 `eit_training_v5`。EIT 保留在线 belief、后验 replay、随机世界模型与可微 imagined belief rollout；采集调用公共 `runner.step()`，更新由公共 `Ratio` 调度，优化器、critic fitting、权重文件和 W&B 记录复用 SuperMimic。采用 float32、eager 执行。
+当前联合训练协议为 `eit_training_v5`。EIT 保留在线 belief、后验 replay、随机世界模型与可微 imagined belief rollout；采集调用公共 `runner.step()`，更新由公共 `Ratio` 调度，优化器、critic fitting、权重文件和 W&B 记录复用 SuperMimic。采用 float32。CUDA 默认使用 TorchInductor 编译训练热点，CPU 使用 eager。单次训练加 `--eager` 或在 TOML 的 `[training]` 设置 `eager = true` 可切换回 eager。显式 learner CUDA Graph 独立于该开关，当前关闭。
 
-本文配置尚无 PRO 6000 完整更新的耗时、峰值显存或收敛实测。历史 Step 6 小批量结果不能作为当前配置的性能证据。先测完整更新、保存及恢复，再确定多 seed 的正式运行预算。
+下表记录服务器上的三组短程对照。长期收敛及 replay 填满后的耗时还需单独测量。
 
 2026-11-23 已在本地 RTX 5090（32 GiB）完成当前协议验证：[实测报告](validation/eit_v5_rtx5090.json)。C 组使用下表默认预算及完整网络宽度，Jacobian batch chunk=32、`PYTORCH_JIT=0`；采集 11 步后完成一组 10/18/1/20 更新。世界模型阶段 0.555 s，策略阶段 691.753 s（其中 critic 0.074 s）；PyTorch 峰值 allocated/reserved 为 15.20/17.76 GiB。新进程恢复至累计 14 步，优化器和调度状态一致，两次启动生成五个四文件 artifact，离线记录约 0.90 GiB。A/B/C 小批量 CUDA 下一次更新恢复逐位一致，完整回归 1095 项通过。
 
 该实测只覆盖一个完整默认更新与恢复后的 warmup；1000 帧缓存已分配但尚未填满，未测稳定容量索引成本或收敛，也不能推算为 PRO 6000 性能。阶段计时存在包含关系，不能把父阶段与子阶段相加。
+
+## CUDA 编译对照（2026-11-24）
+
+服务器报告 GPU 为 NVIDIA RPBZZZ6（每卡 97,887 MiB），PyTorch 版本为 2.14.0+cu130。A/B/C 分别使用物理卡 1/2/6，同一 seed 2027 公共初始化、40 个动作文件和 float32。每组设 2048 个环境、4096 个策略起点、horizon 32、actor microbatch 和 Jacobian chunk 均为 256。使用服务器已有 eager 日志，只运行编译侧，参数 `--max-iterations 21` 对齐从零计数的日志 `step=20`。
+
+下表的每组耗时取最后一个日志区间，由两组更新的阶段总时间除以 2 得到。两种模式至此均完成 30 次 mean、54 次 covariance、3 次 actor 和 60 次 critic 更新。该区间的实际想象转移数也逐组吻合（A 262,019，B/C 262,052）。显存取进程最大 allocated，单位为 GiB。
+
+| 组 | rollout 加反传，eager → 编译（秒/组） | 耗时下降 | 世界模型，eager → 编译（秒/组） | 峰值显存，eager → 编译（GiB） |
+|---|---:|---:|---:|---:|
+| A | 143.98 → 113.00 | 21.5% | 0.873 → 0.442 | 69.78 → 42.72 |
+| B | 150.95 → 140.66 | 6.8% | 0.762 → 0.441 | 70.38 → 42.78 |
+| C | 149.09 → 146.99 | 1.4% | 0.726 → 0.445 | 70.70 → 43.07 |
+
+首次完整更新所在的 `step=10` 日志中，进程累计编译时间 A/B/C 分别为 80.13、105.09、105.36 秒。到 `step=20` 又分别增加约 4.57、3.32、3.98 秒，三组的累计编译图数均从 23 增至 25。各进程可复用已有的磁盘编译缓存，阶段耗时包含在该阶段触发的编译。C 组最后两次更新的耗时差较小，长期吞吐还需更长区间测量。
+
+原始数据位于服务器 `/mnt/cpfs/zbl-cpfs-new/CKPT/leojiang/supermimic_ws/`。eager 实验目录为 `eit_v5_Lafan`，编译实验目录为 `eit_v5_Lafan_compiled_kiGq1fqz`。组内的 `seed2027/{A,B,C}/metrics.jsonl` 提供预算和计数，`profiling.jsonl` 提供阶段时间、显存及编译累计值。
 
 ## A/B/C 与公共初始化
 
@@ -51,7 +67,22 @@ critic 用原始 value 计算 GAE，只裁剪最终 target；MSE 不按累计 su
 
 每个新训练帧、新保存 posterior 只更新一次对应归一化，包含 warmup；同一步多组优化不重复计数。验证 episode 固定为 `episode_id % validation_stride == 0`，不进入训练或归一化。
 
-## 启动与三卡运行
+## 使用 TOML 分配显卡和 seed
+
+服务器配置在仓库根目录的 [train_eit_config.toml](../train_eit_config.toml)。在该目录执行：
+
+```bash
+python3 src/supermimic/scripts/launch_eit.py --config train_eit_config.toml --dry-run
+python3 src/supermimic/scripts/launch_eit.py --config train_eit_config.toml
+```
+
+`[paths]` 指定 CPFS 的三处根目录。启动器使用 `environment_root/.venv/bin/python`，存在 `environment_root/env.sh` 时先加载它。动作路径相对 `dataset_root`，默认使用 `motions/walk1_subject1.npz`，也可指定 `motions/*.npz`。相对根目录按 TOML 所在目录解析。
+
+`[training]` 的键对应单次训练参数，例如 `mean_lr` 对应 `--mean-lr`。三个方法共用这些超参数。每个方法的 `gpus` 填物理卡号，`seeds` 填训练种子。例如 `gpus = [1, 6]`、`seeds = [11, 12, 13]` 会在 GPU 1 上依次运行 11、13，在 GPU 6 上运行 12。多个方法共用同一张卡时也依次执行；不同 GPU 并行。只保留这次要训练的方法表即可。
+
+每个不同的 seed 用 B 组生成一份公共初始化，保存在 `checkpoint_root/experiment/init/`。各组的权重、`training.pt` 和训练日志分别写入 `checkpoint_root/experiment/seed<seed>/<A|B|C>/`。开启新一批实验时修改 `experiment`；接续已有 checkpoint 使用下文的单次训练 `--resume` 命令。
+
+## 单次训练与三卡命令示例
 
 EIT CLI 不读取根目录 `train_config.toml`。`--save-interval`、`--log-interval`、`--run-name`、`--wandb-project` 写入公共 runner 配置；运行目录仍由 `--output` 指定。
 

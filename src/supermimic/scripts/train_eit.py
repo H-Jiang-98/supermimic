@@ -77,6 +77,8 @@ def main():
     formatter_class=argparse.ArgumentDefaultsHelpFormatter,
   )
   parser.add_argument("--motion-file", required=True)
+  parser.add_argument("--env.sim.mujoco.iterations", dest="iterations", type=int)
+  parser.add_argument("--env.sim.mujoco.ls-iterations", dest="ls_iterations", type=int)
   parser.add_argument("--output", type=Path)
   parser.add_argument(
     "--prepare-initialization",
@@ -97,6 +99,9 @@ def main():
   parser.add_argument("--group", choices=("A", "B", "C"), default="B")
   parser.add_argument(
     "--device", default="cuda:0" if torch.cuda.is_available() else "cpu"
+  )
+  parser.add_argument(
+    "--eager", action="store_true", help="Disable CUDA training kernel compilation"
   )
   parser.add_argument("--seed", type=int, default=2026)
   parser.add_argument(
@@ -160,6 +165,10 @@ def main():
   parser.add_argument("--critic-epochs", type=int, default=5)
   parser.add_argument("--critic-minibatches", type=int, default=4)
   parser.add_argument("--critic-microbatch-size", type=int)
+  parser.add_argument("--policy-lr", type=float, default=BeliefPolicyLearnerCfg.lr)
+  parser.add_argument(
+    "--critic-lr", type=float, default=BeliefPolicyLearnerCfg.critic_lr
+  )
   parser.add_argument("--exploration", type=float, default=0.1)
   parser.add_argument("--hidden-dims", type=int, nargs="+", default=[2048, 2048, 2048])
   parser.add_argument(
@@ -215,9 +224,24 @@ def main():
       "Explicit --initialization must exist; create it with --prepare-initialization"
     )
   torch.manual_seed(args.seed)
-  torch.compiler.set_stance("force_eager")
+  compile_kernels = (
+    torch.device(args.device).type == "cuda"
+    and not args.eager
+    and os.environ.get("TORCH_COMPILE_DISABLE") != "1"
+    and os.environ.get("TORCHDYNAMO_DISABLE") != "1"
+  )
+  torch.compiler.set_stance("default" if compile_kernels else "force_eager")
+  print(
+    f"[INFO] EIT execution: {'inductor' if compile_kernels else 'eager'}", flush=True
+  )
   task_id = "SuperMimic-GenCoord-G1"
   env_cfg = load_env_cfg(task_id)
+  for name in ("iterations", "ls_iterations"):
+    value = getattr(args, name)
+    if value is not None:
+      if value < 0:
+        parser.error(f"env.sim.mujoco.{name} must be nonnegative")
+      setattr(env_cfg.sim.mujoco, name, value)
   env_cfg.seed = args.seed
   motion = cast(MotionCommandCfg, env_cfg.commands["motion"])
   motion.motion_file = str(Path(args.motion_file).expanduser())
@@ -264,6 +288,8 @@ def main():
       critic_epochs=args.critic_epochs,
       critic_minibatches=args.critic_minibatches,
       critic_microbatch_size=args.critic_microbatch_size,
+      lr=args.policy_lr,
+      critic_lr=args.critic_lr,
       noise=args.exploration,
     )
     num_envs = args.num_envs
@@ -277,7 +303,9 @@ def main():
   )
   env = create_env(env_cfg, num_envs, args.device)
   try:
-    runner = SuperMimicRunner(env, runner_cfg, task_id, device=args.device)
+    runner = SuperMimicRunner(
+      env, runner_cfg, task_id, device=args.device, compile_eit=compile_kernels
+    )
     training = EITTraining(runner, loop_cfg, policy_cfg)
     if reference_path is not None:
       from supermimic.runners.eit_resume_reference import write_live_reference
