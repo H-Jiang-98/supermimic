@@ -1,5 +1,8 @@
 """A damaged loader must not be able to manufacture both sides of resume proof."""
 
+import os
+import subprocess
+import sys
 from copy import deepcopy
 from dataclasses import replace
 from unittest.mock import patch
@@ -24,10 +27,19 @@ def test_private_reference_discards_live_graph_without_resetting_it():
   source = training()
   source.refresh_collection()
   source.policy.cuda_graphs = True
-  source.policy._actor_graph = sentinel = object()
+  source.policy._policy_graph = graph = object()
+  source.policy._policy_graph_signature = signature = object()
+  source.policy._policy_graph_stream = stream = object()
   _, _, private, _ = _private_components(source)
-  assert private.cuda_graphs is False and private._actor_graph is None
-  assert source.policy.cuda_graphs is True and source.policy._actor_graph is sentinel
+  assert private.cuda_graphs is False
+  assert private._policy_graph is None
+  assert private._policy_graph_signature is None
+  assert private._policy_graph_stream is None
+  assert private._graph_reason == "disabled"
+  assert source.policy.cuda_graphs is True
+  assert source.policy._policy_graph is graph
+  assert source.policy._policy_graph_signature is signature
+  assert source.policy._policy_graph_stream is stream
 
 
 def test_live_reference_is_generated_without_any_loader_and_preserves_live_state(
@@ -244,3 +256,66 @@ def test_real_cpu_checkpoint_live_reference_and_independent_restore(tmp_path):
   assert report["expected_source"] == REFERENCE_SOURCE
   assert report["fixed_input_policy_resume_exact"] is True
   assert report["fixed_input_model_resume_exact"] is True
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA live graph reference")
+def test_captured_policy_live_reference_and_independent_restore(tmp_path):
+  # Establish deterministic cuBLAS settings before the child initializes CUDA,
+  # independently of tests that already used other streams in this process.
+  result = subprocess.run(
+    [
+      sys.executable,
+      "-c",
+      "from pathlib import Path; import sys; "
+      "from tests.test_estimator_live_resume_reference import _cuda_graph_reference; "
+      "_cuda_graph_reference(Path(sys.argv[1]))",
+      str(tmp_path),
+    ],
+    env={
+      **os.environ,
+      "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+      "PYTORCH_JIT": "0",
+      "OMP_NUM_THREADS": "1",
+      "MUJOCO_GL": "egl",
+    },
+    capture_output=True,
+    text=True,
+    timeout=180,
+  )
+  assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _cuda_graph_reference(directory):
+  from supermimic.scripts.check_eit_resume import verify
+  from tests.test_estimator_eit_graph import graph_policy
+
+  torch.set_num_threads(1)
+  fixtures = graph_policy.__wrapped__(directory)
+  make = next(fixtures)
+  try:
+    loop, _ = make(return_training=True, integrated=True)
+    for _ in range(11):
+      loop.run_step()
+    policy = loop.policy
+    captured, stream = policy._policy_graph, policy._policy_graph_stream
+    assert captured.captures == 1 and captured.replay_calls > 0
+    _, _, private, _ = _private_components(loop)
+    assert private._policy_graph is None and private._policy_graph_stream is None
+    before = loop.state_dict()
+    checkpoint, evidence = directory / "training.pt", directory / "live-reference.pt"
+    loop.before_checkpoint_commit = lambda path, state: write_live_reference(
+      loop, path, state, evidence
+    )
+    loop.save(checkpoint)
+    equal_tree(loop.state_dict(), before)
+    assert policy._policy_graph is captured and policy._policy_graph_stream is stream
+    report = verify(checkpoint, directory / "stationary.npz", "cuda:0", evidence)
+    assert report["fixed_input_model_resume_exact"] is True
+    assert report["fixed_input_policy_resume_exact"] is True
+    # Publishing/verification must also leave the original capture reusable.
+    replays = captured.replay_calls
+    for _ in range(2):
+      loop.run_step()
+    assert policy._policy_graph is captured and captured.replay_calls > replays
+  finally:
+    next(fixtures, None)

@@ -171,8 +171,10 @@ def _private_components(training):
   policy._actor_with_aux = getattr(policy.actor, "forward_with_aux", None)
   # A shallow copy must never replay a graph referencing the live parameters.
   policy.cuda_graphs = False
-  policy.clear_actor_graph()
-  policy._actor_graph_stream = None
+  policy.clear_policy_graph()
+  # Private parameters have their own AccumulateGrad nodes: do not inherit the
+  # live capture stream into eager, bitwise continuation verification.
+  policy._policy_graph_stream = None
   policy._graph_reason = "disabled"
   policy.wm_env = env
   return wm, learner, policy, env

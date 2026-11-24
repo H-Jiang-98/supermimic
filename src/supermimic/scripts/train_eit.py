@@ -145,7 +145,7 @@ def main():
   parser.add_argument(
     "--policy-cuda-graphs",
     action="store_true",
-    help="Capture actor rollout/backward for divisible CUDA microbatches; "
+    help="Capture a complete actor/critic update for divisible CUDA microbatches; "
     "disabled by --eager, independent of checkpoint hyperparameters",
   )
   parser.add_argument(

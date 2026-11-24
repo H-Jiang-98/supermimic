@@ -134,25 +134,32 @@ def fit_critic(
   generator=None,
   max_norm=1.0,
   check_finite=False,
+  permutation=None,
+  zero_grad_set_to_none=True,
 ):
   """Fit unweighted MSE with one permutation reused across all epochs.
 
   Normal batches use the original divisible prefix. Small batches shrink the
   number of minibatches so each logical optimizer update remains nonempty.
   Microbatches only split gradient accumulation inside a logical minibatch.
+  A caller-owned permutation and persistent gradients support full-update capture;
+  the caller prepares/validates the permutation outside the graph.
   """
   if len(targets) == 0:
     raise ValueError("Critic needs at least one sample")
   count = min(minibatches, len(targets))
   size = len(targets) // count
-  permutation = torch.randperm(size * count, device=targets.device, generator=generator)
+  if permutation is None:
+    permutation = torch.randperm(
+      size * count, device=targets.device, generator=generator
+    )
   params = list(critic.parameters())
   critic.requires_grad_(True)
   losses, norms = [], []
   for _ in range(epochs):
     for indices in permutation.view(count, size):
       for optimizer in optimizers:
-        optimizer.zero_grad(set_to_none=True)
+        optimizer.zero_grad(set_to_none=zero_grad_set_to_none)
       total = targets.new_zeros(())
       for chunk in indices.split(microbatch_size or size):
         loss = (

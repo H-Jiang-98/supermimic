@@ -1,8 +1,7 @@
-"""Private CUDA capture for one prepared EIT microbatch and its backward.
+"""Private single-graph capture of a complete EIT actor/critic update.
 
-Gradients belong to the learner and accumulate across calls. Inputs and returned
-outputs belong to this cache; callers must consume/copy outputs before reuse.
-No optimizer, RNG, provider state or host numerical checks run inside the graph.
+Inputs and outputs belong to the cache. Sampling, preparation, host checks and
+Python step counters belong to the caller, outside capture and replay.
 """
 
 from dataclasses import fields, is_dataclass
@@ -36,8 +35,8 @@ def _identity(tensors):
   return [(id(t), t.data_ptr(), _layout(t), t.stride()) for t in tensors]
 
 
-class CapturedActorBackward:
-  """Three real warmup calls, then one replay per submitted microbatch.
+class CapturedPolicyUpdate:
+  """Three real policy updates warm up; subsequent updates replay one graph.
 
   Uses a private pool rather than the original learner's shared update-order pool.
   All eager warmup backwards run on the capture stream. Detached return values
@@ -58,7 +57,7 @@ class CapturedActorBackward:
 
   def check_state(self):
     if _identity(self._state()) != self._identity:
-      raise RuntimeError("EIT actor graph dependency or gradient storage moved")
+      raise RuntimeError("EIT policy graph dependency or gradient storage moved")
 
   @property
   def stats(self):
@@ -70,9 +69,11 @@ class CapturedActorBackward:
       "capture_seconds": self.capture_seconds,
     }
 
-  def __call__(self, prepared, process_noise, measurement_noise, total_samples):
+  def __call__(
+    self, prepared, process_noise, measurement_noise, total_samples, permutation
+  ):
     self.check_state()
-    inputs = prepared, process_noise, measurement_noise, total_samples
+    inputs = prepared, process_noise, measurement_noise, total_samples, permutation
     spec = _map_inputs(inputs, _layout, describe=True)
     if self._inputs is None:
 
@@ -85,7 +86,7 @@ class CapturedActorBackward:
       self._spec = spec
     else:
       if spec != self._spec:
-        raise RuntimeError("EIT actor graph input structure changed")
+        raise RuntimeError("EIT policy graph input structure changed")
       destination = iter(self._input_tensors)
 
       def copy(value):
@@ -104,6 +105,9 @@ class CapturedActorBackward:
             outputs = self._fn(*self._inputs)
         finally:
           current.wait_stream(self._stream)
+        # Optimizer moments are allocated lazily by the first real update.
+        self._owned_state = self._state()
+        self._identity = _identity(self._owned_state)
         self.warmup_calls += 1
         self.warmup_seconds += perf_counter() - begin
         return outputs

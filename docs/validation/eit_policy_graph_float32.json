@@ -1,0 +1,179 @@
+{
+  "date": "2026-11-25",
+  "baseline_commit": "8e0119df88494264ecfc1bb0b50d641763a869cd",
+  "baseline_worktree_patch_sha256": "e89206dd53d1f3ccbc812ecac0d8edf4d72400d384ec42e01b16196bc0a48c54",
+  "protocol": {
+    "gpu_index": 0,
+    "seed": 2027,
+    "production_networks": true,
+    "batch": 4096,
+    "microbatch": 1024,
+    "horizon": 32,
+    "samples": 1,
+    "warmup_policy_updates": 4,
+    "timed_policy_updates": 10,
+    "same_initial_weights_starts_noises_and_critic_rng": true,
+    "capture_scope": "one actor update and all critic epochs/minibatches",
+    "excluded": "physics collection and world model fitting",
+    "note": "Sequential measurements with existing compilation caches; setup is not a cold-compile comparison. The secondary no-replay row used two warmup updates."
+  },
+  "actor_only_baseline": {
+    "batch": 4096,
+    "horizon": 32,
+    "small": false,
+    "dtype": "float32",
+    "compiled": true,
+    "torch_version": "2.14.0+cu130",
+    "gpu": "NVIDIA RPBZZZ6",
+    "kind": "graph_policy_update",
+    "microbatch": 1024,
+    "median_ms": 8086.005861405283,
+    "times_ms": [
+      8080.494248773903,
+      8090.790734626353,
+      8093.68637483567,
+      8094.024564139545,
+      8082.070700824261,
+      8094.386678189039,
+      8089.941021986306,
+      8073.9906509406865,
+      8078.433596063405,
+      8078.17322621122
+    ],
+    "phase_median_ms": {
+      "policy_rollout_backward_seconds": 7995.981056476012,
+      "policy_prepare_seconds": 368.4133110046387,
+      "policy_backward_seconds": 7616.345825195312,
+      "critic_regression_seconds": 80.2325049880892
+    },
+    "setup_seconds": 60.12879153620452,
+    "setup_peak_allocated_bytes": 53262834176,
+    "peak_allocated_bytes": 2986983936,
+    "peak_reserved_bytes": 57021562880,
+    "graph": {
+      "requested": true,
+      "reason": "enabled",
+      "warmup_calls": 3,
+      "replay_calls": 53,
+      "captures": 1,
+      "warmup_seconds": 27.01068221917376,
+      "capture_seconds": 6.114508913829923
+    }
+  },
+  "single_policy_graph": {
+    "batch": 4096,
+    "horizon": 32,
+    "small": false,
+    "dtype": "float32",
+    "compiled": true,
+    "torch_version": "2.14.0+cu130",
+    "gpu": "NVIDIA RPBZZZ6",
+    "kind": "graph_policy_update",
+    "microbatch": 1024,
+    "median_ms": 8044.342099688947,
+    "times_ms": [
+      8071.611527353525,
+      8041.475205216557,
+      8045.597749762237,
+      8040.774387773126,
+      8041.785936802626,
+      8047.19672491774,
+      8041.777454782277,
+      8044.802732765675,
+      8045.061368029565,
+      8043.88146661222
+    ],
+    "phase_median_ms": {
+      "policy_prepare_seconds": 351.9898259546608,
+      "policy_update_seconds": 7676.138353534043,
+      "policy_check_seconds": 2.2038135211914778
+    },
+    "setup_seconds": 90.6713465899229,
+    "setup_peak_allocated_bytes": 54297096192,
+    "peak_allocated_bytes": 1843459584,
+    "peak_reserved_bytes": 57996738560,
+    "graph": {
+      "requested": true,
+      "scope": "actor_critic",
+      "reason": "enabled",
+      "warmup_calls": 3,
+      "replay_calls": 11,
+      "captures": 1,
+      "warmup_seconds": 60.612736113835126,
+      "capture_seconds": 20.68716625124216
+    }
+  },
+  "compiled_without_replay_secondary": {
+    "batch": 4096,
+    "horizon": 32,
+    "small": false,
+    "dtype": "float32",
+    "compiled": true,
+    "torch_version": "2.14.0+cu130",
+    "gpu": "NVIDIA RPBZZZ6",
+    "kind": "compiled_policy_update",
+    "microbatch": 1024,
+    "median_ms": 15613.525292603299,
+    "times_ms": [
+      15781.184528954327,
+      15984.511954244226,
+      15158.91452273354,
+      15702.30514369905,
+      15309.700238052756,
+      15842.942256014794,
+      15211.755360942334,
+      15587.468233890831,
+      15043.972850311548,
+      15639.582351315767
+    ],
+    "phase_median_ms": {
+      "policy_rollout_backward_seconds": 15527.027942473069,
+      "policy_prepare_seconds": 356.7527046203613,
+      "policy_backward_seconds": 15153.201293945312,
+      "critic_regression_seconds": 79.18307790532708
+    },
+    "setup_seconds": 49.62973154708743,
+    "setup_peak_allocated_bytes": 53167448576,
+    "peak_allocated_bytes": 53155799552,
+    "peak_reserved_bytes": 56216256512,
+    "graph": {
+      "requested": false,
+      "reason": "disabled"
+    }
+  },
+  "comparison": {
+    "policy_update_speedup": 1.0051792627911669,
+    "policy_update_time_reduction_percent": 0.5152576244743856,
+    "peak_reserved_increase_bytes": 975175680
+  },
+  "validation_runs": [
+    {
+      "suite": "test_estimator_eit_graph.py, initial graph regression",
+      "passed": 18
+    },
+    {
+      "suite": "additional critic gradient/norm overflow, LR, compiled fallback/reentry, live collection/model/policy save/resume",
+      "passed": 5,
+      "note": "Includes one extended test from the first run; 22 distinct graph tests covered across both runs."
+    },
+    {
+      "suite": "learner utils, belief policy, EIT training/profiling/launch/RNG",
+      "passed": 94
+    },
+    {
+      "suite": "pilot report and EIT launch",
+      "passed": 83
+    },
+    {
+      "suite": "original policy learner and learner utils",
+      "passed": 10
+    }
+  ],
+  "source_sha256": {
+    "src/supermimic/learners/belief_policy_learner.py": "9269e861b7bb89ac2579b4db02cd693d1d2154f80099347c1f5fade023d8305e",
+    "src/supermimic/learners/eit_policy_graph.py": "e935e1edf598db436d52f23c8a09cd798b5b57402c10ad790812c1dc86e63fb4",
+    "src/supermimic/learners/learner_utils.py": "67e481607bed4682d696b754f844d03935ea1ef82bc2c06661f6229c9f61f119",
+    "tests/test_estimator_eit_graph.py": "eebb316287ca8f6f5fe1a6e11e0eea21407301735114b487eae1dee64aa18b90",
+    "docs/validation/benchmark_square_root_filter.py": "e0d9c4166c4d2b2e12b46673140712744050c44690f9f948b3ff07454d6a4918"
+  }
+}

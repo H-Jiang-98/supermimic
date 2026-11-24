@@ -21,7 +21,7 @@ from supermimic.imagined_rollout import (
   observe,
   prepare_rollout,
 )
-from supermimic.learners.eit_actor_graph import CapturedActorBackward
+from supermimic.learners.eit_policy_graph import CapturedPolicyUpdate
 from supermimic.learners.learner_utils import (
   build_optimizers,
   fit_critic,
@@ -144,24 +144,29 @@ class BeliefActorCriticPolicyLearner:
       self.generators[name] = generator
     self._v_max = wm_env.max_step_reward / (1 - self.cfg.gamma)
     self.cuda_graphs = cuda_graphs
-    self._actor_graph = None
-    self._actor_graph_signature = None
-    self._actor_graph_stream = None
+    self._policy_graph = None
+    self._policy_graph_signature = None
+    self._policy_graph_stream = None
     self._graph_reason = "disabled"
 
-  def clear_actor_graph(self):
+  def clear_policy_graph(self):
     """Discard process-local capture state after restore/failure/config changes."""
-    self._actor_graph = self._actor_graph_signature = None
+    self._policy_graph = self._policy_graph_signature = None
+
+  def clear_actor_graph(self):
+    """Compatibility name for callers that previously cleared actor-only capture."""
+    self.clear_policy_graph()
 
   @property
   def graph_status(self):
     return {
       "requested": self.cuda_graphs,
+      "scope": "actor_critic",
       "reason": self._graph_reason,
-      **(self._actor_graph.stats if self._actor_graph is not None else {}),
+      **(self._policy_graph.stats if self._policy_graph is not None else {}),
     }
 
-  def _actor_graph_state(self):
+  def _policy_graph_state(self):
     env = self.wm_env
     state = []
     for root in (self.actor, self.critic, env.dynamics, env.representation):
@@ -178,21 +183,27 @@ class BeliefActorCriticPolicyLearner:
       )
     )
     state.append(env.posterior_provider.estimator.default_joint_pos)
-    state.extend(p.grad for p in self.actor.parameters() if p.grad is not None)
+    for module in (self.actor, self.critic):
+      state.extend(p.grad for p in module.parameters() if p.grad is not None)
+    for optimizer in (*self.actor_optimizers, *self.critic_optimizers):
+      state.extend(t for values in optimizer.state.values() for t in values.values())
+      state.extend(
+        group["lr"] for group in optimizer.param_groups if torch.is_tensor(group["lr"])
+      )
     return state
 
-  def _select_actor_graph(self, count):
+  def _select_policy_graph(self, count):
     env, cfg = self.wm_env, self.cfg
     parameter = next(self.actor.parameters())
     if (
       self.cuda_graphs
       and parameter.is_cuda
       and self._uses_tensor_rollout
-      and self._actor_graph_stream is None
+      and self._policy_graph_stream is None
     ):
       # AccumulateGrad may survive cache destruction. Reuse this stream through
       # checkpoint restores, graph rebuilds, and whole-update eager fallbacks.
-      self._actor_graph_stream = torch.cuda.Stream(device=parameter.device)
+      self._policy_graph_stream = torch.cuda.Stream(device=parameter.device)
     reason = "enabled"
     if not self.cuda_graphs:
       reason = "disabled"
@@ -209,17 +220,26 @@ class BeliefActorCriticPolicyLearner:
       reason = "tail_microbatch"
     if reason != self._graph_reason:
       if self.cuda_graphs:
-        print(f"[INFO] EIT actor CUDA graph: {reason}", flush=True)
+        print(f"[INFO] EIT policy CUDA graph: {reason}", flush=True)
       self._graph_reason = reason
     if reason != "enabled":
       # A retained capture pool must not inflate the fallback's peak allocation.
-      self.clear_actor_graph()
+      self.clear_policy_graph()
       return None
 
     estimator, rep = env.posterior_provider.estimator, env.representation
     signature = (
       count,
       asdict(cfg),
+      tuple(
+        tuple(
+          (key, value)
+          for key, value in group.items()
+          if key != "params" and not torch.is_tensor(value)
+        )
+        for optimizer in (*self.actor_optimizers, *self.critic_optimizers)
+        for group in optimizer.param_groups
+      ),
       asdict(env.estimator_input_config),
       asdict(env._eit_critic_config()),
       asdict(estimator.config),
@@ -242,34 +262,19 @@ class BeliefActorCriticPolicyLearner:
       id(self._actor_with_aux),
       getattr(self._rollout_kernel, "__func__", self._rollout_kernel),
     )
-    if self._actor_graph is not None and signature != self._actor_graph_signature:
-      self.clear_actor_graph()
-    if self._actor_graph is None:
-      for parameter in self.actor.parameters():
-        parameter.grad = torch.zeros_like(parameter)
-      self._actor_graph = CapturedActorBackward(
-        self._actor_backward, self._actor_graph_state, self._actor_graph_stream
+    if self._policy_graph is not None and signature != self._policy_graph_signature:
+      self.clear_policy_graph()
+    if self._policy_graph is None:
+      for module in (self.actor, self.critic):
+        for parameter in module.parameters():
+          parameter.grad = torch.zeros_like(parameter)
+      self._policy_graph = CapturedPolicyUpdate(
+        self._policy_update, self._policy_graph_state, self._policy_graph_stream
       )
-      self._actor_graph_signature = signature
+      self._policy_graph_signature = signature
     else:
-      self._actor_graph.check_state()
-    return self._actor_graph
-
-  def _eager_actor_backward(
-    self, prepared, process_noise, measurement_noise, count, *, starts
-  ):
-    stream = self._actor_graph_stream
-    arguments = prepared, process_noise, measurement_noise, count
-    if stream is None or stream.device != process_noise.device:
-      return self._actor_backward(*arguments, starts=starts)
-    with torch.cuda.device(process_noise.device):
-      current = torch.cuda.current_stream()
-      stream.wait_stream(current)
-      try:
-        with torch.cuda.stream(stream):
-          return self._actor_backward(*arguments, starts=starts)
-      finally:
-        current.wait_stream(stream)
+      self._policy_graph.check_state()
+    return self._policy_graph
 
   def _actor_backward(
     self, prepared, process_noise, measurement_noise, count, *, starts=None
@@ -528,16 +533,33 @@ class BeliefActorCriticPolicyLearner:
     try:
       self._validate_noises(starts, process_noise, measurement_noise)
       if self._uses_tensor_rollout:
-        # Check the whole logical batch before touching gradients or optimizers.
+        # Preparation and input checks run before any captured optimizer step.
         self.wm_env.validate_policy_start(starts)
         if self._actor_with_aux is None:
           raise TypeError("Belief training actor requires forward_with_aux")
+      count = len(starts) * self.cfg.num_samples
+      graph = self._select_policy_graph(count)
+      if graph is not None:
+        return self._update_with_graph(graph, starts, process_noise, measurement_noise)
+      stream = self._policy_graph_stream
+      if stream is None:
+        return self._update_from_eager(starts, process_noise, measurement_noise)
+      # Keep critic as well as actor AccumulateGrad on its original stream after
+      # restore, recapture or an eager fallback.
+      current = torch.cuda.current_stream(stream.device)
+      stream.wait_stream(current)
+      try:
+        with torch.cuda.stream(stream):
+          return self._update_from_eager(starts, process_noise, measurement_noise)
+      finally:
+        current.wait_stream(stream)
     except Exception:
-      if self._actor_graph is not None:
-        self.clear_actor_graph()
-        for optimizer in (*self.actor_optimizers, *self.critic_optimizers):
-          optimizer.zero_grad(set_to_none=True)
+      self.clear_policy_graph()
+      for optimizer in (*self.actor_optimizers, *self.critic_optimizers):
+        optimizer.zero_grad(set_to_none=True)
       raise
+
+  def _update_from_eager(self, starts, process_noise, measurement_noise):
     timer = PhaseTimer(next(self.actor.parameters()).device)
     self.last_profile = timer.seconds
     cfg, env = self.cfg, self.wm_env
@@ -559,14 +581,8 @@ class BeliefActorCriticPolicyLearner:
         module.zero_grad(set_to_none=True)
       actor_start = timer.now()
       try:
-        graph = self._select_actor_graph(count)
-        if graph is None:
-          for optimizer in self.actor_optimizers:
-            optimizer.zero_grad(set_to_none=True)
-        else:
-          for parameter in self.actor.parameters():
-            parameter.grad.zero_()
-        invalid = process_noise.new_zeros((), dtype=torch.bool)
+        for optimizer in self.actor_optimizers:
+          optimizer.zero_grad(set_to_none=True)
         stream_timer = StreamTimer(process_noise.device)
         for offset in range(0, count, cfg.microbatch_size):
           selected = slice(offset, offset + cfg.microbatch_size)
@@ -588,28 +604,15 @@ class BeliefActorCriticPolicyLearner:
               measurement_noise[:, selected],
               count,
             )
-            regression, metrics, failed = (
-              graph(*arguments)
-              if graph is not None
-              else self._eager_actor_backward(*arguments, starts=batch)
-            )
-          if graph is not None:
-            # Replay overwrites graph outputs. Own critic samples before reuse.
-            data.append(tuple(value.clone() for value in regression))
-            invalid.logical_or_(failed.any())
-          else:
-            if failed.any():
-              raise FloatingPointError("Invalid imagined rollout; actor step rejected")
-            data.append(regression)
+            regression, metrics, failed = self._actor_backward(*arguments, starts=batch)
+          if failed.any():
+            raise FloatingPointError("Invalid imagined rollout; actor step rejected")
+          data.append(regression)
           for name, value in metrics.items():
             totals[name] = totals.get(name, 0) + value
           del prepared, arguments, regression, metrics, failed
           self._clear_rollout()
 
-        if graph is not None:
-          if invalid:
-            raise FloatingPointError("Invalid imagined rollout; actor step rejected")
-          graph.check_state()
         if self._uses_tensor_rollout:
           env.check_policy_start_identity(starts)
         self._check_gradients(self.actor)
@@ -664,27 +667,11 @@ class BeliefActorCriticPolicyLearner:
           else:
             explained = targets.new_tensor(float("nan"))
         timer.seconds["critic_regression_seconds"] = timer.now() - critic_start
-        return {
-          "Policy/return": totals["return"] / count,
-          "Policy/raw_reward": totals["raw_reward_sum"] / totals["valid_steps"],
-          "Policy/bootstrap": totals["bootstrap"] / count,
-          "Policy/bootstrap_fraction": totals["bootstrap"].abs()
-          / totals["return"].abs().clamp_min(1e-8),
-          "Policy/final_survival": totals["final_survival"] / count,
-          "Policy/valid_steps": totals["valid_steps"],
-          "Policy/survival_weighted_steps": totals["survival_weighted_steps"],
-          "Policy/action_saturation": totals["action_saturation"]
-          / totals["valid_steps"],
-          "Policy/film_gamma": totals["film_scale"][0] / totals["valid_steps"],
-          "Policy/film_beta": totals["film_scale"][1] / totals["valid_steps"],
-          "Policy/value_clamp_fraction": totals["value_clamp_fraction"] / count,
-          "Policy/critic_loss": critic_loss,
-          "Policy/explained_variance": explained,
-          "Grad/actor_norm": actor_norm.detach(),
-          "Grad/critic_norm": critic_norm.detach(),
-        }
+        return self._policy_metrics(
+          totals, count, actor_norm, critic_loss, critic_norm, explained
+        )
       except Exception:
-        self.clear_actor_graph()
+        self.clear_policy_graph()
         for optimizer in (*self.actor_optimizers, *self.critic_optimizers):
           optimizer.zero_grad(set_to_none=True)
         raise
@@ -692,6 +679,146 @@ class BeliefActorCriticPolicyLearner:
         self._clear_rollout()
         if not self._uses_tensor_rollout and hasattr(self.actor, "_aux_loss"):
           self.actor._aux_loss = next(self.actor.parameters()).new_empty(0)
+
+  def _update_with_graph(self, graph, starts, process_noise, measurement_noise):
+    cfg, env = self.cfg, self.wm_env
+    timer = PhaseTimer(process_noise.device)
+    self.last_profile = timer.seconds
+    modules = (self.actor, self.critic, env.dynamics, env.representation)
+    with env.readonly_policy_motion(), env.dynamics.readonly(), _module_modes(modules):
+      for module in (env.dynamics, env.representation):
+        module.eval().requires_grad_(False)
+        module.zero_grad(set_to_none=True)
+      with timer.measure("policy_prepare_seconds"):
+        starts = starts.repeat_interleave(cfg.num_samples)
+        process_noise = process_noise.detach().flatten(1, 2)
+        measurement_noise = measurement_noise.detach().flatten(1, 2)
+        count = len(starts)
+        prepared = []
+        for offset in range(0, count, cfg.microbatch_size):
+          selected = slice(offset, offset + cfg.microbatch_size)
+          prepared.append(
+            prepare_rollout(
+              env,
+              starts.index(selected),
+              cfg.horizon,
+              process_noise[:, selected],
+              measurement_noise[:, selected],
+            )
+          )
+        env.check_policy_start_identity(starts)
+        samples = cfg.horizon * count
+        minibatches = min(cfg.critic_minibatches, samples)
+        permutation = torch.randperm(
+          samples // minibatches * minibatches,
+          device=process_noise.device,
+          generator=self.generators["critic"],
+        )
+      with timer.measure("policy_update_seconds"):
+        metrics, invalid = graph(
+          tuple(prepared), process_noise, measurement_noise, count, permutation
+        )
+      # The complete update has executed, even if its results fail validation.
+      self.actor_steps += 1
+      self.critic_steps += cfg.critic_epochs * minibatches
+      with timer.measure("policy_check_seconds"):
+        graph.check_state()
+        env.check_policy_start_identity(starts)
+        finite = torch.stack(
+          [
+            torch.isfinite(value).all()
+            for name, value in metrics.items()
+            if name != "Policy/explained_variance"
+          ]
+        ).all()
+        if invalid or not finite:
+          raise FloatingPointError(
+            "Invalid EIT policy update after execution; parameters may have changed"
+          )
+        return {name: value.clone() for name, value in metrics.items()}
+
+  def _policy_update(
+    self, prepared, process_noise, measurement_noise, count, permutation
+  ):
+    """Single capture body: all actor microbatches and all critic optimizer steps."""
+    cfg = self.cfg
+    self.actor.train().requires_grad_(True)
+    self.critic.eval().requires_grad_(False)
+    for optimizer in self.actor_optimizers:
+      optimizer.zero_grad(set_to_none=False)
+    data, totals = [], {}
+    invalid = process_noise.new_zeros((), dtype=torch.bool)
+    for index, batch in enumerate(prepared):
+      offset = index * cfg.microbatch_size
+      selected = slice(offset, offset + cfg.microbatch_size)
+      regression, metrics, failed = self._actor_backward(
+        batch, process_noise[:, selected], measurement_noise[:, selected], count
+      )
+      data.append(regression)
+      invalid.logical_or_(failed.any())
+      for name, value in metrics.items():
+        totals[name] = totals.get(name, 0) + value
+    actor_norm = torch.nn.utils.clip_grad_norm_(
+      self.actor.parameters(), cfg.max_grad_norm, error_if_nonfinite=False
+    )
+    if cfg.grad_clip_value:
+      torch.nn.utils.clip_grad_value_(self.actor.parameters(), cfg.grad_clip_value)
+    for optimizer in self.actor_optimizers:
+      optimizer.step()
+    self.actor.requires_grad_(False)
+    self.critic.requires_grad_(True)
+    features, targets = (
+      torch.cat(chunks, dim=1).flatten(0, 1) for chunks in zip(*data, strict=True)
+    )
+    del data
+    critic_loss, critic_norm, _ = fit_critic(
+      self.critic,
+      self.critic_optimizers,
+      features,
+      targets,
+      epochs=cfg.critic_epochs,
+      minibatches=cfg.critic_minibatches,
+      microbatch_size=cfg.critic_microbatch_size,
+      max_norm=cfg.max_grad_norm,
+      permutation=permutation,
+      zero_grad_set_to_none=False,
+    )
+    with torch.no_grad():
+      variance = targets.var(unbiased=False)
+      size = cfg.critic_microbatch_size or len(targets)
+      for start in range(0, len(targets), size):
+        chunk = slice(start, start + size)
+        targets[chunk].sub_(self.critic(features[chunk]).squeeze(-1))
+      invalid.logical_or_(~torch.isfinite(targets).all())
+      explained = torch.where(
+        variance > 0,
+        1 - targets.var(unbiased=False) / variance,
+        variance.new_full((), float("nan")),
+      )
+    return self._policy_metrics(
+      totals, count, actor_norm, critic_loss, critic_norm, explained
+    ), invalid
+
+  @staticmethod
+  def _policy_metrics(totals, count, actor_norm, critic_loss, critic_norm, explained):
+    return {
+      "Policy/return": totals["return"] / count,
+      "Policy/raw_reward": totals["raw_reward_sum"] / totals["valid_steps"],
+      "Policy/bootstrap": totals["bootstrap"] / count,
+      "Policy/bootstrap_fraction": totals["bootstrap"].abs()
+      / totals["return"].abs().clamp_min(1e-8),
+      "Policy/final_survival": totals["final_survival"] / count,
+      "Policy/valid_steps": totals["valid_steps"],
+      "Policy/survival_weighted_steps": totals["survival_weighted_steps"],
+      "Policy/action_saturation": totals["action_saturation"] / totals["valid_steps"],
+      "Policy/film_gamma": totals["film_scale"][0] / totals["valid_steps"],
+      "Policy/film_beta": totals["film_scale"][1] / totals["valid_steps"],
+      "Policy/value_clamp_fraction": totals["value_clamp_fraction"] / count,
+      "Policy/critic_loss": critic_loss,
+      "Policy/explained_variance": explained,
+      "Grad/actor_norm": actor_norm.detach(),
+      "Grad/critic_norm": critic_norm.detach(),
+    }
 
   def _contract(self):
     return {
@@ -754,7 +881,7 @@ class BeliefActorCriticPolicyLearner:
 
   def load_state_dict(self, state):
     self.validate_state_dict(state)
-    self.clear_actor_graph()
+    self.clear_policy_graph()
     for name, optimizers in (
       ("actor", self.actor_optimizers),
       ("critic", self.critic_optimizers),

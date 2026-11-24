@@ -42,6 +42,9 @@ PHASES = (
   "posterior_prefix_normalization_seconds",
   "posterior_cache_normalization_seconds",
   "posterior_cache_read_seconds",
+  "policy_prepare_seconds",
+  "policy_update_seconds",
+  "policy_check_seconds",
   "policy_rollout_backward_seconds",
   "critic_regression_seconds",
   "checkpoint_save_seconds",
@@ -738,6 +741,19 @@ def _audit_group(audit, group, p, validation, commands):
   for row in profiles:
     for phase in PHASES:
       seconds = row.get("seconds", {})
+      # A single policy graph has one complete-update timing; older/eager logs
+      # retain separate actor and critic phases instead.
+      if (
+        phase
+        in ("policy_prepare_seconds", "policy_update_seconds", "policy_check_seconds")
+        and phase not in seconds
+      ):
+        continue
+      if (
+        phase in ("policy_rollout_backward_seconds", "critic_regression_seconds")
+        and "policy_update_seconds" in seconds
+      ):
+        continue
       # Prefix rebuilding and incremental cache reading are distinct protocols.
       if (
         phase == "posterior_prefix_normalization_seconds"

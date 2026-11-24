@@ -2,7 +2,8 @@
 
 Preparation is an eager boundary. ``observe`` and ``imagine_step`` consume only
 local tensors and read-only model/configuration dependencies. Their device-side
-status must be checked before an optimizer may consume the rollout gradients.
+status is checked by the caller: before eager optimization, or after the complete
+actor/critic update when CUDA graph replay is enabled.
 """
 
 from dataclasses import dataclass

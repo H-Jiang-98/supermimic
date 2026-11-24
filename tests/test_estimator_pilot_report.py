@@ -1210,3 +1210,24 @@ def test_step_validation_requires_the_raw_final_episodes_and_actor_updates(
   assert any(
     "raw validation tasks are missing" in item for item in audit_sources().pending
   )
+
+
+@pytest.mark.parametrize("single_graph", [False, True])
+def test_report_accepts_single_graph_and_legacy_policy_timings(
+  tmp_path, monkeypatch, single_graph
+):
+  fixture(tmp_path, monkeypatch)
+  for group in "ABC":
+    path = tmp_path / group / "profiling.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    omitted = (
+      ("policy_rollout_backward_seconds", "critic_regression_seconds")
+      if single_graph
+      else ("policy_prepare_seconds", "policy_update_seconds", "policy_check_seconds")
+    )
+    for row in rows:
+      for name in omitted:
+        row["seconds"].pop(name, None)
+    write(path, rows, lines=True)
+  report = build_report(tmp_path)
+  assert report["status"] == "complete", report

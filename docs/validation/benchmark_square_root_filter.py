@@ -25,7 +25,7 @@ parser.add_argument("--small", action="store_true")
 parser.add_argument(
   "--compare-policy-graph",
   action="store_true",
-  help="Compare complete fixed-input policy updates with/without actor CUDA replay",
+  help="Compare complete fixed-input policy updates with/without complete policy CUDA replay",
 )
 parser.add_argument("--microbatch", type=int, default=1024)
 args = parser.parse_args()
@@ -213,15 +213,12 @@ else:
           torch.cuda.empty_cache()
           torch.cuda.reset_peak_memory_stats()
           begin = time.perf_counter()
-          # At least four microbatch calls: three warmups plus capture/replay.
-          warmups = max(
-            2,
-            (4 + args.batch // args.microbatch - 1) // (args.batch // args.microbatch),
-          )
+          # Three complete updates warm up both optimizers; the fourth captures.
+          warmups = 4
           for _ in range(warmups):
             policy.update_from(starts, *fixed_noises)
           if enabled and policy.graph_status.get("captures") != 1:
-            raise RuntimeError("Benchmark did not reach actor CUDA replay")
+            raise RuntimeError("Benchmark did not reach policy CUDA replay")
           torch.cuda.synchronize()
           setup_seconds = time.perf_counter() - begin
           setup_peak = torch.cuda.max_memory_allocated()
