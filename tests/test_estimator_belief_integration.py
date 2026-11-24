@@ -311,9 +311,11 @@ def test_two_step_fixed_noise_policy_gradient_and_covariance_sensitivity():
   measurement = torch.randn(2, BATCH, 64)
 
   def rollout():
-    nonlocal covariance
+    nonlocal covariance_sqrt
     obs = env.reset(episode_id=torch.arange(BATCH), time_index=0)
-    covariance = env.posterior_provider.state.belief.covariance.requires_grad_()
+    covariance_sqrt = (
+      env.posterior_provider.state.belief.covariance_sqrt.requires_grad_()
+    )
     rewards = []
     for k in range(2):
       obs, reward, _, _ = env.step(
@@ -322,10 +324,12 @@ def test_two_step_fixed_noise_policy_gradient_and_covariance_sensitivity():
       rewards.append(reward)
     return torch.stack(rewards).sum() / BATCH
 
-  covariance = None
+  covariance_sqrt = None
   parameter = actor.decoder[-1].bias
   loss = rollout()
-  gradient, covariance_gradient = torch.autograd.grad(loss, (parameter, covariance))
+  gradient, covariance_gradient = torch.autograd.grad(
+    loss, (parameter, covariance_sqrt)
+  )
   assert torch.isfinite(gradient).all() and gradient.norm() > 1e-6
   assert torch.isfinite(covariance_gradient).all() and covariance_gradient.norm() > 1e-7
   assert all(p.grad is None for p in env.dynamics.parameters())
@@ -468,9 +472,9 @@ def test_runner_reads_matching_restored_frame_directly_from_provider(ready_flag)
     elif change == "width":
       bad["context"] = saved["context"].repeat(1, 2)
     else:
-      bad["mean"], bad["covariance"] = (
+      bad["mean"], bad["covariance_sqrt"] = (
         saved["mean"].double(),
-        saved["covariance"].double(),
+        saved["covariance_sqrt"].double(),
       )
     with pytest.raises(ValueError):
       real.load_state_dict(bad)
@@ -776,7 +780,7 @@ def test_model_bundle_restores_filter_noise_and_prior_without_online_state():
     return WorldModel(rep, model, torch.nn.Identity(), 700, 29)
 
   wm = build()
-  wm.filter_config = FilterConfig(jitter_initial=1e-6)
+  wm.filter_config = FilterConfig(validate_numerics=True)
   wm.initial_prior = GaussianStatePrior((0.02,) * 6)
   wm.representation.configure_estimator_measurement(
     GaussianMeasurementConfig(joint_position_std=0.0003)
@@ -790,7 +794,7 @@ def test_model_bundle_restores_filter_noise_and_prior_without_online_state():
     restored.representation.measurement_config == wm.representation.measurement_config
   )
   assert restored.dynamics.model_version == wm.dynamics.model_version
-  del bundle["estimator"]["filter_config"]["jitter_max"]
+  del bundle["estimator"]["filter_config"]["validate_numerics"]
   with pytest.raises(ValueError, match="Incomplete"):
     restored.load_bundle(bundle)
 
@@ -817,7 +821,7 @@ def test_invalid_bundle_does_not_partially_restore_model_or_configuration(
     return WorldModel(rep, model, context, 700, 29)
 
   source, target = build(0.02), build(0.01)
-  source.filter_config = FilterConfig(jitter_initial=1e-6)
+  source.filter_config = FilterConfig(validate_numerics=True)
   source.initial_prior = GaussianStatePrior((0.02,) * 6)
   source.sim_context.mean.add_(0.1)
   source.sim_context.scale.mul_(2)

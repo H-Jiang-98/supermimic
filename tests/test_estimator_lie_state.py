@@ -265,7 +265,8 @@ def test_belief_projection_features_and_tensor_lifecycle():
 def test_belief_validation_accepts_psd_and_rejects_invalid_boundaries():
   state = _state()
   covariance = torch.eye(70, dtype=torch.float64).expand(2, -1, -1).clone()
-  BeliefState(state, torch.zeros_like(covariance)).validate()
+  with pytest.raises(torch.linalg.LinAlgError):
+    BeliefState(state, torch.zeros_like(covariance))
   belief = BeliefState(state, covariance)
   with pytest.raises(ValueError, match="tangent version"):
     replace(belief, tangent_version="wrong").validate()
@@ -274,11 +275,11 @@ def test_belief_validation_accepts_psd_and_rejects_invalid_boundaries():
   negative = covariance.clone()
   negative[:, 0, 0] = -0.1
   with pytest.raises(ValueError, match="positive semidefinite"):
-    replace(belief, covariance=negative).validate()
+    BeliefState(belief.mean, negative).validate()
   asymmetric = covariance.clone()
   asymmetric[:, 0, 1] = 0.1
   with pytest.raises(ValueError, match="asymmetric"):
-    replace(belief, covariance=asymmetric).validate()
+    BeliefState(belief.mean, asymmetric).validate()
   with pytest.raises(ValueError, match="orthonormal"):
     replace(state, rotation=state.rotation * 2).validate()
 

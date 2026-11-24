@@ -71,7 +71,7 @@ def _cat_beliefs(beliefs: list[BeliefState]) -> BeliefState:
     LieState(
       *(torch.cat([getattr(b.mean, f.name) for b in beliefs]) for f in fields(LieState))
     ),
-    torch.cat([b.covariance for b in beliefs]),
+    covariance_sqrt=torch.cat([b.covariance_sqrt for b in beliefs]),
   )
 
 
@@ -436,7 +436,7 @@ class WorldModelEnv(ABC):
 
     for requested in batched(times, batch_size, strict=False):
       with torch.inference_mode(False), torch.no_grad():
-        means, covariances = [], []
+        means, factors = [], []
         positions = [t - first for t in requested]
         for position in positions:
           for k in range(next_step, position + 1):
@@ -446,12 +446,12 @@ class WorldModelEnv(ABC):
             current = estimator.correct(predicted, sensors[k : k + 1, :64])
           next_step = position + 1
           means.append(current.mean.to_full())
-          covariances.append(current.covariance)
+          factors.append(current.covariance_sqrt)
         indices = torch.tensor(positions, device=self.device)
         batch = frames[indices]
         batch["sensor_window"] = sensors[(indices[:, None] + offsets).clamp_min(0)]
         belief = BeliefState(
-          LieState.from_full(torch.cat(means)), torch.cat(covariances)
+          LieState.from_full(torch.cat(means)), covariance_sqrt=torch.cat(factors)
         )
       yield batch, belief
 

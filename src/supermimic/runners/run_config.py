@@ -10,6 +10,7 @@ from typing import Any, Union, get_args, get_origin, get_type_hints
 import torch
 
 from supermimic.critic_inputs import CRITIC_INPUT_VERSION, CriticInputConfig
+from supermimic.estimator import FilterConfig
 from supermimic.estimator_inputs import EITInputConfig, GaussianMeasurementConfig
 from supermimic.runners.eit_snapshots import checkpoint_snapshot_interval
 from supermimic.runners.supermimic_runner import SuperMimicRunnerCfg
@@ -62,7 +63,12 @@ def validate_eit_checkpoint_contract(
       revision = saved["model_revision"]
       compatible = (
         kind == "policy"
-        and saved.get("posterior_replay_protocol") == POSTERIOR_REPLAY_VERSION
+        and (
+          saved.get("posterior_replay_protocol") == POSTERIOR_REPLAY_VERSION
+          or for_inference
+          and saved.get("posterior_replay_protocol")
+          == "incremental_posterior_tril_f32_v1"
+        )
         and type(stride) is int
         and 1 <= stride <= saved["runner_config"]["buffer_size"]
         and type(revision) is int
@@ -157,6 +163,8 @@ def check_representation_matches(task_id: str, representation_name: str) -> None
 def _rebuild(
   cls: type, raw: dict[str, Any], defaulted: list[str] | None, prefix: str
 ) -> Any:
+  if cls is FilterConfig:
+    return FilterConfig.from_dict(raw)
   hints = get_type_hints(cls)
   kwargs: dict[str, Any] = {}
   if defaulted is None and raw.keys() != {

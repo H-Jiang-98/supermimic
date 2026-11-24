@@ -291,7 +291,7 @@ def test_malformed_checkpoint_does_not_partially_restore_any_live_component(comp
   elif component == "cov_optimizer":
     checkpoint["learner"]["cov"]["optimizer"]["state"][0]["exp_avg"] = torch.zeros(1)
   elif component == "filter":
-    checkpoint["world_model"]["estimator"]["filter_config"]["jitter_initial"] *= 2
+    checkpoint["world_model"]["estimator"]["filter_config"]["validate_numerics"] = True
   elif component == "prior":
     checkpoint["world_model"]["estimator"]["initial_prior"]["std"] = (0.02,) * 6
   elif component == "replay_mode":

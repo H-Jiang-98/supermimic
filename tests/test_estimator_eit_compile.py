@@ -95,7 +95,7 @@ def test_fixed_policy_rollout_compiled(group, backend, tmp_path):
     assert {
       ("models.py", "forward"),
       ("estimator.py", "_vector_jacobian"),
-      ("estimator.py", "_propagate_covariance"),
+      ("estimator.py", "_propagate_sqrt"),
     } <= graphs
   finally:
     env.close()

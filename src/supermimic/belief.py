@@ -18,76 +18,115 @@ from supermimic.utils.lie_state import (
 from supermimic.utils.validation import check_covariance
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class BeliefState:
+  """Gaussian state with a single authoritative square-root covariance.
+
+  The positional covariance constructor is an external-data boundary. Internal
+  code supplies ``covariance_sqrt=`` to transport factors without factorization
+  or numerical validation. ``covariance`` materializes a read-only view by value.
+  """
+
   mean: LieState
-  covariance: torch.Tensor
+  covariance_sqrt: torch.Tensor
   state_layout_version: str = STATE_LAYOUT_VERSION
   tangent_version: str = TANGENT_VERSION
 
-  def _with(self, mean: LieState, covariance: torch.Tensor) -> BeliefState:
+  def __init__(
+    self,
+    mean,
+    covariance=None,
+    state_layout_version=STATE_LAYOUT_VERSION,
+    tangent_version=TANGENT_VERSION,
+    *,
+    covariance_sqrt=None,
+  ):
+    if covariance is not None:
+      if covariance_sqrt is not None:
+        raise ValueError("Supply covariance or covariance_sqrt, not both")
+      check_covariance(
+        covariance, "Belief covariance", rtol=128 * torch.finfo(covariance.dtype).eps
+      )
+      covariance_sqrt = torch.linalg.cholesky(0.5 * (covariance + covariance.mT))
+    if covariance_sqrt is None:
+      raise ValueError("Belief requires a covariance or covariance_sqrt")
+    object.__setattr__(self, "mean", mean)
+    object.__setattr__(self, "covariance_sqrt", covariance_sqrt)
+    object.__setattr__(self, "state_layout_version", state_layout_version)
+    object.__setattr__(self, "tangent_version", tangent_version)
+
+  @property
+  def covariance(self) -> torch.Tensor:
+    return self.covariance_sqrt @ self.covariance_sqrt.mT
+
+  @property
+  def covariance_rpv(self) -> torch.Tensor:
+    # L is lower triangular; the leading marginal needs only its 9x9 block.
+    lower = self.covariance_sqrt[..., :9, :9]
+    return lower @ lower.mT
+
+  def _with(self, mean: LieState, lower: torch.Tensor) -> BeliefState:
     return BeliefState(
-      mean, covariance, self.state_layout_version, self.tangent_version
+      mean,
+      covariance_sqrt=lower,
+      state_layout_version=self.state_layout_version,
+      tangent_version=self.tangent_version,
     )
 
   def clone(self) -> BeliefState:
-    return self._with(self.mean.clone(), self.covariance.clone())
+    return self._with(self.mean.clone(), self.covariance_sqrt.clone())
 
   def detach(self) -> BeliefState:
-    return self._with(self.mean.detach(), self.covariance.detach())
+    return self._with(self.mean.detach(), self.covariance_sqrt.detach())
 
   def to(self, *args, **kwargs) -> BeliefState:
-    mean = self.mean.to(*args, **kwargs)
-    covariance = self.covariance.to(*args, **kwargs)
-    if torch.finfo(covariance.dtype).eps < torch.finfo(self.covariance.dtype).eps:
-      self.validate()
-      covariance = 0.5 * (covariance + covariance.mT)
-      # A PSD matrix rounded at source precision may have tiny negative
-      # eigenvalues at destination precision. Remove just that roundoff.
-      # A cast transports covariance derivatives unchanged on symmetric
-      # inputs; eigenvectors at repeated zero eigenvalues have no derivative.
-      with torch.no_grad():
-        std = covariance.diagonal(dim1=-2, dim2=-1).sqrt()
-        scale = torch.where(std > 0, std, 1)
-        correlation = covariance / scale.unsqueeze(-1) / scale.unsqueeze(-2)
-        eigenvalues, basis = torch.linalg.eigh(correlation)
-        repair = (basis * (-eigenvalues).clamp_min(0).unsqueeze(-2)) @ basis.mT
-        repair = repair * std.unsqueeze(-1) * std.unsqueeze(-2)
-      covariance = covariance + repair
-    return self._with(mean, covariance)
+    return self._with(
+      self.mean.to(*args, **kwargs), self.covariance_sqrt.to(*args, **kwargs)
+    )
 
   def index(self, selection) -> BeliefState:
-    return self._with(self.mean.index(selection), self.covariance[selection])
+    return self._with(self.mean.index(selection), self.covariance_sqrt[selection])
 
   def to_actor_input(self) -> PosteriorInput:
     return PosteriorInput(
       RpvState(self.mean.rotation, self.mean.position, self.mean.velocity),
-      self.covariance[..., :9, :9],
+      self.covariance_rpv,
     )
 
   @property
   def covariance_rtol(self) -> float:
-    return 128 * torch.finfo(self.covariance.dtype).eps
+    return 128 * torch.finfo(self.covariance_sqrt.dtype).eps
 
-  def validate(self) -> None:
-    """Check a boundary without modifying covariance or its computation graph."""
+  def validate_structure(self) -> None:
+    """Metadata-only checks, safe on the GPU hot path."""
     if self.state_layout_version != STATE_LAYOUT_VERSION:
       raise ValueError("Unsupported belief state layout version")
     if self.tangent_version != TANGENT_VERSION:
       raise ValueError("Unsupported belief tangent version")
-    self.mean.validate()
-    covariance = self.covariance
+    self.mean.validate_structure()
+    lower = self.covariance_sqrt
     expected = (*self.mean.position.shape[:-1], TANGENT_DIM, TANGENT_DIM)
-    if covariance.shape != expected or not covariance.is_floating_point():
-      raise ValueError("Belief covariance must match the mean batch and (...,70,70)")
-    if (
-      covariance.device != self.mean.position.device
-      or covariance.dtype != self.mean.position.dtype
-    ):
+    if lower.shape != expected or not lower.is_floating_point():
       raise ValueError(
-        "Belief mean and covariance must have identical device and dtype"
+        "Belief covariance factor must match the mean batch and (...,70,70)"
       )
-    check_covariance(covariance, "Belief covariance", rtol=self.covariance_rtol)
+    if (
+      lower.device != self.mean.position.device
+      or lower.dtype != self.mean.position.dtype
+    ):
+      raise ValueError("Belief mean and covariance factor must share dtype and device")
+
+  def validate(self) -> None:
+    """Explicit initialization/load/debug check; never called by filter kernels."""
+    self.validate_structure()
+    self.mean.validate()
+    lower = self.covariance_sqrt
+    if not torch.isfinite(lower).all():
+      raise ValueError("Belief covariance factor contains non-finite values")
+    if (lower.diagonal(dim1=-2, dim2=-1) <= 0).any() or lower.triu(1).count_nonzero():
+      raise ValueError(
+        "Belief covariance factor must be lower triangular with positive diagonal"
+      )
 
 
 def to_actor_input(belief: BeliefState) -> PosteriorInput:
@@ -116,5 +155,5 @@ class GaussianStatePrior:
       raise ValueError("Prior variances must be representable in the state dtype")
     shape = (*truth.position.shape[:-1], TANGENT_DIM)
     noise = torch.randn(shape, device=std.device, dtype=std.dtype, generator=generator)
-    covariance = torch.diag(std.square()).expand(*shape[:-1], TANGENT_DIM, TANGENT_DIM)
-    return BeliefState(boxplus(truth, noise * std), covariance)
+    lower = torch.diag(std).expand(*shape[:-1], TANGENT_DIM, TANGENT_DIM)
+    return BeliefState(boxplus(truth, noise * std), covariance_sqrt=lower)

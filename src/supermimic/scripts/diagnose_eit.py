@@ -17,7 +17,7 @@ from supermimic.critic_inputs import (
   CriticInputConfig,
   build_critic_features,
 )
-from supermimic.estimator import LieBeliefFilter
+from supermimic.estimator import FilterConfig, LieBeliefFilter
 from supermimic.evaluation_diagnostics import PosteriorBins
 from supermimic.learners.two_stage_wm import process_nll
 from supermimic.models import Dynamics
@@ -126,9 +126,11 @@ def _load_model(saved, cfg, device):
   if saved["learner"]["model_version"] != dynamics.model_version:
     raise ValueError("Saved learner and dynamics fingerprints disagree")
   estimator_meta = bundle["estimator"]
-  if estimator_meta["measurement_config"] != asdict(
-    cfg.estimator_inputs.measurement_noise
-  ) or estimator_meta["filter_config"] != asdict(cfg.filter_config):
+  if (
+    estimator_meta["measurement_config"]
+    != asdict(cfg.estimator_inputs.measurement_noise)
+    or FilterConfig.from_dict(estimator_meta["filter_config"]) != cfg.filter_config
+  ):
     raise ValueError("Saved filter and runner configuration disagree")
   dynamics.eval().requires_grad_(False)
   return dynamics, representation
@@ -307,7 +309,6 @@ def score_frames(estimator, record, device, bins, critic_info):
           ep["time_index"][t : t + 1].to(device),
           local_error(belief.mean, truth)[:, :9],
           belief.covariance[:, :9, :9],
-          diagnostic.jitter,
           diagnostic.innovation.norm(dim=-1),
           truth.position - belief.mean.position,
           truth.velocity - belief.mean.velocity,

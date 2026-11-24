@@ -227,20 +227,10 @@ class LieState:
     )
     return aux, rep
 
-  def validate(self) -> None:
-    """Validate an API boundary, outside jacrev/vmap and differentiable kernels."""
+  def validate_structure(self) -> None:
+    """Check tensor metadata without reading device values."""
     batch = self.position.shape[:-1]
-    state_fields = fields(self)
-    finite = []
-
-    def check_values():
-      if finite:
-        flags = torch.stack(finite)
-        if not flags.all():
-          name = state_fields[flags.tolist().index(False)].name
-          raise ValueError(f"LieState {name} must be finite")
-
-    for f in state_fields:
+    for f in fields(self):
       value = getattr(self, f.name)
       tail = (
         (3, 3)
@@ -248,13 +238,19 @@ class LieState:
         else ((NUM_JOINTS,) if f.name in ("joint_pos", "joint_vel") else (3,))
       )
       if value.shape != (*batch, *tail) or not value.is_floating_point():
-        check_values()
         raise ValueError(f"Invalid {f.name} shape or dtype in LieState")
       if value.device != self.position.device or value.dtype != self.position.dtype:
-        check_values()
         raise ValueError("All LieState fields must have identical device and dtype")
-      finite.append(torch.isfinite(value.detach()).all())
-    check_values()
+
+  def validate(self) -> None:
+    """Explicit numerical boundary check, outside differentiated kernels."""
+    self.validate_structure()
+    finite = torch.stack(
+      [torch.isfinite(getattr(self, f.name).detach()).all() for f in fields(self)]
+    )
+    if not finite.all():
+      name = fields(self)[finite.tolist().index(False)].name
+      raise ValueError(f"LieState {name} must be finite")
     validate_rotation(self.rotation)
 
 
@@ -335,32 +331,82 @@ def local_error(base: LieState, state: LieState) -> torch.Tensor:
 def reset_jacobian(delta: torch.Tensor) -> torch.Tensor:
   """d Log(Exp(-delta) Exp(delta+e)) / de at zero, including cross blocks.
 
-  The SE_2(3) right Jacobian is integral_0^1 exp(-t ad_delta) dt. An augmented
-  matrix exponential evaluates it without an inverse of the singular ad map,
-  supports all angles, and preserves outer derivatives through the correction.
+  Closed-form SE(3) cross blocks also apply independently to rho and nu.
+  See Sola et al., A micro Lie theory, Eq. (149):
+  https://arxiv.org/abs/1812.01537
+  All branches are tensor selections; no adaptive matrix_exp or host reads.
   """
   if delta.shape[-1] != TANGENT_DIM:
     raise ValueError("G1 reset correction must have 70 components")
-  theta = skew(delta[..., :3])
-  rho, nu = skew(delta[..., 3:6]), skew(delta[..., 6:9])
-  zero = torch.zeros_like(theta)
-  ad = torch.cat(
+  theta = -delta[..., :3]
+  squared = theta.square().sum(-1)[..., None, None]
+  safe = squared.clamp_min(1.0)
+  angle = safe.sqrt()
+  sine, cosine = angle.sin(), angle.cos()
+
+  # Horner Taylor polynomials avoid cancellation in float32 near zero and
+  # have finite first/second derivatives in both torch.where branches.
+  b0 = 0.5 + squared * (
+    -1 / 24
+    + squared
+    * (1 / 720 + squared * (-1 / 40320 + squared * (1 / 3628800 - squared / 479001600)))
+  )
+  a0 = 1 / 6 + squared * (
+    -1 / 120
+    + squared
+    * (
+      1 / 5040
+      + squared * (-1 / 362880 + squared * (1 / 39916800 - squared / 6227020800))
+    )
+  )
+  q0 = -1 / 24 + squared * (
+    1 / 720
+    + squared
+    * (
+      -1 / 40320
+      + squared * (1 / 3628800 + squared * (-1 / 479001600 + squared / 87178291200))
+    )
+  )
+  d0 = -1 / 120 + squared * (
+    1 / 5040
+    + squared
+    * (
+      -1 / 362880
+      + squared * (1 / 39916800 + squared * (-1 / 6227020800 + squared / 1307674368000))
+    )
+  )
+  # Keep the clamp boundary in the Taylor branch so its first and second
+  # derivatives do not depend on clamp_min's subgradient at equality.
+  use_taylor = squared <= 1
+  b = torch.where(use_taylor, b0, (1 - cosine) / safe)
+  a = torch.where(use_taylor, a0, (angle - sine) / (safe * angle))
+  q = torch.where(use_taylor, q0, (1 - safe / 2 - cosine) / safe.square())
+  d = torch.where(
+    use_taylor, d0, (angle - sine - angle * safe / 6) / (safe.square() * angle)
+  )
+  cross = skew(theta)
+  cross2 = cross @ cross
+  rotation = _eye(3, delta) + b * cross + a * cross2
+
+  def translation(vector):
+    u = skew(-vector)
+    middle = cross @ u @ cross
+    return (
+      0.5 * u
+      + a * (cross @ u + u @ cross + middle)
+      - q * (cross2 @ u + u @ cross2 - 3 * middle)
+      - 0.5 * (q - 3 * d) * (cross @ u @ cross2 + cross2 @ u @ cross)
+    )
+
+  zero = torch.zeros_like(cross)
+  right_jacobian = torch.cat(
     (
-      torch.cat((theta, zero, zero), -1),
-      torch.cat((rho, theta, zero), -1),
-      torch.cat((nu, zero, theta), -1),
+      torch.cat((rotation, zero, zero), -1),
+      torch.cat((translation(delta[..., 3:6]), rotation, zero), -1),
+      torch.cat((translation(delta[..., 6:9]), zero, rotation), -1),
     ),
     -2,
   )
-  identity9 = _eye(9, delta).expand_as(ad)
-  augmented = torch.cat(
-    (
-      torch.cat((-ad, identity9), -1),
-      torch.zeros_like(torch.cat((ad, ad), -1)),
-    ),
-    -2,
-  )
-  right_jacobian = torch.matrix_exp(augmented)[..., :9, 9:]
   trailing = TANGENT_DIM - 9
   upper = torch.cat(
     (right_jacobian, delta.new_zeros(*delta.shape[:-1], 9, trailing)), -1

@@ -31,7 +31,7 @@ def inputs(dtype=torch.float64, device="cpu"):
 
 
 def test_groups_use_rpv_belief_and_a_never_reads_it():
-  args = inputs()
+  args = inputs(dtype=torch.float32)
   a = build_critic_features(*args, group="A")
   torch.testing.assert_close(a, build_critic_features(*args[:-1], group="A"))
   torch.testing.assert_close(a, build_critic_features(*args[:-1], object(), group="A"))
@@ -45,8 +45,7 @@ def test_groups_use_rpv_belief_and_a_never_reads_it():
     build_critic_features(*args[:-1], group="B")
   changed = deepcopy(args[-1])
   changed.mean.position[:, 1] += 0.3
-  changed.covariance[:, 1, 7] += 0.0001
-  changed.covariance[:, 7, 1] += 0.0001
+  changed.covariance_sqrt[:, 7, 1] += 0.0001
   torch.testing.assert_close(build_critic_features(*args[:-1], changed, group="A"), a)
   different = build_critic_features(*args[:-1], changed, group="B")
   assert (different[:, 1237:1249] != b[:, 1237:1249]).any()
@@ -56,7 +55,7 @@ def test_groups_use_rpv_belief_and_a_never_reads_it():
 @pytest.mark.parametrize("group", ["B", "C"])
 @pytest.mark.parametrize("component", ["mean", "covariance", "cross_covariance"])
 def test_rpv_critic_ignores_other_belief_coordinates(group, component):
-  args = inputs()
+  args = inputs(dtype=torch.float32)
   expected = build_critic_features(*args, group=group)
   changed = args[-1].clone()
   if component == "mean":
@@ -64,11 +63,15 @@ def test_rpv_critic_ignores_other_belief_coordinates(group, component):
     changed.mean.joint_pos.add_(0.2)
     changed.mean.joint_vel.sub_(0.4)
   elif component == "covariance":
-    changed.covariance[:, 9:, 9:] += torch.eye(61, dtype=torch.float64) * 0.01
+    changed.covariance_sqrt[:, 9:, 9:] += torch.eye(61, dtype=torch.float32) * 0.01
   else:
     for row, col in ((1, 10), (5, 42), (7, 65)):
-      changed.covariance[:, row, col] += 0.0001
-      changed.covariance[:, col, row] += 0.0001
+      changed.covariance_sqrt[:, col, row] += 0.0001
+  if component != "mean":
+    assert not torch.equal(changed.covariance, args[-1].covariance)
+    torch.testing.assert_close(
+      changed.covariance_rpv, args[-1].covariance_rpv, atol=0, rtol=0
+    )
   # Legal changes outside the marginal cannot enter the current critic, including
   # through a Schur complement. They may still affect future filter updates.
   actual = build_critic_features(*args[:-1], changed, group=group)

@@ -157,7 +157,7 @@ def diagnostic_structure_errors(
       require(
         _finite(value) and 0 <= value <= 1, f"{prefix}.coverage_95 must be in [0,1]"
       )
-      for key in ("null_direction_violations", "jitter_frames"):
+      for key in ("null_direction_violations",):
         count = integer(item.get(key), f"{prefix}.{key}")
         require(count <= frames, f"{prefix}.{key} exceeds frame count")
 

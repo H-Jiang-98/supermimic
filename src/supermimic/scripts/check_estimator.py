@@ -78,12 +78,11 @@ def main():
       real, imagined = runner.configure_belief_filter()
       runner.reset_collection()
       version = runner._dynamics.model_version
-      reset_slots, jitter_count = 0, 0
+      reset_slots = 0
       collection_start = time.perf_counter()
       for _ in range(8):
         reset_slots += int(runner._measurement_reset.sum())
         runner.step()
-        jitter_count += int((real.diagnostics["jitter"] > 0).sum())
         assert real.state.belief.covariance.grad_fn is None
       collection_seconds = time.perf_counter() - collection_start
       assert version == runner._dynamics.model_version
@@ -151,7 +150,6 @@ def main():
         "uncertainty": list(obs["task_uncertainty"].shape),
         "covariance_min_eigenvalue": float(torch.linalg.eigvalsh(covariance).min()),
         "covariance_max_variance": float(covariance.diagonal(dim1=-2, dim2=-1).max()),
-        "collection_jitter_slots": jitter_count,
         "innovation_norm_max": float(real.diagnostics["innovation_norm"].max()),
         "actor_gradients_finite": True,
       }

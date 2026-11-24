@@ -16,7 +16,6 @@ import torch
 from torch import nn
 
 from supermimic.belief import BeliefState
-from supermimic.estimator_inputs import extract_rpv_covariance
 from supermimic.models import _CudaGraphNormalization, build_mlp
 from supermimic.utils.lie_state import TANGENT_VERSION, LieState
 from supermimic.utils.validation import check_covariance, validate_state_dict
@@ -158,7 +157,7 @@ def build_critic_features(
   if cfg.group != "A":
     if not isinstance(belief, BeliefState):
       raise ValueError("B/C critic requires a complete BeliefState")
-    belief.validate()
+    belief.validate_structure()
     mean = belief.mean
     if (
       mean.position.shape != truth.position.shape
@@ -182,7 +181,7 @@ def build_critic_features(
     pieces.extend(
       (
         mean_features / scale,
-        encode_rpv_covariance(extract_rpv_covariance(belief.covariance), cfg),
+        encode_rpv_covariance(belief.covariance_rpv, cfg),
       )
     )
   features = torch.cat(pieces, -1)

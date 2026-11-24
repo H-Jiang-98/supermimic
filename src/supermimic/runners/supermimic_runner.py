@@ -205,6 +205,8 @@ class WorldModel:
 
       def decode(cls, name):
         data = metadata.get(name)
+        if cls is FilterConfig:
+          return FilterConfig.from_dict(data)
         if not isinstance(data, dict) or data.keys() != {f.name for f in fields(cls)}:
           raise ValueError(f"Incomplete estimator checkpoint {name}")
         return cls(**data)

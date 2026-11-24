@@ -139,11 +139,11 @@ def audit(training, steps):
     )
 
   def score(decoded_mean, decoded_cov, payload, fallback=0):
-    belief = BeliefState(unpack_mean(decoded_mean), decoded_cov)
+    decoded_state = unpack_mean(decoded_mean)
     row = {
       "mean_cov_payload_bytes": payload,
       "fp32_factor_fallback_frames": fallback,
-      "invalid_rotations": rejected_frames(belief.mean.rotation, validate_rotation),
+      "invalid_rotations": rejected_frames(decoded_state.rotation, validate_rotation),
       "nonfinite_mean_entries": int((~torch.isfinite(decoded_mean)).sum()),
       "invalid_covariances": rejected_frames(decoded_cov, validate_cov),
       "invalid_filter_covariances": rejected_frames(decoded_cov, validate_filter_cov),
@@ -160,12 +160,13 @@ def audit(training, steps):
       or row["invalid_filter_covariances"]
       or row["nonfinite_mean_entries"]
     ):
-      scored_belief = belief.index(chosen.repeat_interleave(policy.cfg.num_samples))
       try:
+        belief = BeliefState(decoded_state, decoded_cov)
+        scored_belief = belief.index(chosen.repeat_interleave(policy.cfg.num_samples))
         ret, grad = policy_probe(
           policy, replace(scored, belief=scored_belief), noises, horizon
         )
-      except (ValueError, FloatingPointError) as exc:
+      except (ValueError, FloatingPointError, torch.linalg.LinAlgError) as exc:
         row["policy_error"] = str(exc)
       else:
         row.update(
@@ -174,7 +175,15 @@ def audit(training, steps):
         )
     return row
 
-  formats = {}
+  packed_factor = starts.belief.covariance_sqrt[:, rows, cols].to(torch.float32)
+  decoded = unpack_belief(mean.float(), packed_factor, dtype=mean.dtype)
+  formats = {
+    "sqrt_float32": score(
+      pack_mean(decoded.mean),
+      decoded.covariance,
+      mean.float().nbytes + packed_factor.nbytes,
+    )
+  }
   main_round_trips = {}
   for dtype in (torch.float64, torch.float32, torch.bfloat16, torch.float16):
     name = str(dtype).removeprefix("torch.")
@@ -199,16 +208,6 @@ def audit(training, steps):
           )
     main_round_trips[name] = fields
     if dtype in (torch.bfloat16, torch.float16):
-      # Widening through the normal belief API reprojects rotations and repairs
-      # covariance roundoff with a full eigendecomposition on the read path.
-      try:
-        repaired = unpack_belief(qmean, qlower, dtype=mean.dtype)
-      except ValueError as exc:
-        formats[name + "_with_cast_repair"] = {"decode_error": str(exc)}
-      else:
-        formats[name + "_with_cast_repair"] = score(
-          pack_mean(repaired.mean), repaired.covariance, qmean.nbytes + qlower.nbytes
-        )
       formats["fp32_mean_" + name + "_cov"] = score(
         mean, cov, mean.nbytes + qlower.nbytes
       )

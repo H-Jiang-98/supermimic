@@ -8,7 +8,7 @@ from tensordict import TensorDict
 from supermimic.belief import BeliefState
 from supermimic.utils.lie_state import LieState
 
-POSTERIOR_REPLAY_VERSION = "incremental_posterior_tril_f32_v1"
+POSTERIOR_REPLAY_VERSION = "incremental_posterior_sqrt_tril_f32_v2"
 
 
 def pack_mean(mean):
@@ -39,17 +39,16 @@ def unpack_mean(mean):
 def pack_belief(belief):
   packed = pack_mean(belief.mean)
   rows, cols = torch.tril_indices(70, 70, device=packed.device)
-  return packed.detach().to(torch.float32).clone(), belief.covariance[
+  return packed.detach().to(torch.float32).clone(), belief.covariance_sqrt[
     ..., rows, cols
   ].detach().to(torch.float32).clone()
 
 
 def unpack_belief(mean, lower, *, dtype):
   rows, cols = torch.tril_indices(70, 70, device=mean.device)
-  covariance = lower.new_zeros(*lower.shape[:-1], 70, 70)
-  covariance[..., rows, cols] = lower
-  covariance[..., cols, rows] = lower
-  return BeliefState(unpack_mean(mean), covariance).to(dtype=dtype)
+  factor = lower.new_zeros(*lower.shape[:-1], 70, 70)
+  factor[..., rows, cols] = lower
+  return BeliefState(unpack_mean(mean), covariance_sqrt=factor).to(dtype=dtype)
 
 
 class PosteriorReplay:
@@ -89,7 +88,7 @@ class PosteriorReplay:
     return TensorDict(
       {
         "posterior_mean": torch.zeros(e, c, 76, device=device, dtype=torch.float32),
-        "posterior_cov_tril": torch.zeros(
+        "posterior_sqrt_tril": torch.zeros(
           e, c, 2485, device=device, dtype=torch.float32
         ),
         "posterior_revision": torch.full((e, c), -1, dtype=torch.long, device=device),
@@ -103,11 +102,9 @@ class PosteriorReplay:
       return None
     if type(revision) is not int or revision < 0:
       raise ValueError("Posterior source revision must be a nonnegative integer")
-    if belief.covariance.shape != (replay.num_envs, 70, 70):
+    if belief.covariance_sqrt.shape != (replay.num_envs, 70, 70):
       raise ValueError("Posterior batch must match replay environments")
     mean, lower = pack_belief(belief)
-    if not torch.isfinite(mean).all() or not torch.isfinite(lower).all():
-      raise ValueError("Non-finite cached posterior")
     _ = self.storage
     return mean, lower, revision
 
@@ -133,7 +130,7 @@ class PosteriorReplay:
     if posterior is not None:
       pslot = (seq // self.stride) % self.capacity
       self.storage["posterior_mean"][:, pslot] = mean
-      self.storage["posterior_cov_tril"][:, pslot] = lower
+      self.storage["posterior_sqrt_tril"][:, pslot] = lower
       self.storage["posterior_revision"][:, pslot] = revision
       self.sequences[pslot] = seq
     self.frame_sequences[slot] = seq
@@ -231,7 +228,7 @@ class PosteriorReplay:
     batch["insert_sequence"] = self.sequences[pslots].clone()
     belief = unpack_belief(
       self.storage["posterior_mean"][rows, pslots],
-      self.storage["posterior_cov_tril"][rows, pslots],
+      self.storage["posterior_sqrt_tril"][rows, pslots],
       dtype=batch["state"].dtype,
     )
     return batch, belief

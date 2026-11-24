@@ -166,7 +166,10 @@ def test_adapter_reset_does_not_reset_physics_and_rejects_skipped_frames(tmp_pat
 
 
 @pytest.mark.parametrize("legacy", [False, True])
-def test_evaluation_loader_is_private_and_checks_estimator_contract(tmp_path, legacy):
+@pytest.mark.parametrize("legacy_filter", [False, True])
+def test_evaluation_loader_is_private_and_checks_estimator_contract(
+  tmp_path, legacy, legacy_filter
+):
   with physical_runner(tmp_path, "B") as runner:
     saved = {
       "version": EIT_POLICY_TRAINING_VERSION,
@@ -191,6 +194,21 @@ def test_evaluation_loader_is_private_and_checks_estimator_contract(tmp_path, le
       weights = saved["critic"]["state_dict"]
       weights["mlp.0.weight"] = torch.nn.functional.pad(weights["mlp.0.weight"], (0, 1))
       with pytest.raises(ValueError, match=EIT_POLICY_TRAINING_VERSION):
+        validate_eit_checkpoint_contract(saved, stage="policy")
+    if legacy_filter:
+      saved["posterior_replay_protocol"] = "incremental_posterior_tril_f32_v1"
+      for settings in (
+        saved["runner_config"]["filter_config"],
+        saved["world_model"]["estimator"]["filter_config"],
+      ):
+        settings.pop("validate_numerics")
+        settings.update(
+          jitter_initial=1e-8,
+          jitter_multiplier=10.0,
+          jitter_max=1e-4,
+          jitter_attempts=5,
+        )
+      with pytest.raises(ValueError):
         validate_eit_checkpoint_contract(saved, stage="policy")
     saved["runner_config"]["wandb_run_path"] = "unused/source/run"
     saved["runner_config"]["estimator_inputs"]["mode"] = "train"

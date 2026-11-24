@@ -145,7 +145,6 @@ def _fixed_belief_diagnostics(monkeypatch):
       "error_squared": torch.zeros(size, 70),
       "variance": torch.ones(size, 70),
       "tracking_squared": torch.zeros(size, 3),
-      "jitter": torch.zeros(size),
       "innovation_norm": torch.zeros(size),
     }
 

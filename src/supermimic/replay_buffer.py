@@ -9,7 +9,6 @@ from supermimic.posterior_replay import (
   PosteriorReplay,
   pack_mean,
   unpack_belief,
-  unpack_mean,
 )
 from supermimic.utils.lie_state import LieState
 from supermimic.utils.validation import validate_rotation
@@ -32,57 +31,27 @@ class FieldSpec:
 
 @dataclass(frozen=True)
 class _RecordedHeadPrior:
-  """Lossless native-precision physical reset seed for explicit diagnostics."""
+  """Native-precision square-root reset seed for explicit diagnostics."""
 
   mean: torch.Tensor
-  covariance: torch.Tensor
-  upper_indices: torch.Tensor | None = None
-  upper_values: torch.Tensor | None = None
+  covariance_sqrt: torch.Tensor
 
   @staticmethod
   def capture(priors):
-    means = pack_mean(priors.mean).detach()
-    cov = priors.covariance.detach()
-    diagonals = cov.diagonal(dim1=-2, dim2=-1)
-    if torch.count_nonzero(cov) == torch.count_nonzero(diagonals):
-      # All heads in this batch expire together when this physical slot wraps.
-      # The standard Gaussian requires only 70 variances per sampled head.
-      return [
-        _RecordedHeadPrior(mean, diagonal)
-        for mean, diagonal in zip(means, diagonals.clone(), strict=True)
-      ]
-    rows, cols = torch.tril_indices(70, 70, device=cov.device)
-    lower = cov[:, rows, cols]
-    upper = cov[:, cols, rows]
-    records = []
-    for mean, lo, hi in zip(means, lower, upper, strict=True):
-      # Validation tolerates roundoff-level asymmetry in custom priors. Preserve
-      # just the differing entries so diagnostics reproduce the actual draw.
-      changed = (hi != lo).nonzero().flatten()
-      if len(changed):
-        records.append(
-          _RecordedHeadPrior(mean, lo, cols[changed] * 70 + rows[changed], hi[changed])
-        )
-      else:
-        records.append(_RecordedHeadPrior(mean, lo))
-    return records
+    means = pack_mean(priors.mean).detach().clone()
+    factor = priors.covariance_sqrt.detach()
+    rows, cols = torch.tril_indices(70, 70, device=factor.device)
+    packed = factor[:, rows, cols].clone()
+    return [
+      _RecordedHeadPrior(mean, lower) for mean, lower in zip(means, packed, strict=True)
+    ]
 
   def restore(self):
-    mean = self.mean.clone()
-    if self.covariance.numel() == 70:
-      return BeliefState(unpack_mean(mean), self.covariance.diag())
-    prior = unpack_belief(mean, self.covariance, dtype=mean.dtype)
-    if self.upper_indices is not None:
-      prior.covariance.view(-1)[self.upper_indices] = self.upper_values
-    return prior
+    return unpack_belief(self.mean.clone(), self.covariance_sqrt, dtype=self.mean.dtype)
 
   @property
   def nbytes(self):
-    return sum(
-      t.nbytes
-      for t in (self.mean, self.covariance, self.upper_indices, self.upper_values)
-      if t is not None
-    )
+    return self.mean.nbytes + self.covariance_sqrt.nbytes
 
 
 @dataclass(frozen=True)
@@ -211,13 +180,13 @@ class ReplayBuffer:
       or not torch.equal(ids, heads)
       or ids.unique().numel() != heads.numel()
       or not isinstance(priors, BeliefState)
-      or priors.covariance.shape[:-2] != heads.shape
+      or priors.covariance_sqrt.shape[:-2] != heads.shape
     ):
       raise ValueError("Recorded priors must match the episode heads being inserted")
     sensor = self._storage["actor_obs"]
     if (
-      priors.covariance.device != sensor.device
-      or priors.covariance.dtype != sensor.dtype
+      priors.covariance_sqrt.device != sensor.device
+      or priors.covariance_sqrt.dtype != sensor.dtype
     ):
       raise ValueError(
         "Episode head priors must match replay measurement dtype and device"
@@ -404,7 +373,9 @@ class ReplayBuffer:
       priors = self.initial_prior.sample(LieState.from_full(full))
       for j, i in enumerate(missing):
         # Each row owns its mean; the fixed diagonal covariance can be shared.
-        prior = BeliefState(priors.mean.index(j).clone(), priors.covariance[j])
+        prior = BeliefState(
+          priors.mean.index(j).clone(), covariance_sqrt=priors.covariance_sqrt[j]
+        )
         heads[ids[i]] = (row_numbers[i], slot_numbers[i], times[i], prior)
     self._training_heads = heads
 

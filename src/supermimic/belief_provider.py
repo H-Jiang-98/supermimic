@@ -13,12 +13,12 @@ from dataclasses import asdict, dataclass, field, replace
 import torch
 
 from supermimic.belief import BeliefState, GaussianStatePrior
-from supermimic.estimator import LieBeliefFilter
+from supermimic.estimator import CorrectionSummary, LieBeliefFilter
 from supermimic.estimator_inputs import GaussianMeasurementConfig
 from supermimic.utils.lie_state import STATE_LAYOUT_VERSION, TANGENT_VERSION, LieState
 
 _FIELDS = ("rotation", "position", "velocity", "omega", "joint_pos", "joint_vel")
-PROVIDER_VERSION = "right_local_provider_v3"
+PROVIDER_VERSION = "right_local_sqrt_provider_v4"
 
 
 @dataclass(frozen=True)
@@ -68,7 +68,7 @@ class FixedBeliefPrior:
   def __call__(self, *, measurement, context, env_ids) -> BeliefState:
     del context
     return (
-      self.belief.index(env_ids.to(self.belief.covariance.device))
+      self.belief.index(env_ids.to(self.belief.covariance_sqrt.device))
       .to(measurement)
       .clone()
     )
@@ -122,7 +122,10 @@ class BeliefProvider:
   def _validation_stamp(self, belief: BeliefState, generation: int) -> tuple | None:
     if self._rollout is None:
       return None
-    tensors = (*(getattr(belief.mean, name) for name in _FIELDS), belief.covariance)
+    tensors = (
+      *(getattr(belief.mean, name) for name in _FIELDS),
+      belief.covariance_sqrt,
+    )
     if any(t.is_inference() for t in tensors):
       return None
     config = self.estimator.config
@@ -227,9 +230,10 @@ class BeliefProvider:
         or previous_action.dtype != measurement.dtype
       ):
         raise ValueError("Previous action must match measurement dtype and device")
-      self._check_finite(
-        measurement=measurement, previous_action=previous_action, context=context
-      )
+      if self.estimator.config.validate_numerics:
+        self._check_finite(
+          measurement=measurement, previous_action=previous_action, context=context
+        )
       version = self.model_version
       model_write_generation = self.estimator.dynamics.write_generation
       slots = torch.arange(batch, device=measurement.device)
@@ -302,46 +306,24 @@ class BeliefProvider:
           prior.validate()
           self._pending_prior = (ids, episodes, prior)
         head_priors = (episodes, prior.detach())
-        if self._rollout is None:
-          corrected, diagnostic = self.estimator.correct(
-            prior, measurement[ids], return_diagnostics=True
-          )
-        else:
-          corrected, diagnostic = self.estimator._correct(
-            prior, measurement[ids], return_diagnostics=True, measurement_checked=True
-          )
+        corrected, diagnostic = self.estimator.correct(
+          prior,
+          measurement[ids],
+          return_diagnostics="summary",
+        )
         pieces.append((ids, corrected))
         diagnostics.append((ids, diagnostic))
       if len(live_ids):
         ids = live_ids
         committed = self.state.belief
         old = committed.index(ids)
-        if self._rollout is None:
-          corrected, diagnostic = self.estimator.predict_correct(
-            old,
-            previous_action[ids],
-            context[ids],
-            measurement[ids],
-            return_diagnostics=True,
-          )
-        else:
-          trusted = (
-            self._validation is not None
-            and self._validation == self._validation_stamp(committed, self._generation)
-          )
-          predicted = self.estimator._prediction(
-            old,
-            previous_action[ids],
-            context[ids],
-            belief_checked=trusted,
-            inputs_checked=True,
-          )[0]
-          corrected, diagnostic = self.estimator._correct(
-            predicted,
-            measurement[ids],
-            return_diagnostics=True,
-            measurement_checked=True,
-          )
+        corrected, diagnostic = self.estimator.predict_correct(
+          old,
+          previous_action[ids],
+          context[ids],
+          measurement[ids],
+          return_diagnostics="summary",
+        )
         pieces.append((ids, corrected))
         diagnostics.append((ids, diagnostic))
 
@@ -357,29 +339,19 @@ class BeliefProvider:
           for ids, piece in pieces:
             value = value.index_copy(0, ids, getattr(piece.mean, name))
           fields[name] = value
-        covariance = measurement.new_zeros(batch, 70, 70)
+        lower = measurement.new_zeros(batch, 70, 70)
         for ids, piece in pieces:
-          covariance = covariance.index_copy(0, ids, piece.covariance)
-        belief = BeliefState(LieState(**fields), covariance)
-      # correct() validated every output row. Gathering those rows changes no
-      # values. The general belief contract can be stricter for float64 or a
-      # loose user-configured filter. Its eigenvalue threshold scales by >= 1.
-      config = self.estimator.config
-      if config.covariance_atol + config.covariance_rtol > belief.covariance_rtol:
-        belief.validate()
+          lower = lower.index_copy(0, ids, piece.covariance_sqrt)
+        belief = BeliefState(LieState(**fields), covariance_sqrt=lower)
       if not track_grad:
         belief, context = belief.detach(), context.detach()
-      summary = {
-        "innovation_norm": measurement.new_zeros(batch),
-        "jitter": measurement.new_zeros(batch),
-        "cholesky_attempts": torch.zeros(
-          batch, dtype=torch.long, device=measurement.device
-        ),
-      }
+      summary = {"innovation_norm": measurement.new_zeros(batch)}
       for ids, diagnostic in diagnostics:
-        summary["innovation_norm"][ids] = diagnostic.innovation.detach().norm(dim=-1)
-        summary["jitter"][ids] = diagnostic.jitter.detach()
-        summary["cholesky_attempts"][ids] = diagnostic.cholesky_attempts.detach()
+        summary["innovation_norm"][ids] = (
+          diagnostic.innovation_norm
+          if isinstance(diagnostic, CorrectionSummary)
+          else diagnostic.innovation.detach().norm(dim=-1)
+        )
       return PreparedBelief(
         ProviderState(belief, context, episode_id, time_index, version, head_priors),
         self._generation,
@@ -418,10 +390,10 @@ class BeliefProvider:
       belief = self._belief(belief)
       context = self._ordinary(context)
       belief.validate()
-      if belief.covariance.ndim != 3:
+      if belief.covariance_sqrt.ndim != 3:
         raise ValueError("Provider restore requires one batch dimension")
-      batch = belief.covariance.shape[0]
-      self._check_context_layout(context, batch, belief.covariance)
+      batch = belief.covariance_sqrt.shape[0]
+      self._check_context_layout(context, batch, belief.covariance_sqrt)
       self._check_finite(context=context)
       if episode_id is None:
         raise ValueError("Restoring a posterior requires its episode_id")
@@ -435,7 +407,7 @@ class BeliefProvider:
         ids, prior = head_priors
         expected = episode_id[time_index == 0]
         self._check_index(ids, expected.numel(), context.device)
-        if not torch.equal(ids, expected) or prior.covariance.shape != (
+        if not torch.equal(ids, expected) or prior.covariance_sqrt.shape != (
           expected.numel(),
           70,
           70,
@@ -443,8 +415,8 @@ class BeliefProvider:
           raise ValueError("Restored head priors must match the frame-zero episodes")
         prior.validate()
         if (
-          prior.covariance.dtype != context.dtype
-          or prior.covariance.device != context.device
+          prior.covariance_sqrt.dtype != context.dtype
+          or prior.covariance_sqrt.device != context.device
         ):
           raise ValueError("Restored head priors must match model dtype and device")
         head_priors = (ids.detach().clone(), prior.detach().clone())
@@ -509,7 +481,7 @@ class BeliefProvider:
       heads = {
         "episode_id": ids.detach().clone(),
         "mean": prior.mean.to_full().detach().clone(),
-        "covariance": prior.covariance.detach().clone(),
+        "covariance_sqrt": prior.covariance_sqrt.detach().clone(),
       }
     return {
       "version": PROVIDER_VERSION,
@@ -525,7 +497,7 @@ class BeliefProvider:
       "default_joint_pos": self.estimator.default_joint_pos.detach().clone(),
       "mean": state.belief.mean.to_full().detach().clone(),
       "rotation": state.belief.mean.rotation.detach().clone(),
-      "covariance": state.belief.covariance.detach().clone(),
+      "covariance_sqrt": state.belief.covariance_sqrt.detach().clone(),
       "context": state.context.detach().clone(),
       "episode_id": state.episode_id.detach().clone(),
       "time_index": state.time_index.detach().clone(),
@@ -558,14 +530,16 @@ class BeliefProvider:
     ):
       raise ValueError("Snapshot rotation disagrees with the packed mean")
     mean = replace(mean, rotation=rotation)
-    belief = BeliefState(mean, data["covariance"])
+    belief = BeliefState(mean, covariance_sqrt=data["covariance_sqrt"])
     heads = data["head_priors"]
     head_priors = (
       None
       if heads is None
       else (
         heads["episode_id"],
-        BeliefState(LieState.from_full(heads["mean"]), heads["covariance"]),
+        BeliefState(
+          LieState.from_full(heads["mean"]), covariance_sqrt=heads["covariance_sqrt"]
+        ),
       )
     )
     if data["model_version"] != self.estimator.dynamics.model_version:

@@ -16,8 +16,10 @@ from tests.test_estimator_stochastic_dynamics import make_dynamics, model_inputs
 
 def setup_provider(batch=3, *, differentiable=False):
   torch.manual_seed(12)
-  model, representation = make_dynamics()
-  rep, action, aux, context = model_inputs(representation, batch=batch)
+  model, representation = make_dynamics(dtype=torch.float32)
+  rep, action, aux, context = model_inputs(
+    representation, batch=batch, dtype=torch.float32
+  )
   prior = BeliefState(
     LieState.from_rep(aux, rep),
     torch.diag(torch.linspace(0.002, 0.01, 70, dtype=rep.dtype))
@@ -40,17 +42,17 @@ def assert_same_belief(actual, expected):
   torch.testing.assert_close(
     local_error(actual.mean, expected.mean),
     torch.zeros_like(actual.mean.to_full()[..., :70]),
-    atol=1e-12,
+    atol=2e-6,
     rtol=0,
   )
   torch.testing.assert_close(
-    actual.covariance, expected.covariance, atol=1e-12, rtol=1e-10
+    actual.covariance, expected.covariance, atol=2e-6, rtol=2e-5
   )
 
 
 def assert_detached_state(state):
   values = [getattr(state.belief.mean, f.name) for f in fields(LieState)]
-  for value in (*values, state.belief.covariance, state.context):
+  for value in (*values, state.belief.covariance_sqrt, state.context):
     assert not value.requires_grad
     assert value.grad_fn is None
     assert not torch.is_inference(value)
@@ -99,6 +101,7 @@ def test_prepare_retry_does_not_mutate_state_or_consume_randomness():
   provider, _, measurement, action, context = setup_provider()
   advance(provider, measurement, action, context, [True] * 3)
   current = provider.state
+  provider.estimator.config = replace(provider.estimator.config, validate_numerics=True)
   bad = measurement.clone()
   bad[0, 0] = float("nan")
   with pytest.raises(ValueError, match="finite"):
@@ -129,88 +132,27 @@ def test_prepare_retry_does_not_mutate_state_or_consume_randomness():
   assert other.state is None
 
 
-def test_provider_preserves_stricter_covariance_contract_after_filter_rows_merge(
-  monkeypatch,
-):
+def test_rollout_does_not_numerically_revalidate_committed_factors():
   provider, _, measurement, action, context = setup_provider()
   advance(provider, measurement, action, context, [True] * 3)
-  committed = provider.state
-  estimator = provider.estimator
-  estimator.config = replace(estimator.config, covariance_rtol=1e-2)
-  correct = estimator.correct
-
-  def marginally_indefinite(*args, **kwargs):
-    posterior, diagnostics = correct(*args, **kwargs)
-    covariance = (
-      torch.eye(70, dtype=measurement.dtype).expand_as(posterior.covariance).clone()
-    )
-    covariance[..., 0, 1] = covariance[..., 1, 0] = 1.0001
-    loose = replace(posterior, covariance=covariance)
-    estimator._validate_belief(loose)
-    return loose, diagnostics
-
-  monkeypatch.setattr(estimator, "correct", marginally_indefinite)
-  with (
-    belief_rollout(provider),
-    pytest.raises(ValueError, match="positive semidefinite"),
-  ):
-    advance(provider, measurement, action, context, [False, True, False])
-  assert provider.state is committed
-
-
-def test_rollout_reuses_only_committed_results_with_current_tolerances():
-  provider, _, measurement, action, context = setup_provider()
-  live = [False] * 3
-
-  def step(resets):
-    return advance(provider, measurement, action, context, resets)
-
-  estimator = provider.estimator
   with (
     belief_rollout(provider),
     patch.object(
-      estimator, "_validate_belief", wraps=estimator._validate_belief
-    ) as validate,
+      BeliefState, "validate", side_effect=AssertionError("hot-path numerical check")
+    ),
   ):
-    step([True] * 3)
-    validate.reset_mock()
-    step(live)
-    assert validate.call_count == 2  # new prediction and corrected posterior
-    validate.reset_mock()
-    step([False, True, False])
-    assert validate.call_count == 4  # reset prior and posterior, plus two live checks
-    validate.reset_mock()
-    estimator.config = replace(estimator.config, covariance_rtol=2e-5)
-    step(live)
-    assert validate.call_count == 3
-    state = provider.state
-    provider.restore(
-      state.belief,
-      state.context,
-      model_version=provider.model_version,
-      episode_id=state.episode_id,
-      time_index=state.time_index,
-    )
-    validate.reset_mock()
-    step(live)
-    assert validate.call_count == 3
-  # The preceding scope's result is also external at the next rollout boundary.
-  with (
-    belief_rollout(provider),
-    patch.object(
-      estimator, "_validate_belief", wraps=estimator._validate_belief
-    ) as validate,
-  ):
-    step(live)
-    assert validate.call_count == 3
+    advance(provider, measurement, action, context, [False] * 3)
+    advance(provider, measurement, action, context, [False] * 3)
+  assert set(provider.diagnostics) == {"innovation_norm"}
 
 
 @pytest.mark.parametrize("when", ["prepared", "committed"])
 @pytest.mark.parametrize(
-  "corrupt,error", [("covariance", "semidefinite"), ("rotation", "orthonormal")]
+  "corrupt,error", [("covariance", "positive diagonal"), ("rotation", "orthonormal")]
 )
 def test_mutating_posterior_forces_full_revalidation(when, corrupt, error):
   provider, _, measurement, action, context = setup_provider()
+  provider.estimator.config = replace(provider.estimator.config, validate_numerics=True)
   with belief_rollout(provider):
     candidate = provider.prepare(
       measurement=measurement,
@@ -222,7 +164,7 @@ def test_mutating_posterior_forces_full_revalidation(when, corrupt, error):
       provider.commit(candidate)
     belief = candidate.state.belief
     if corrupt == "covariance":
-      belief.covariance.detach()[0, 0, 0] = -1
+      belief.covariance_sqrt.detach()[0, 0, 0] = -1
     else:
       belief.mean.rotation.detach()[0].zero_()
     if when == "prepared":
@@ -236,6 +178,7 @@ def test_mutating_posterior_forces_full_revalidation(when, corrupt, error):
 @pytest.mark.parametrize("name", ["measurement", "previous_action", "context"])
 def test_provider_reports_each_nonfinite_input_before_publishing(name):
   provider, _, measurement, action, context = setup_provider()
+  provider.estimator.config = replace(provider.estimator.config, validate_numerics=True)
   inputs = dict(
     measurement=measurement,
     previous_action=action,
@@ -410,7 +353,7 @@ def test_fused_optimizer_invalidates_posterior_and_checkpoint_roundtrips():
     provider.lookup(state.episode_id, state.time_index, context)
 
   checkpoint = model.checkpoint()
-  restored, _ = make_dynamics()
+  restored, _ = make_dynamics(dtype=torch.float32)
   restored.load_checkpoint(checkpoint)
   assert restored.model_version == checkpoint["model_version"] == model.model_version
   torch.testing.assert_close(restored.noise_head[-1].bias, bias, rtol=0, atol=0)

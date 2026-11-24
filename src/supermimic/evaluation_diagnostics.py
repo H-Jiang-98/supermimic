@@ -82,7 +82,6 @@ class PosteriorBins:
     time_index,
     error,
     covariance,
-    jitter,
     innovation_norm,
     position_error_w,
     velocity_error_w,
@@ -91,7 +90,7 @@ class PosteriorBins:
     features = torch.cat(
       (
         error.double().reshape(-1, 3, 3).square().sum(-1),
-        torch.stack((distance, violation, covered, jitter > 0, innovation_norm), -1),
+        torch.stack((distance, violation, covered, innovation_norm), -1),
         position_error_w.double().square().sum(-1, keepdim=True),
         velocity_error_w.double().square().sum(-1, keepdim=True),
       ),
@@ -103,7 +102,7 @@ class PosteriorBins:
       if index not in self.bins:
         self.bins[index] = (
           set(),
-          torch.zeros(10, dtype=torch.double),
+          torch.zeros(9, dtype=torch.double),
           torch.zeros(10, dtype=torch.long),
         )
       ids, totals, ranks = self.bins[index]
@@ -124,14 +123,13 @@ class PosteriorBins:
           "frames": count,
           "rotation_rmse_rad": float(mean[0].sqrt()),
           "right_local_rho_rmse_m": float(mean[1].sqrt()),
-          "position_rmse_m": float(mean[8].sqrt()),
+          "position_rmse_m": float(mean[7].sqrt()),
           "right_local_nu_rmse_m_s": float(mean[2].sqrt()),
-          "velocity_rmse_m_s": float(mean[9].sqrt()),
+          "velocity_rmse_m_s": float(mean[8].sqrt()),
           "mean_supported_mahalanobis_squared": float(mean[3]),
           "null_direction_violations": int(sums[4]),
           "coverage_95": float(mean[5]),
-          "jitter_frames": int(sums[6]),
-          "mean_innovation_norm": float(mean[7]),
+          "mean_innovation_norm": float(mean[6]),
           "rank_counts": ranks.tolist(),
         }
       )

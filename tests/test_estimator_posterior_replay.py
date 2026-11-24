@@ -27,25 +27,18 @@ def belief(batch=3):
   )
 
 
-@pytest.mark.parametrize("kind", ["positive", "singular", "zero"])
-def test_packed_covariance_is_symmetric_lower_triangle_not_cholesky(kind):
+def test_packed_factor_roundtrip_is_exact_and_keeps_covariance_positive():
   b = belief()
-  if kind == "positive":
-    factor = torch.randn(3, 70, 70)
-    cov = factor @ factor.mT
-  elif kind == "singular":
-    factor = torch.arange(70, dtype=torch.float32).expand(3, 70)
-    cov = factor[..., None] * factor[..., None, :]
-  else:
-    cov = torch.zeros(3, 70, 70)
-  b = replace(b, covariance=cov)
+  torch.manual_seed(8)
+  factor = torch.randn(3, 70, 70).tril(-1) * 0.005 + 0.1 * torch.eye(70)
+  b = replace(b, covariance_sqrt=factor)
   mean, lower = pack_belief(b)
   assert mean.shape == (3, 76) and lower.shape == (3, 2485)
   assert mean.dtype == lower.dtype == torch.float32
   restored = unpack_belief(mean, lower, dtype=torch.float32)
-  assert torch.equal(restored.covariance, cov)
+  assert torch.equal(restored.covariance_sqrt, factor)
+  assert torch.equal(restored.covariance, b.covariance)
   assert torch.equal(restored.mean.rotation, b.mean.rotation)
-  assert torch.equal(restored.mean.to_full(), b.mean.to_full())
   restored.validate()
 
 
@@ -124,7 +117,7 @@ def test_sparse_ring_retains_exact_histories_across_asynchronous_resets(
     previous = torch.where(done[:, None], 0, action)
     episodes += 3 * done.long()
     times = torch.where(done, 0, times + 1)
-  assert cache.storage["posterior_cov_tril"].shape == (
+  assert cache.storage["posterior_sqrt_tril"].shape == (
     3,
     (size + stride - 1) // stride,
     2485,
@@ -251,7 +244,7 @@ def test_fresh_restore_reuses_matching_allocations_and_releases_superseded_cache
   old_cache = ref(replay.posterior_cache)
   raw_pointer = replay._storage["actor_obs"].data_ptr()
   # Even an explicitly inspected empty cache is reused when the layouts match.
-  old_cov = ref(replay.posterior_cache.storage["posterior_cov_tril"])
+  old_cov = ref(replay.posterior_cache.storage["posterior_sqrt_tril"])
   with patch.object(
     target.runner,
     "_make_replay_buffer",
@@ -264,12 +257,12 @@ def test_fresh_restore_reuses_matching_allocations_and_releases_superseded_cache
   assert replay.insert_count == 0
   cache = replay.posterior_cache
   if target_stride == 1:
-    assert old_cache() is cache and old_cov() is cache.storage["posterior_cov_tril"]
+    assert old_cache() is cache and old_cov() is cache.storage["posterior_sqrt_tril"]
   else:
     assert old_cache() is None and old_cov() is None
     assert cache.storage_bytes()["posterior_storage_bytes"] == cache.sequences.nbytes
     target.runner.step()
-    assert cache.storage["posterior_cov_tril"].shape == (2, 8, 2485)
+    assert cache.storage["posterior_sqrt_tril"].shape == (2, 8, 2485)
     assert cache.storage_bytes()["posterior_storage_bytes"] > cache.sequences.nbytes
 
 
@@ -332,7 +325,7 @@ def test_physical_heads_remain_diagnostic_even_when_unsaved_and_expire_with_raw_
   # The asynchronous reset was at sequence one, between saved posteriors.
   unsaved = int(episodes.item())
   assert unsaved not in replay.posterior_frames()["episode_id"].tolist()
-  bytes_per_head = (76 + 70) * replay._storage["actor_obs"].element_size()
+  bytes_per_head = (76 + 2485) * replay._storage["actor_obs"].element_size()
   assert replay.episode_head_storage_bytes == (len(first) + 1) * bytes_per_head
   runner.step()
   assert replay.episode_head_storage_bytes == bytes_per_head
@@ -342,15 +335,13 @@ def test_physical_heads_remain_diagnostic_even_when_unsaved_and_expire_with_raw_
   assert replay.episode_prefix(unsaved, 1)[1]["time_index"].tolist() == [0, 1]
 
 
-def test_custom_correlated_head_preserves_native_precision_and_tolerated_asymmetry():
-  loop = training()
-  replay = loop.runner.replay_buffer
-  b = belief(2).to(dtype=torch.float64)
-  b.mean.position.fill_(1 + 2**-40)
-  b.covariance[:, 0, 1] = 0.25 + 2**-49
-  b.covariance[:, 1, 0] = 0.25
+def test_custom_correlated_head_preserves_float32_factor_exactly():
+  replay = replay_fixture(8, 1, 5)
+  b = belief(3)
+  b.covariance_sqrt[:, 1, 0] = 0.25
+  b.mean.position.fill_(1.001)
   frame = replay._storage[:, 0].clone()
-  frame["episode_id"] = torch.arange(2)
+  frame["episode_id"] = torch.arange(3)
   replay.insert(
     frame,
     head_priors=(frame["episode_id"], b),
@@ -358,7 +349,7 @@ def test_custom_correlated_head_preserves_native_precision_and_tolerated_asymmet
   )
   restored, _ = replay.episode_prefix(1, 0)
   assert torch.equal(restored.mean.position, b.mean.position[1])
-  assert torch.equal(restored.covariance, b.covariance[1])
+  assert torch.equal(restored.covariance_sqrt, b.covariance_sqrt[1])
 
 
 def test_revision_rejects_updates_during_collection_and_entire_policy_update():

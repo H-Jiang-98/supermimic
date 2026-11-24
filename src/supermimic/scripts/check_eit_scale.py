@@ -162,7 +162,7 @@ def main():
         (
           parameter,
           actor.film[0].weight,
-          runner.imagined_posterior_provider.state.belief.covariance,
+          runner.imagined_posterior_provider.state.belief.covariance_sqrt,
         ),
       )
       assert film_gradient.norm() > 0 and covariance_gradient.norm() > 0
@@ -192,7 +192,7 @@ def main():
         ),
         "finite_difference_epsilon": epsilon,
         "film_hidden_gradient_norm": float(film_gradient.norm()),
-        "terminal_covariance_gradient_norm": float(covariance_gradient.norm()),
+        "terminal_covariance_sqrt_gradient_norm": float(covariance_gradient.norm()),
       }
 
       del (

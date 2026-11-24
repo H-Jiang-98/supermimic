@@ -89,7 +89,7 @@ def _belief_diagnostics(policy, obs):
     "position_error_w": truth.position - belief.mean.position,
     "velocity_error_w": truth.velocity - belief.mean.velocity,
     "error_squared": error.square(),
-    "variance": belief.covariance.diagonal(dim1=-2, dim2=-1),
+    "variance": belief.covariance_sqrt.square().sum(-1),
     "tracking_squared": torch.stack(
       (
         (truth.position - reference.position[:, 0]).square().mean(-1),
@@ -98,7 +98,6 @@ def _belief_diagnostics(policy, obs):
       ),
       -1,
     ),
-    "jitter": diagnostics["jitter"],
     "innovation_norm": diagnostics["innovation_norm"],
   }
 
@@ -145,7 +144,7 @@ def run_evaluation(
     else None
   )
   records = [None] * batch
-  jitter_slots, innovation_max, step_count = 0, 0.0, 0
+  innovation_max, step_count = 0.0, 0
 
   def episode(row, reason, *, failure=False, clip_end=False, timeout=False):
     return {
@@ -175,8 +174,7 @@ def run_evaluation(
           state.episode_id[active_before],
           state.time_index[active_before],
           diagnostic["rpv_error"][active_before],
-          state.belief.covariance[active_before, :9, :9],
-          diagnostic["jitter"][active_before],
+          state.belief.covariance_rpv[active_before],
           diagnostic["innovation_norm"][active_before],
           diagnostic["position_error_w"][active_before],
           diagnostic["velocity_error_w"][active_before],
@@ -187,7 +185,6 @@ def run_evaluation(
         (tracking_sums, "tracking_squared"),
       ):
         sums[active_before] += diagnostic[name][active_before]
-      jitter_slots += int((diagnostic["jitter"][active_before] > 0).sum())
       innovation_max = max(
         innovation_max, float(diagnostic["innovation_norm"][active_before].max())
       )
@@ -285,7 +282,6 @@ def run_evaluation(
         )
       ),
       "posterior_time_bins": bins.result() if bins is not None else None,
-      "jitter_slots": jitter_slots,
       "innovation_norm_max": innovation_max,
     }
     if posterior_diagnostics
