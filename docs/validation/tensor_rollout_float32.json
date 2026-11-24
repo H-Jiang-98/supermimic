@@ -1,0 +1,53 @@
+[
+  {
+    "kind": "transactional_rollout_backward",
+    "batch": 1024,
+    "horizon": 32,
+    "small": false,
+    "dtype": "float32",
+    "compiled": true,
+    "torch_version": "2.14.0+cu130",
+    "gpu": "NVIDIA RPBZZZ6",
+    "median_ms": 4637.309940997511,
+    "times_ms": [
+      4562.008033040911,
+      4637.309940997511,
+      4649.0042810328305
+    ],
+    "peak_allocated_bytes": 55258647552
+  },
+  {
+    "kind": "prepared_rollout_backward",
+    "batch": 1024,
+    "horizon": 32,
+    "small": false,
+    "dtype": "float32",
+    "compiled": true,
+    "torch_version": "2.14.0+cu130",
+    "gpu": "NVIDIA RPBZZZ6",
+    "median_ms": 3904.587548226118,
+    "times_ms": [
+      3931.5384388901293,
+      3904.587548226118,
+      3860.606491100043
+    ],
+    "peak_allocated_bytes": 54713646592
+  },
+  {
+    "kind": "tensor_rollout_backward",
+    "batch": 1024,
+    "horizon": 32,
+    "small": false,
+    "dtype": "float32",
+    "compiled": true,
+    "torch_version": "2.14.0+cu130",
+    "gpu": "NVIDIA RPBZZZ6",
+    "median_ms": 3757.17011699453,
+    "times_ms": [
+      3751.085725147277,
+      3757.17011699453,
+      4292.615795042366
+    ],
+    "peak_allocated_bytes": 54712933888
+  }
+]

@@ -73,3 +73,42 @@ def check_covariance(
   eig = torch.linalg.eigvalsh((correlation + correlation.mT) * 0.5)
   if (eig[..., 0] < -(atol + rtol * eig[..., -1].clamp_min(1))).any():
     raise ValueError(f"{name} must be positive semidefinite")
+
+
+@torch.no_grad()
+def covariance_encoding_invalid(matrix, *, rtol, atol=0.0):
+  """Device-side preconditions before covariance symmetrization and clipping.
+
+  This checks encoding preconditions, not the full PSD spectrum. Untrusted
+  inputs still require ``check_covariance`` at the preparation boundary.
+  Return one flag per matrix, preserving all leading batch dimensions.
+  """
+  variance = matrix.diagonal(dim1=-2, dim2=-1)
+  zero = variance == 0
+  std = torch.where(zero, 1.0, variance.double()).sqrt()
+  correlation = matrix.double() / std.unsqueeze(-1) / std.unsqueeze(-2)
+  return (
+    ~torch.isfinite(matrix).all(dim=(-2, -1))
+    | (variance < 0).any(-1)
+    | (((zero.unsqueeze(-1) | zero.unsqueeze(-2)) & (matrix != 0)).any(dim=(-2, -1)))
+    | ((correlation - correlation.mT).abs() > atol + rtol).any(dim=(-2, -1))
+    | (correlation.abs() > 1 + atol + rtol).any(dim=(-2, -1))
+  )
+
+
+@torch.no_grad()
+def rotation_valid(rotation):
+  """Device-only equivalent of the rotation numerical predicate.
+
+  The explicit 3x3 determinant avoids linalg's synchronous error checking.
+  Shape/dtype validation belongs to the preparation boundary.
+  """
+  tolerance = 128 * torch.finfo(rotation.dtype).eps
+  matrix = rotation.double()
+  identity = torch.eye(3, device=matrix.device, dtype=matrix.dtype)
+  gram = matrix.mT @ matrix
+  orthogonal = ((gram - identity).abs() <= tolerance * (1 + identity)).all(dim=(-2, -1))
+  determinant = (
+    matrix[..., 0, :] * torch.linalg.cross(matrix[..., 1, :], matrix[..., 2, :], dim=-1)
+  ).sum(-1)
+  return orthogonal & (determinant > 0)

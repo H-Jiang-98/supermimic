@@ -14,7 +14,13 @@ from dataclasses import asdict, dataclass
 import torch
 from torch import nn
 
-from supermimic.belief_provider import belief_rollout
+from supermimic.belief_provider import BeliefProvider, belief_rollout
+from supermimic.imagined_rollout import (
+  RolloutResult,
+  imagine_step,
+  observe,
+  prepare_rollout,
+)
 from supermimic.learners.learner_utils import (
   build_optimizers,
   fit_critic,
@@ -101,6 +107,12 @@ class BeliefActorCriticPolicyLearner:
     self.actor: nn.Module = actor
     self._actor_forward = (
       compile_eit_kernel(actor.forward) if compile_kernels else actor
+    )
+    forward_with_aux = getattr(actor, "forward_with_aux", None)
+    self._actor_with_aux = (
+      compile_eit_kernel(forward_with_aux)
+      if compile_kernels and forward_with_aux
+      else forward_with_aux
     )
     self.critic: nn.Module = critic
     self.wm_env = wm_env
@@ -195,35 +207,91 @@ class BeliefActorCriticPolicyLearner:
       ):
         raise ValueError(f"Invalid policy {name} noise")
 
+  @property
+  def _uses_tensor_rollout(self):
+    return isinstance(getattr(self.wm_env, "posterior_provider", None), BeliefProvider)
+
+  def _clear_rollout(self):
+    # Production rollouts own only local tensors, never the provider's state.
+    if not self._uses_tensor_rollout:
+      self.wm_env.clear_rollout()
+
   def _rollout(
     self, starts, process_noise, measurement_noise, horizon, *, return_components=False
   ):
-    """Roll out one microbatch, returning live actor returns and time-major critic data."""
+    """Compatibility tuple for diagnostic callers; state is returned by _rollout_result."""
+    result = self._rollout_result(starts, process_noise, measurement_noise, horizon)
+    if result.invalid.any():
+      raise FloatingPointError("Invalid imagined rollout")
+    return result.legacy_tuple(return_components)
+
+  def _rollout_result(self, starts, process_noise, measurement_noise, horizon):
+    prepared = (
+      prepare_rollout(self.wm_env, starts, horizon, process_noise, measurement_noise)
+      if self._uses_tensor_rollout
+      else None
+    )
+    result = self._rollout_kernel(
+      prepared, process_noise, measurement_noise, horizon, starts=starts
+    )
+    return result
+
+  def _rollout_kernel(
+    self, prepared, process_noise, measurement_noise, horizon, *, starts=None
+  ):
+    """Fixed tensor rollout, including bootstrap/GAE, with explicit result/status.
+
+    ``prepared`` is required for production belief training. The None branch
+    preserves the custom analytical environment protocol outside CUDA capture.
+    No preparation, state commits or device-to-host checks occur in the tensor path.
+    """
     cfg, env = self.cfg, self.wm_env
-    obs = env.reset_prepared(starts)
-    survival = process_noise.new_ones(len(starts))
+    count = process_noise.shape[1]
+    state = prepared.state if prepared is not None else None
+    if prepared is None:
+      obs = env.reset_prepared(starts)
+      invalid = torch.zeros(count, device=process_noise.device, dtype=torch.bool)
+    else:
+      obs, invalid = observe(env, prepared, state, 0)
+    survival = process_noise.new_ones(count)
     returns = torch.zeros_like(survival)
     observations, rewards, dones, weights = [], [], [], []
     aux_loss = 0.0
     saturation = process_noise.new_zeros(())
     film_scale = process_noise.new_zeros(2)
-    with belief_rollout(getattr(env, "posterior_provider", None)):
+    scope = (
+      nullcontext()
+      if prepared is not None
+      else belief_rollout(getattr(env, "posterior_provider", None))
+    )
+    with scope:
       for t in range(horizon):
         observations.append(obs["critic"].detach())
         weights.append(survival.detach())
-        actions = self._actor_forward(obs)
-        aux = getattr(self.actor, "auxiliary_loss", lambda: 0.0)()
+        if prepared is not None:
+          assert self._actor_with_aux is not None
+          actions, aux = self._actor_with_aux(obs)
+        else:
+          actions = self._actor_forward(obs)
+          aux = getattr(self.actor, "auxiliary_loss", lambda: 0.0)()
         aux_loss = aux_loss + (aux.mean() if isinstance(aux, torch.Tensor) else aux)
         with torch.no_grad():
           saturation += (env.limit_actions(actions) != actions).float().mean()
           if getattr(self.actor, "film", None) is not None:
             scale, shift = self.actor.film(obs["task_uncertainty"]).chunk(2, -1)
             film_scale += torch.stack((scale.abs().mean(), shift.abs().mean()))
-        obs, reward, done, _ = env.step(
-          actions,
-          process_noise=process_noise[t],
-          measurement_noise=measurement_noise[t],
-        )
+        if prepared is None:
+          obs, reward, done, _ = env.step(
+            actions,
+            process_noise=process_noise[t],
+            measurement_noise=measurement_noise[t],
+          )
+        else:
+          state, reward, done, failed = imagine_step(
+            env, prepared, state, actions, process_noise[t], measurement_noise[t], t
+          )
+          obs, bad_features = observe(env, prepared, state, t + 1)
+          invalid = invalid | failed | bad_features
         returns = returns + cfg.gamma**t * survival * reward
         survival = survival * (1 - done)
         rewards.append(reward.detach())
@@ -258,16 +326,20 @@ class BeliefActorCriticPolicyLearner:
       "raw_reward_sum": step_rewards.sum(),
       "bootstrap": bootstrap.detach().sum(),
       "final_survival": survival.detach().sum(),
-      "valid_steps": returns.new_tensor(horizon * len(starts)),
+      "valid_steps": returns.new_full((), horizon * count),
       "survival_weighted_steps": torch.stack(weights).sum(),
-      "action_saturation": saturation * len(starts),
-      "film_scale": film_scale * len(starts),
-      "value_clamp_fraction": (raw_values > self._v_max).float().mean() * len(starts),
+      "action_saturation": saturation * count,
+      "film_scale": film_scale * count,
+      "value_clamp_fraction": (raw_values > self._v_max).float().mean() * count,
     }
-    self._rollout_aux_loss = aux_loss
-    if return_components:
-      return returns, data, metrics, (reward_return, bootstrap)
-    return returns, data, metrics
+    with torch.no_grad():
+      invalid = invalid | ~torch.isfinite(returns) | ~torch.isfinite(targets).all(dim=0)
+      invalid = invalid | ~torch.isfinite(raw_values).all(dim=0)
+      if isinstance(aux_loss, torch.Tensor):
+        invalid = invalid | ~torch.isfinite(aux_loss).all()
+    return RolloutResult(
+      returns, data, metrics, aux_loss, state, invalid, reward_return, bootstrap
+    )
 
   @staticmethod
   def _check_gradients(module):
@@ -278,6 +350,11 @@ class BeliefActorCriticPolicyLearner:
   def update_from(self, starts, process_noise, measurement_noise):
     """One actor step and configured critic epochs, with fixed caller-owned noise."""
     self._validate_noises(starts, process_noise, measurement_noise)
+    if self._uses_tensor_rollout:
+      # Check the whole logical batch before touching gradients or optimizers.
+      self.wm_env.validate_policy_start(starts)
+      if self._actor_with_aux is None:
+        raise TypeError("Belief training actor requires forward_with_aux")
     timer = PhaseTimer(next(self.actor.parameters()).device)
     self.last_profile = timer.seconds
     cfg, env = self.cfg, self.wm_env
@@ -304,23 +381,30 @@ class BeliefActorCriticPolicyLearner:
         for offset in range(0, count, cfg.microbatch_size):
           selected = slice(offset, offset + cfg.microbatch_size)
           batch = starts.index(selected)
-          returns, regression, metrics = self._rollout(
+          result = self._rollout_result(
             batch,
             process_noise[:, selected],
             measurement_noise[:, selected],
             cfg.horizon,
           )
-          if not torch.isfinite(returns).all():
-            raise FloatingPointError("Non-finite imagined return; actor step rejected")
+          returns, regression, metrics = (
+            result.returns,
+            result.critic_data,
+            result.metrics,
+          )
           (
-            -returns.sum() / count + self._rollout_aux_loss * len(batch) / count
+            -returns.sum() / count + result.auxiliary_loss * len(batch) / count
           ).backward()
+          if result.invalid.any():
+            raise FloatingPointError("Invalid imagined rollout; actor step rejected")
           data.append(regression)
           for name, value in metrics.items():
             totals[name] = totals.get(name, 0) + value
-          del returns
-          env.clear_rollout()
+          del returns, result
+          self._clear_rollout()
 
+        if self._uses_tensor_rollout:
+          env.check_policy_start_identity(starts)
         self._check_gradients(self.actor)
         actor_norm = torch.nn.utils.clip_grad_norm_(
           self.actor.parameters(), cfg.max_grad_norm, error_if_nonfinite=True
@@ -390,9 +474,8 @@ class BeliefActorCriticPolicyLearner:
           optimizer.zero_grad(set_to_none=True)
         raise
       finally:
-        self._rollout_aux_loss = 0.0
-        env.clear_rollout()
-        if hasattr(self.actor, "_aux_loss"):
+        self._clear_rollout()
+        if not self._uses_tensor_rollout and hasattr(self.actor, "_aux_loss"):
           self.actor._aux_loss = next(self.actor.parameters()).new_empty(0)
 
   def _contract(self):

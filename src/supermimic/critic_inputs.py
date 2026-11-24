@@ -16,6 +16,7 @@ import torch
 from torch import nn
 
 from supermimic.belief import BeliefState
+from supermimic.estimator_inputs import covariance_encoding_constants
 from supermimic.models import _CudaGraphNormalization, build_mlp
 from supermimic.utils.lie_state import TANGENT_VERSION, LieState
 from supermimic.utils.validation import check_covariance, validate_state_dict
@@ -78,25 +79,39 @@ def encode_rpv_covariance(
   check_covariance(
     covariance, "Critic covariance", rtol=128 * torch.finfo(covariance.dtype).eps
   )
-  scale = covariance.new_tensor(cfg.covariance_scales).repeat_interleave(3)
-  scaled = (
-    (covariance + covariance.mT) * 0.5 / scale.unsqueeze(-1) / scale.unsqueeze(-2)
+  constants = critic_feature_constants(covariance, cfg)
+  features = encode_rpv_covariance_kernel(covariance, constants)
+  if not torch.isfinite(features).all():
+    raise ValueError("Critic covariance encoding produced non-finite features")
+  return features
+
+
+def critic_feature_constants(reference, config):
+  scale, _, rows, cols = covariance_encoding_constants(
+    reference, config.covariance_scales, config.epsilon_std
   )
-  floor = covariance.new_tensor(cfg.epsilon_std).square()
+  floor = reference.new_tensor(config.epsilon_std).square()
+  mean_scale = reference.new_tensor(
+    [1.0] * 6 + [s for s in config.mean_scales for _ in range(3)]
+  )
   if not (
-    torch.isfinite(scale.square()).all()
-    and (scale.square() > 0).all()
+    torch.isfinite(mean_scale).all()
+    and (mean_scale > 0).all()
     and torch.isfinite(floor)
     and floor > 0
   ):
     raise ValueError("Critic scales/floor are not representable in this dtype")
+  return scale, floor, rows, cols, mean_scale
+
+
+def encode_rpv_covariance_kernel(covariance, constants):
+  scale, floor, rows, cols, _ = constants
+  scaled = (
+    (covariance + covariance.mT) * 0.5 / scale.unsqueeze(-1) / scale.unsqueeze(-2)
+  )
   std = scaled.diagonal(dim1=-2, dim2=-1).clamp_min(floor).sqrt()
   correlation = scaled / std.unsqueeze(-1) / std.unsqueeze(-2)
-  rows, cols = torch.triu_indices(9, 9, offset=1, device=covariance.device)
-  features = torch.cat((std.log(), correlation[..., rows, cols].clamp(-1, 1)), -1)
-  if not torch.isfinite(features).all():
-    raise ValueError("Critic covariance encoding produced non-finite features")
-  return features
+  return torch.cat((std.log(), correlation[..., rows, cols].clamp(-1, 1)), -1)
 
 
 def critic_state_features(truth: LieState) -> torch.Tensor:
@@ -148,12 +163,6 @@ def build_critic_features(
       or not torch.isfinite(value).all()
     ):
       raise ValueError(f"Invalid critic {name} shape, dtype, device or values")
-  pieces = [
-    critic_state_features(truth),
-    true_goal,
-    history.flatten(-2),
-    sim_ctx,
-  ]
   if cfg.group != "A":
     if not isinstance(belief, BeliefState):
       raise ValueError("B/C critic requires a complete BeliefState")
@@ -165,6 +174,32 @@ def build_critic_features(
       or mean.position.device != truth.position.device
     ):
       raise ValueError("Critic belief must match truth batch, dtype and device")
+    check_covariance(
+      belief.covariance_rpv,
+      "Critic covariance",
+      rtol=128 * torch.finfo(history.dtype).eps,
+    )
+  features = build_critic_features_kernel(
+    truth,
+    true_goal,
+    history,
+    sim_ctx,
+    belief,
+    group=cfg.group,
+    constants=critic_feature_constants(history, cfg) if cfg.group != "A" else None,
+  )
+  if not torch.isfinite(features).all():
+    raise ValueError("Critic encoding produced non-finite features")
+  return features
+
+
+def build_critic_features_kernel(
+  truth, true_goal, history, sim_ctx, belief, *, group, constants
+):
+  """Trusted tensor encoding; belief marginals come from covariance factors."""
+  pieces = [critic_state_features(truth), true_goal, history.flatten(-2), sim_ctx]
+  if group != "A":
+    mean = belief.mean
     inverse = truth.rotation.mT
     rotation = inverse @ mean.rotation
     mean_features = torch.cat(
@@ -175,19 +210,13 @@ def build_critic_features(
       ),
       -1,
     )
-    scale = mean_features.new_tensor(
-      [1.0] * 6 + [s for s in cfg.mean_scales for _ in range(3)]
-    )
     pieces.extend(
       (
-        mean_features / scale,
-        encode_rpv_covariance(belief.covariance_rpv, cfg),
+        mean_features / constants[-1],
+        encode_rpv_covariance_kernel(belief.covariance_rpv, constants),
       )
     )
-  features = torch.cat(pieces, -1)
-  if not torch.isfinite(features).all():
-    raise ValueError("Critic encoding produced non-finite features")
-  return features
+  return torch.cat(pieces, -1)
 
 
 class BeliefCritic(nn.Module):

@@ -15,7 +15,11 @@ from typing import Any, Literal, Protocol
 
 import torch
 
-from supermimic.utils.validation import check_covariance, validate_rotation
+from supermimic.utils.validation import (
+  check_covariance,
+  covariance_encoding_invalid,
+  validate_rotation,
+)
 
 INPUT_VERSION = "eit_rpv_v1"
 COVARIANCE_ENCODING = "log_std_corr_v1"
@@ -485,6 +489,10 @@ def task_error_covariance(
     raise ValueError(
       "One RPV covariance (batch,9,9) is required for the current posterior"
     )
+  return task_error_covariance_kernel(covariance_rpv, position_error, velocity_error)
+
+
+def task_error_covariance_kernel(covariance_rpv, position_error, velocity_error):
   jacobian = task_error_jacobian(position_error, velocity_error)
   return jacobian @ covariance_rpv[:, None] @ jacobian.transpose(-1, -2)
 
@@ -501,12 +509,32 @@ def encode_covariance(
   if len(scales) != 3 or any(not math.isfinite(s) or s <= 0 for s in scales):
     raise ValueError("Covariance scales must be positive")
   covariance = validate_covariance(covariance)
-  scale = covariance.new_tensor(scales).repeat_interleave(3)
+  constants = covariance_encoding_constants(covariance, scales, std_floor)
+  return encode_covariance_kernel(covariance, constants)
+
+
+def covariance_encoding_constants(reference, scales, std_floor):
+  """Prepare and validate dtype-specific constants outside a captured rollout."""
+  scale = reference.new_tensor(scales).repeat_interleave(3)
+  floor = reference.new_tensor(std_floor**2)
+  if not (
+    torch.isfinite(scale.square()).all()
+    and (scale.square() > 0).all()
+    and torch.isfinite(floor)
+    and floor > 0
+  ):
+    raise ValueError("Covariance scales/floor are not representable in this dtype")
+  rows, cols = torch.triu_indices(9, 9, offset=1, device=reference.device)
+  return scale, floor, rows, cols
+
+
+def encode_covariance_kernel(covariance, constants):
+  scale, floor, rows, cols = constants
+  covariance = (covariance + covariance.mT) * 0.5
   normalized = covariance / (scale[:, None] * scale[None, :])
-  std = normalized.diagonal(dim1=-2, dim2=-1).clamp_min(std_floor**2).sqrt()
+  std = normalized.diagonal(dim1=-2, dim2=-1).clamp_min(floor).sqrt()
   correlation = normalized / (std.unsqueeze(-1) * std.unsqueeze(-2))
-  rows, cols = torch.triu_indices(9, 9, offset=1, device=covariance.device)
-  return torch.cat((std.log(), correlation[..., rows, cols].clamp(-1.0, 1.0)), dim=-1)
+  return torch.cat((std.log(), correlation[..., rows, cols].clamp(-1.0, 1.0)), -1)
 
 
 def build_actor_features(
@@ -550,3 +578,27 @@ def build_actor_critic_goals(
     else actor.clone()
   )
   return actor, uncertainty, critic
+
+
+def build_actor_critic_goals_kernel(config, truth, posterior, reference, constants):
+  """Tensor-only goals and numerical status for a fixed training configuration."""
+  state = posterior.mean if config.uses_posterior else truth
+  actor, position_error, velocity_error = _motion_goal(state, reference)
+  uncertainty = None
+  invalid = torch.zeros(actor.shape[0], device=actor.device, dtype=torch.bool)
+  if config.uses_uncertainty:
+    covariance = posterior.covariance_rpv
+    tolerance = 64 * torch.finfo(covariance.dtype).eps
+    invalid = covariance_encoding_invalid(covariance, rtol=tolerance)
+    covariance = (covariance + covariance.mT) * 0.5
+    task_covariance = task_error_covariance_kernel(
+      covariance, position_error, velocity_error
+    )
+    # Inspect the projected covariance before the encoder can hide numerical
+    # failures with variance floors or correlation clamps.
+    invalid = invalid | covariance_encoding_invalid(
+      task_covariance, rtol=tolerance
+    ).flatten(1).any(-1)
+    uncertainty = encode_covariance_kernel(task_covariance, constants).flatten(1)
+  critic = _motion_goal(truth, reference)[0] if config.uses_posterior else actor.clone()
+  return actor, uncertainty, critic, invalid

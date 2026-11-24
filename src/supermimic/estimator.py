@@ -26,7 +26,7 @@ from supermimic.utils.lie_state import (
   skew,
 )
 from supermimic.utils.square_root import covariance_root
-from supermimic.utils.validation import check_covariance
+from supermimic.utils.validation import check_covariance, rotation_valid
 
 if TYPE_CHECKING:
   from supermimic.models import Dynamics
@@ -419,10 +419,43 @@ class LieBeliefFilter:
       and not bool(torch.isfinite(action).all() & torch.isfinite(context).all())
     ):
       raise ValueError("Action and context must be finite")
-    nominal, factor = self.dynamics.distribution_lie(belief.mean, action, context)
-    jacobian = self.transition_jacobian(belief.mean, action, context, nominal)
-    lower = self._propagate(jacobian, belief.covariance_sqrt, factor)
+    return self._prediction_kernel(belief.mean, belief.covariance_sqrt, action, context)
+
+  def _prediction_kernel(self, mean, covariance_sqrt, action, context):
+    nominal, factor = self.dynamics.distribution_lie(mean, action, context)
+    jacobian = self.transition_jacobian(mean, action, context, nominal)
+    lower = self._propagate(jacobian, covariance_sqrt, factor)
     return BeliefState(nominal, covariance_sqrt=lower), jacobian, factor
+
+  def predict_correct_kernel(
+    self,
+    mean: LieState,
+    covariance_sqrt: torch.Tensor,
+    action: torch.Tensor,
+    context: torch.Tensor,
+    measurement: torch.Tensor,
+    *,
+    measurement_std: torch.Tensor,
+  ) -> tuple[LieState, torch.Tensor, torch.Tensor]:
+    """Unchecked tensor transition with explicit noise constants.
+
+    The caller validates initial tensors and pins model/configuration for the
+    rollout. No provider state, host numerical decisions, cache initialization,
+    or detach of differentiable outputs occurs here. ``invalid`` is a boolean
+    tensor with the belief's leading batch shape. The factor is (...,70,70),
+    action (...,29), measurement (...,64), and measurement_std (64,).
+    """
+    predicted, jacobian, factor = self._prediction_kernel(
+      mean, covariance_sqrt, action, context
+    )
+    result, *_ = self._correction_kernel(predicted, measurement, measurement_std)
+    with torch.no_grad():
+      invalid = belief_invalid(result) | belief_invalid(predicted)
+      invalid = invalid | ~torch.isfinite(jacobian).all(dim=(-2, -1))
+      invalid = invalid | ~torch.isfinite(factor).all(dim=(-2, -1))
+      invalid = invalid | ~torch.isfinite(measurement).all(dim=-1)
+      invalid = invalid | ~torch.isfinite(action).all(dim=-1)
+    return result.mean, result.covariance_sqrt, invalid
 
   def correct(
     self,
@@ -449,10 +482,12 @@ class LieBeliefFilter:
     summary_only: bool = False,
   ) -> tuple[BeliefState, CorrectionDiagnostics | CorrectionSummary | None]:
     self._validate_belief(belief)
-    predicted = self.observation(belief.mean)
-    if measurement.shape != predicted.shape:
+    if measurement.shape != (*belief.mean.position.shape[:-1], 64):
       raise ValueError("Measurement must have shape (*belief_batch, 64)")
-    if measurement.device != predicted.device or measurement.dtype != predicted.dtype:
+    if (
+      measurement.device != belief.covariance_sqrt.device
+      or measurement.dtype != belief.covariance_sqrt.dtype
+    ):
       raise ValueError("Measurement and belief must share dtype and device")
     if (
       self.config.validate_numerics
@@ -460,15 +495,12 @@ class LieBeliefFilter:
       and not bool(torch.isfinite(measurement).all())
     ):
       raise ValueError("Measurement contains non-finite values")
-    h = self.observation_jacobian(belief.mean)
     std, _ = self.measurement_config._tensors(
       29, device=measurement.device, dtype=measurement.dtype
     )
-    innovation = measurement - predicted
-    lower, correction, innovation_factor, gain, reset = self._correct_factor(
-      belief.covariance_sqrt, h, std, innovation
+    result, innovation, h, innovation_factor, gain, correction, reset = (
+      self._correction_kernel(belief, measurement, std)
     )
-    result = BeliefState(boxplus(belief.mean, correction), covariance_sqrt=lower)
     self._validate_belief(result)
     if summary_only:
       return result, CorrectionSummary(innovation.detach().norm(dim=-1))
@@ -483,6 +515,30 @@ class LieBeliefFilter:
       )
     return result, None
 
+  def _correction_kernel(self, belief, measurement, std):
+    predicted = self.observation(belief.mean)
+    h = self.observation_jacobian(belief.mean)
+    innovation = measurement - predicted
+    lower, correction, innovation_factor, gain, reset = self._correct_factor(
+      belief.covariance_sqrt, h, std, innovation
+    )
+    result = BeliefState(boxplus(belief.mean, correction), covariance_sqrt=lower)
+    return result, innovation, h, innovation_factor, gain, correction, reset
+
   @staticmethod
   def to_actor_input(belief: BeliefState) -> PosteriorInput:
     return belief.to_actor_input()
+
+
+@torch.no_grad()
+def belief_invalid(belief: BeliefState) -> torch.Tensor:
+  """Per-sample numerical status; square roots guarantee covariance PSD."""
+  mean, lower = belief.mean, belief.covariance_sqrt
+  valid = rotation_valid(mean.rotation)
+  for field in fields(mean):
+    value = getattr(mean, field.name)
+    axes = (-2, -1) if field.name == "rotation" else -1
+    valid = valid & torch.isfinite(value).all(dim=axes)
+  valid = valid & torch.isfinite(lower).all(dim=(-2, -1))
+  valid = valid & (lower.diagonal(dim1=-2, dim2=-1) > 0).all(dim=-1)
+  return ~valid

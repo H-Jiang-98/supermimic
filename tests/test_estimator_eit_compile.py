@@ -1,5 +1,6 @@
 """Fixed-input CUDA parity for EIT policy gradients through the compiled filter."""
 
+import gc
 from pathlib import Path
 
 import pytest
@@ -7,6 +8,7 @@ import torch
 from torch._dynamo.utils import get_compilation_metrics
 
 from supermimic.estimator import FilterConfig
+from supermimic.imagined_rollout import prepare_rollout
 from supermimic.learners.belief_policy_learner import BeliefPolicyLearnerCfg
 from supermimic.models import ProcessNoiseConfig
 from supermimic.runners.eit_training import EITTraining
@@ -72,8 +74,9 @@ def test_fixed_policy_rollout_compiled(group, backend, tmp_path):
       results = []
       for stance in ("force_eager", "default"):
         with torch.compiler.set_stance(stance):
-          returns, _, _ = policy._rollout(inputs, *noises, policy.cfg.horizon)
-          posterior = world.posterior_provider.state.belief
+          result = policy._rollout_result(inputs, *noises, policy.cfg.horizon)
+          returns = result.returns
+          posterior = result.final_state.belief
           gradients = torch.autograd.grad(
             returns.sum(), tuple(policy.actor.parameters()), allow_unused=True
           )
@@ -85,17 +88,96 @@ def test_fixed_policy_rollout_compiled(group, backend, tmp_path):
               [g.detach() if g is not None else None for g in gradients],
             )
           )
+          del result, returns, posterior, gradients
           world.clear_rollout()
       torch.testing.assert_close(results[1], results[0], atol=2e-5, rtol=1e-3)
+      # Capture the actual training tensor path, including actor backward.
+      prepared = prepare_rollout(world, inputs, policy.cfg.horizon, *noises)
+      parameters = tuple(policy.actor.parameters())
+
+      def run(prepared=prepared, noises=noises, parameters=parameters):
+        result = policy._rollout_kernel(prepared, *noises, policy.cfg.horizon)
+        gradients = torch.autograd.grad(
+          -result.returns.mean() + result.auxiliary_loss, parameters
+        )
+        belief = result.final_state.belief
+        return (
+          result.returns,
+          belief.mean.to_full(),
+          belief.covariance_sqrt,
+          result.critic_data,
+          result.invalid,
+          gradients,
+        )
+
+      _capture_and_compare(run, prepared, noises)
+      if group == "C" and backend == "increment":
+        with torch.compiler.set_stance("force_eager"):
+          _capture_and_compare(run, prepared, noises)
+
+        # Production-style backward uses stable gradient buffers. Zeroing is a
+        # captured device operation, so consecutive replays cannot accumulate.
+        for parameter in parameters:
+          parameter.grad = torch.zeros_like(parameter)
+
+        def run_backward(prepared=prepared, noises=noises, parameters=parameters):
+          for parameter in parameters:
+            parameter.grad.zero_()
+          result = policy._rollout_kernel(prepared, *noises, policy.cfg.horizon)
+          (-result.returns.mean() + result.auxiliary_loss).backward()
+          return (
+            result.returns,
+            result.invalid,
+            tuple(p.grad.clone() for p in parameters),
+          )
+
+        _capture_and_compare(run_backward, prepared, noises)
     graphs = {
       (Path(metric.co_filename).name, metric.co_name)
       for metric in get_compilation_metrics()
       if metric.co_filename and metric.graph_op_count
     }
     assert {
-      ("models.py", "forward"),
+      ("models.py", "forward_with_aux"),
       ("estimator.py", "_vector_jacobian"),
       ("estimator.py", "_propagate_sqrt"),
     } <= graphs
   finally:
     env.close()
+
+
+def _capture_and_compare(run, prepared, noises):
+  # Drop autograd cycles from eager comparisons before creating capture nodes.
+  gc.collect()
+  stream = torch.cuda.Stream()
+  stream.wait_stream(torch.cuda.current_stream())
+  with torch.cuda.stream(stream):
+    for _ in range(3):
+      run()
+  torch.cuda.current_stream().wait_stream(stream)
+  graph = torch.cuda.CUDAGraph()
+  with torch.cuda.graph(graph, stream=stream):
+    captured = run()
+  for _replay in range(2):
+    # Reuse addresses with changed starts/noises; replay must execute new math.
+    with torch.no_grad():
+      noises[0].add_(0.05)
+      noises[1].sub_(0.03)
+      prepared.state.belief.mean.position.add_(0.002)
+      prepared.state.history.add_(0.001)
+    graph.replay()
+    expected = run()
+    assert not captured[-2].any()
+    torch.testing.assert_close(captured, expected, atol=2e-5, rtol=1e-3)
+  with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+    run()
+  keys = {event.key for event in prof.key_averages()}
+  assert (
+    not {
+      "aten::item",
+      "aten::_local_scalar_dense",
+      "aten::nonzero",
+      "aten::_linalg_check_errors",
+    }
+    & keys
+  )

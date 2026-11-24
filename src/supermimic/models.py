@@ -561,6 +561,11 @@ class MultiEncoderAE(nn.Module):
     return ranges
 
   def forward(self, obs_td: TensorDict) -> torch.Tensor:
+    action, self._aux_loss = self.forward_with_aux(obs_td)
+    return action
+
+  def forward_with_aux(self, obs_td: TensorDict) -> tuple[torch.Tensor, torch.Tensor]:
+    """Training forward with explicit auxiliary output and no mutable graph state."""
     history = obs_td["history"]
     if history.shape[1:] != (self.history_length, self.obs_dim):
       raise ValueError(
@@ -575,13 +580,13 @@ class MultiEncoderAE(nn.Module):
       goal_n = self.goal_normalizers[name](obs_td[f"goal_{name}"][lo:hi])
       enc_outs.append(self.encoders[name](goal_n))
 
-    self._aux_loss = self._compute_aux_loss(obs_td, slots)
+    aux_loss = self._compute_aux_loss(obs_td, slots)
 
     z = torch.cat([torch.tanh(eo) for eo in enc_outs], dim=0)
     history_n = self.obs_normalizer(history)
     decoder_input = torch.cat([z, history_n.flatten(start_dim=1)], dim=-1)
     if self.film is None:
-      return self.decoder(decoder_input)
+      return self.decoder(decoder_input), aux_loss
     if "task_uncertainty" not in obs_td.keys():
       raise ValueError("FiLM actor requires task_uncertainty input")
     uncertainty = obs_td["task_uncertainty"]
@@ -595,7 +600,7 @@ class MultiEncoderAE(nn.Module):
     hidden = (1.0 + gamma) * hidden + beta
     for layer in self.decoder[2:]:
       hidden = layer(hidden)
-    return hidden
+    return hidden, aux_loss
 
   def _compute_aux_loss(
     self, obs_td: TensorDict, slots: list[tuple[int, int]]

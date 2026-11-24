@@ -168,6 +168,7 @@ def _private_components(training):
   ):
     setattr(policy, name, cloned[name])
   policy._actor_forward = policy.actor
+  policy._actor_with_aux = getattr(policy.actor, "forward_with_aux", None)
   policy.wm_env = env
   return wm, learner, policy, env
 

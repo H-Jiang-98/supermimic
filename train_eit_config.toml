@@ -5,7 +5,7 @@ environment_root = "/mnt/cpfs/zbl-cpfs-new/USERS/leojiang/supermimic_ws" # 使�
 dataset_root = "/mnt/cpfs/zbl-cpfs-new/dataset/leojiang/supermimic_ws"
 motion_file = "motions/*.npz" # 相对 dataset_root，也可用 "motions/*.npz"
 checkpoint_root = "/mnt/cpfs/zbl-cpfs-new/CKPT/leojiang/supermimic_ws"
-experiment = "eit_v6_Lafan_compiled_plc_micb_512" # 输出：checkpoint_root/experiment/seed<seed>/<方法>/
+experiment = "eit_v6_Lafan_compiled_plc_micb_1024" # 输出：checkpoint_root/experiment/seed<seed>/<方法>/
 
 [training]
 jacobian_backend = "increment" # 35 维网络增量求导，再通过积分组装 70x70 Jacobian。
@@ -17,7 +17,7 @@ replay_ratio = 16
 sampling_mode = "return"
 log_interval = 10
 save_interval = 1000
-posterior_save_stride = 2
+posterior_save_stride = 4
 
 mean_lr = 2e-4
 mean_updates = 10
@@ -32,7 +32,7 @@ policy_lr = 2e-4
 critic_lr = 2e-4
 policy_updates = 1
 policy_batch_size = 4096
-policy_microbatch_size = 512
+policy_microbatch_size = 1024
 policy_horizon = 32
 samples = 1
 critic_epochs = 5
@@ -52,16 +52,16 @@ ls_iterations = 50 # 当前任务默认：20；每次线搜索的迭代上限。
 # 方法可共用 GPU；每张卡同时只跑一个进程。删除整个方法表即可跳过该方法。
 
 [methods.A]
-gpus = [1]
+gpus = [5]
 seeds = [2027]
 #seeds = [2027, 2028, 2029, 2030, 2031]
 
 [methods.B]
-gpus = [2]
+gpus = [6]
 seeds = [2027]
 #seeds = [2027, 2028, 2029, 2030, 2031]
 
 [methods.C]
-gpus = [6]
+gpus = [7]
 seeds = [2027]
 #seeds = [2027, 2028, 2029, 2030, 2031]

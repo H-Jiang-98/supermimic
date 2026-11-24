@@ -622,11 +622,8 @@ class WorldModelEnv(ABC):
       *self.sample_policy_keys(batch_size, episode_ids, generator)
     )
 
-  def reset_prepared(self, start: BeliefRolloutStart) -> TensorDict:
-    """Restore a copied Q0 without sampling or fusing the first measurement again."""
-    self._check_posterior_source(None)
-    if not isinstance(start, BeliefRolloutStart) or not len(start):
-      raise ValueError("A nonempty BeliefRolloutStart is required")
+  def check_policy_start_identity(self, start):
+    """Host-side identity check at preparation and before optimizer submission."""
     if (
       start.replay_buffer is not self.replay_buffer
       or start.insert_count != self.replay_buffer.insert_count
@@ -638,6 +635,13 @@ class WorldModelEnv(ABC):
       )
     ):
       raise ValueError("Stale rollout start: model, replay or motion changed")
+
+  def validate_policy_start(self, start):
+    """Validate/copy complete initial conditions without touching provider state."""
+    self._check_posterior_source(None)
+    if not isinstance(start, BeliefRolloutStart) or not len(start):
+      raise ValueError("A nonempty BeliefRolloutStart is required")
+    self.check_policy_start_identity(start)
     batch = start.batch.detach().clone()
     shape = (len(start),)
     reference = next(self.dynamics.parameters())
@@ -673,8 +677,26 @@ class WorldModelEnv(ABC):
     if (batch["motion_time"] >= self.motion.motion_ends[-1]).any():
       raise ValueError("Prepared reference frame exceeds motion bounds")
     validate_rotation(batch["alignment_rotation"])
+    if not isinstance(start.belief, BeliefState):
+      raise TypeError("Training requires a complete BeliefState")
+    belief = start.belief.detach().clone()
+    belief.validate()
+    if (
+      belief.covariance_sqrt.shape != (len(start), 70, 70)
+      or belief.covariance_sqrt.dtype != reference.dtype
+      or belief.covariance_sqrt.device != reference.device
+    ):
+      raise ValueError("Prepared belief must match batch, dtype and device")
+    LieState.from_full(batch["state"]).validate()
+    if not torch.equal(batch["sensor_window"][:, -1, -29:], batch["prev_action"]):
+      raise ValueError("Stored measurement actions must equal replay prev_action")
+    return batch, belief
+
+  def reset_prepared(self, start: BeliefRolloutStart) -> TensorDict:
+    """Restore a copied Q0 without sampling or fusing the first measurement again."""
+    batch, belief = self.validate_policy_start(start)
     candidate = self.posterior_provider.prepare_restore(
-      start.belief.detach(),
+      belief,
       batch["sim_ctx"],
       model_version=start.model_version,
       episode_id=batch["episode_id"],
@@ -1179,6 +1201,28 @@ class WorldModelEnv(ABC):
     score the post-step state against the cached reference body state, the way
     the simulator scores it before advancing the clip.
     """
+    return self._wm_step_kernel(
+      rep_state,
+      aux_state,
+      action,
+      last_action,
+      sim_ctx,
+      self._ref_body_state,
+      process_noise=process_noise,
+    )
+
+  def _wm_step_kernel(
+    self,
+    rep_state,
+    aux_state,
+    action,
+    last_action,
+    sim_ctx,
+    reference,
+    *,
+    process_noise,
+  ):
+    """Shared transition/reward math with explicit reference and latent state."""
     if process_noise is None:
       next_aux_state, next_rep_state = self.dynamics(
         rep_state, action, aux_state, sim_ctx
@@ -1188,9 +1232,7 @@ class WorldModelEnv(ABC):
         rep_state, action, aux_state, sim_ctx, process_noise
       )
     next_joint_state = self.representation.joint_state(next_rep_state)
-    ref_body_pos_w, ref_body_quat_w, ref_body_lin_vel_w, ref_body_ang_vel_w = (
-      self._ref_body_state
-    )
+    ref_body_pos_w, ref_body_quat_w, ref_body_lin_vel_w, ref_body_ang_vel_w = reference
     term_prob = self._compute_term_prob(next_aux_state, ref_body_pos_w, ref_body_quat_w)
     reward = self.representation.compute_wm_reward_from_reference(
       next_rep_state,

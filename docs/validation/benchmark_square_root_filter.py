@@ -12,6 +12,11 @@ import torch
 parser = argparse.ArgumentParser()
 parser.add_argument("--output", required=True)
 parser.add_argument("--rollout", action="store_true")
+parser.add_argument(
+  "--compare-rollout",
+  action="store_true",
+  help="Compare transactional and tensor rollout paths",
+)
 parser.add_argument("--batch", type=int, default=1024)
 parser.add_argument("--horizon", type=int, default=32)
 parser.add_argument("--repeats", type=int, default=3)
@@ -45,7 +50,7 @@ def measure(fn, **metadata):
   Path(args.output).write_text(json.dumps(reports, indent=2))
 
 
-if not args.rollout:
+if not (args.rollout or args.compare_rollout):
   from tests.test_estimator_belief_filter import _fixture
 
   from supermimic.belief import BeliefState
@@ -170,14 +175,37 @@ else:
         (-value.mean()).backward()
         runner.wm_env.clear_rollout()
 
-      measure(
-        rollout,
-        kind="policy_rollout_backward",
+      metadata = dict(
         batch=args.batch,
         horizon=args.horizon,
         small=args.small,
         dtype="float32",
         compiled=True,
+        torch_version=torch.__version__,
+        gpu=torch.cuda.get_device_name(),
       )
+      if args.compare_rollout:
+        from supermimic.imagined_rollout import prepare_rollout
+
+        def transactional():
+          actor.zero_grad(set_to_none=True)
+          result = policy._rollout_kernel(None, *noises, args.horizon, starts=starts)
+          (-result.returns.mean()).backward()
+          runner.wm_env.clear_rollout()
+
+        measure(transactional, kind="transactional_rollout_backward", **metadata)
+        measure(rollout, kind="prepared_rollout_backward", **metadata)
+        prepared = prepare_rollout(runner.wm_env, starts, args.horizon, *noises)
+
+        def tensor_rollout():
+          actor.zero_grad(set_to_none=True)
+          result = policy._rollout_kernel(prepared, *noises, args.horizon)
+          (-result.returns.mean()).backward()
+          if result.invalid.any():
+            raise FloatingPointError("Invalid benchmark rollout")
+
+        measure(tensor_rollout, kind="tensor_rollout_backward", **metadata)
+      else:
+        measure(rollout, kind="policy_rollout_backward", **metadata)
     finally:
       env.close()

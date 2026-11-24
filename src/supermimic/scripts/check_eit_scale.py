@@ -156,13 +156,15 @@ def main():
       runner._dynamics.requires_grad_(False)
       critic.requires_grad_(False)
       parameter = actor.decoder[-1].bias
-      value, _, _ = policy._rollout(one, process, measurement, 2)
+      result = policy._rollout_result(one, process, measurement, 2)
+      value = result.returns
+      assert result.final_state is not None
       gradient, film_gradient, covariance_gradient = torch.autograd.grad(
         value.sum(),
         (
           parameter,
           actor.film[0].weight,
-          runner.imagined_posterior_provider.state.belief.covariance_sqrt,
+          result.final_state.belief.covariance_sqrt,
         ),
       )
       assert film_gradient.norm() > 0 and covariance_gradient.norm() > 0
@@ -174,7 +176,7 @@ def main():
       for sign in (1, -1):
         with torch.no_grad():
           parameter.copy_(original + sign * epsilon * direction)
-        value, _, _ = policy._rollout(one, process, measurement, 2)
+        value = policy._rollout_result(one, process, measurement, 2).returns
         values.append(value.detach().sum())
       with torch.no_grad():
         parameter.copy_(original)
@@ -197,6 +199,7 @@ def main():
 
       del (
         value,
+        result,
         gradient,
         analytical,
         finite_difference,

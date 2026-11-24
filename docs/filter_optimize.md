@@ -100,7 +100,7 @@ posterior:  L_post = root([J @ (L_pred - K @ U), (J @ K) * sensor_std])
 和版本。显式 `belief.validate()`、初始化、状态加载和开启调试检查时可以同步。
 常规 provider 只请求 `return_diagnostics="summary"`，返回 innovation norm；
 `True` 仍提供完整诊断。旧 rank/jitter/retry 诊断已删除。
-episode/reset 控制和独立 actor/critic 输入校验不属于此次同步清理范围。
+在线 episode/reset 控制和公开 actor/critic 输入校验继续保留；训练专用路径见下节。
 
 Replay 使用 `incremental_posterior_sqrt_tril_f32_v2`，保存 2485 个 float32
 因子元素，恢复时无需分解。Provider 使用 `right_local_sqrt_provider_v4`。
@@ -136,3 +136,110 @@ CUDA_VISIBLE_DEVICES=3 PYTHONPATH=src:. python docs/validation/benchmark_square_
 ```
 
 对照旧版时使用同一份脚本，并将 `PYTHONPATH` 指向旧源码及其测试目录。
+
+
+## 局部张量 imagined rollout
+
+训练不再通过 `WorldModelEnv.step → BeliefProvider.prepare/commit` 展开。
+`LieBeliefFilter.predict_correct_kernel` 接受完整 `LieState`、`covariance_sqrt`、
+已限幅动作、context、测量及预先准备的传感器标准差，返回下一步 mean、因子和
+与 batch 同形状的设备端 boolean `invalid`。在线滤波包装和训练入口共用
+`_prediction_kernel` / `_correction_kernel`；平方根传播、Jacobian、三角求解、
+Joseph/reset 公式及其一阶、二阶梯度保持不变。
+
+[`imagined_rollout.py`](../src/supermimic/imagined_rollout.py) 分为两个边界：
+
+- `prepare_rollout`：校验 starts、模型/replay/reference 身份、完整初始后验、
+  context、历史动作和固定噪声；复制 detached 初始张量，准备 dtype/device 常量和
+  H+1 个 clip-clamped reference 窗口。准备数据的内存按 microbatch 分配。
+- `observe` / `imagine_step`：只读模型及固定配置，显式接收/返回 `ImaginedState`。
+  动态失败标志在 GPU 上合并，不做 reset/live 分流、episode/time 连续性查询、
+  generation 更新、pending transition 或 provider 状态写入。
+
+actor/critic 特征编码也共用无主机数值判断的张量函数。初始后验因子已在边界验证，
+后续因子由 QR 产生，RPV/task covariance 是其线性映射，因此训练无需逐步重新进行
+特征协方差的谱分解。设备端检查仍覆盖有限性、旋转有效性、因子正对角及目标；
+外部输入的公开校验函数继续拒绝非法协方差。
+
+`MultiEncoderAE.forward_with_aux` 显式返回 action 和附加损失。训练不读取或替换
+actor 的 `_aux_loss`，也不把最终后验写回 provider。`RolloutResult` 返回 returns、
+critic 数据、metrics、附加损失、最终状态和 invalid；需要检查最终后验的诊断改读
+`result.final_state.belief`。旧 `_rollout` tuple 接口作为带边界检查的诊断包装保留。
+恢复验证复制 learner 时，同时重新绑定 actor 的两个 forward 入口。
+
+奖励/termination 仍用推进前的 reference 对推进后的 latent 评分，然后构造下一帧
+观测。history 保持 oldest-first，动作只限幅一次使用，尾帧保持、soft survival、
+bootstrap、GAE、microbatch 加权和 replay 初始 posterior 不重复融合的语义不变。
+
+### CUDA capture 边界
+
+生产训练已默认使用张量路径。本次提供 capture/replay 回归验证，不启用自动 graph
+缓存或捕获整个 optimizer/critic update。可捕获部分为：
+
+```python
+# 图外，模型/reference/config 与 normalization 在本次 update 内只读。
+prepared = prepare_rollout(env, start, horizon, process_noise, measurement_noise)
+
+# 固定尺寸的图内入口，噪声为 (H, B, 70) / (H, B, 64)。
+result = learner._rollout_kernel(prepared, process_noise, measurement_noise, horizon)
+loss = -result.returns.sum() / total_samples
+loss = loss + result.auxiliary_loss * microbatch_samples / total_samples
+loss.backward()
+
+# 图外：读取 invalid、复核模型/reference 身份与梯度，再允许 optimizer.step。
+```
+
+中间后验、latent、history 都保持 autograd 联系。输入噪声和准备数据的 backing
+storage 在该次 forward/backward 生命周期内必须保持只读；replay 更换输入时要复制
+到已捕获的固定地址，不能依赖 Python 对象替换。准备、版本检查、模式切换、日志、
+梯度裁剪、优化器和计数器仍在图外；batch/horizon/配置变化需另行准备/捕获。
+
+每个 microbatch 的前向/反向返回后读取一次设备失败状态。任一步失败会拒绝本次
+actor update 并清空累计梯度；不会推进 actor/critic optimizer 或更新步数。
+在线 `reset/step/snapshot/restore` 继续使用原有事务和相同动作/噪声重试规则。
+
+### 验证与性能
+
+验证覆盖 A/B/C、vmap/increment、逐帧后验/观测/reward/termination、actor 梯度、
+初始 mean/因子和模型参数的一阶/二阶梯度、重复 starts、不同 clip、尾帧、尾部
+microbatch、失败拒绝、provider 状态隔离及恢复验证。CUDA 测试对 batch 2/1、H=2
+执行前向与反向捕获，修改起点和噪声后连续 replay，并检查与 eager 结果一致。
+C/increment 额外验证强制 eager 计算及固定梯度缓冲区 `backward()` 的 capture。Profiler 检查整个张量路径不包含
+`aten::item`、`aten::_local_scalar_dense`、`aten::nonzero`、
+`aten::_linalg_check_errors`。
+
+固定噪声的生产网络性能比较可用以下命令复现：
+
+```bash
+CUDA_VISIBLE_DEVICES=5 PYTHONPATH=src:. python docs/validation/benchmark_square_root_filter.py --compare-rollout --batch 1024 --horizon 32 --repeats 3 --output /tmp/tensor-rollout-benchmark.json
+```
+
+比较三条路径：保留的事务展开、包含准备阶段的新训练展开、已准备输入的张量展开；
+都包含 actor 反向，不包含优化器和 critic 拟合。所有路径使用同一模型、starts 和
+噪声，先预热再取三次中位数；不把编译时间算入计时。
+
+
+2026-11-24 在 PyTorch 2.14.0+cu130 / NVIDIA RPBZZZ6 上的独立复测结果：
+
+| 路径（batch 1024，H=32，生产网络） | 前向及反向中位数 | 峰值 allocated 显存 |
+|---|---:|---:|
+| 事务展开 | 4637 ms | 51.46 GiB |
+| 新路径，包含准备阶段 | 3905 ms | 50.96 GiB |
+| 新路径，输入已准备 | 3757 ms | 50.96 GiB |
+
+包含准备阶段的耗时减少约 15.8%；只计已准备张量展开时减少约 19.0%。
+这些数字是常规调用张量路径的耗时，不是 CUDA Graph replay 的吞吐率。
+原始三次计时、运行配置和显存见
+[验证记录](validation/tensor_rollout_float32.json)。
+
+本次分批验证了 614 项相关回归用例及六组 CUDA capture 用例；C/increment
+还验证了 eager capture 和使用固定梯度缓冲区的实际 `loss.backward()`，连续
+replay 的梯度不会累加。Ruff 与 `git diff --check` 通过。
+
+验证环境的既有问题单独记录：
+
+- `test_first_publication_can_retry_in_its_own_interrupted_output` 与先前启动过 W&B
+  的测试同进程运行时失败；未修改的 HEAD 同样复现，独立进程运行通过。本次未修改
+  无关的 W&B 生命周期代码。
+- Pyright 未作为通过项：远端缺少可用 Node 运行时；本地同依赖配置对未修改 HEAD
+  的相关文件也报告大量既有类型错误，因此不能报告完整类型检查通过。
