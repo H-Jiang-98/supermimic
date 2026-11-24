@@ -152,6 +152,8 @@ class EITTraining(BeliefModelTraining):
     runner: SuperMimicRunner,
     cfg: EITTrainingCfg | None = None,
     policy_cfg: BeliefPolicyLearnerCfg | None = None,
+    *,
+    policy_cuda_graphs: bool = False,
   ):
     if runner.replay_buffer.replay_mode != "full":
       raise ValueError("EIT policy starts require full replay")
@@ -186,6 +188,7 @@ class EITTraining(BeliefModelTraining):
       policy_cfg or BeliefPolicyLearnerCfg(),
       runner.device,
       compile_kernels=getattr(runner, "compile_eit", False),
+      cuda_graphs=policy_cuda_graphs,
     )
     self.initialization_digest: str | None = None
     self.collected_steps = self.update_groups = self.skipped_update_groups = 0
@@ -661,7 +664,8 @@ class EITTraining(BeliefModelTraining):
       "normalization_samples": self._cache_budget["normalization_samples"],
       "profiling": {
         "seconds": {**timer.seconds, **self._normalization_profile},
-        "runtime": runtime_metadata(next(self.actor.parameters())),
+        "runtime": runtime_metadata(next(self.actor.parameters()))
+        | {"policy_cuda_graph": self.policy.graph_status},
       },
     }
     json.dumps(metrics, allow_nan=False)
@@ -890,6 +894,7 @@ class EITTraining(BeliefModelTraining):
           **{"Perf/" + k: v for k, v in seconds.items()},
         }
         runtime = runtime_metadata(next(self.actor.parameters()))
+        runtime["policy_cuda_graph"] = self.policy.graph_status
         runtime["eit_execution"] = "eager"
         if getattr(runner, "compile_eit", False):
           from torch._dynamo.utils import calculate_time_spent, counters

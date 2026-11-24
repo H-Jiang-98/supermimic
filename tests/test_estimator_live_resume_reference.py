@@ -10,6 +10,7 @@ import torch
 from supermimic.runners.eit_resume_reference import (
   REFERENCE_SOURCE,
   REFERENCE_VERSION,
+  _private_components,
   build_live_reference,
   compare_reference_update,
   equal_tree,
@@ -17,6 +18,16 @@ from supermimic.runners.eit_resume_reference import (
   write_live_reference,
 )
 from tests.test_estimator_eit_training import advance, training
+
+
+def test_private_reference_discards_live_graph_without_resetting_it():
+  source = training()
+  source.refresh_collection()
+  source.policy.cuda_graphs = True
+  source.policy._actor_graph = sentinel = object()
+  _, _, private, _ = _private_components(source)
+  assert private.cuda_graphs is False and private._actor_graph is None
+  assert source.policy.cuda_graphs is True and source.policy._actor_graph is sentinel
 
 
 def test_live_reference_is_generated_without_any_loader_and_preserves_live_state(

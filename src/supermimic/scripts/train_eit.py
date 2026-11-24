@@ -138,6 +138,12 @@ def main():
   )
   add_model_fit_args(parser)
   parser.add_argument(
+    "--policy-cuda-graphs",
+    action="store_true",
+    help="Capture actor rollout/backward for divisible CUDA microbatches; "
+    "disabled by --eager, independent of checkpoint hyperparameters",
+  )
+  parser.add_argument(
     "--policy-updates",
     type=int,
     default=1,
@@ -313,7 +319,12 @@ def main():
     runner = SuperMimicRunner(
       env, runner_cfg, task_id, device=args.device, compile_eit=compile_kernels
     )
-    training = EITTraining(runner, loop_cfg, policy_cfg)
+    training = EITTraining(
+      runner,
+      loop_cfg,
+      policy_cfg,
+      policy_cuda_graphs=args.policy_cuda_graphs and not args.eager,
+    )
     if reference_path is not None:
       from supermimic.runners.eit_resume_reference import write_live_reference
 

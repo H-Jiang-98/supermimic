@@ -139,17 +139,58 @@ def test_mujoco_limits_reach_model(config, tmp_path, monkeypatch, solver, expect
     train_eit.main()
 
 
-@pytest.mark.parametrize("eager", [False, True])
-def test_eager_flag_is_forwarded_to_both_phases(config, tmp_path, eager):
-  config["training"]["eager"] = eager
+@pytest.mark.parametrize("option", ["eager", "policy_cuda_graphs"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_execution_flag_is_forwarded_to_both_phases(config, tmp_path, option, enabled):
+  config["training"][option] = enabled
   _, _, phases = plan(config, tmp_path)
   for phase in phases:
     for jobs in phase.values():
       for command in jobs:
-        assert ("--eager" in command) == eager
+        assert ("--" + option.replace("_", "-") in command) == enabled
 
 
-def test_eager_requires_a_toml_boolean(config, tmp_path):
-  config["training"]["eager"] = "false"
+@pytest.mark.parametrize("option", ["eager", "policy_cuda_graphs"])
+def test_execution_flag_requires_a_toml_boolean(config, tmp_path, option):
+  config["training"][option] = "false"
   with pytest.raises(ValueError, match="boolean"):
     plan(config, tmp_path)
+
+
+@pytest.mark.parametrize(
+  "requested,eager,expected",
+  [(False, False, False), (True, False, True), (True, True, False)],
+)
+def test_worker_graph_flag_and_eager_override(
+  tmp_path, monkeypatch, requested, eager, expected
+):
+  from types import SimpleNamespace
+
+  from supermimic.scripts import train_eit
+
+  class ConfigurationChecked(Exception):
+    pass
+
+  def inspect_training(*args, policy_cuda_graphs):
+    assert policy_cuda_graphs is expected
+    raise ConfigurationChecked
+
+  flags = [
+    "train_eit",
+    "--motion-file=unused.npz",
+    "--device=cpu",
+    f"--output={tmp_path}",
+  ]
+  if requested:
+    flags.append("--policy-cuda-graphs")
+  if eager:
+    flags.append("--eager")
+  monkeypatch.setattr(sys, "argv", flags)
+  monkeypatch.setenv("WANDB_MODE", "disabled")
+  monkeypatch.setattr(
+    train_eit, "create_env", lambda *a: SimpleNamespace(close=lambda: None)
+  )
+  monkeypatch.setattr(train_eit, "SuperMimicRunner", lambda *a, **kw: None)
+  monkeypatch.setattr(train_eit, "EITTraining", inspect_training)
+  with pytest.raises(ConfigurationChecked):
+    train_eit.main()

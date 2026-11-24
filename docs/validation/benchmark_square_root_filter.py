@@ -5,6 +5,7 @@ import json
 import statistics
 import tempfile
 import time
+from copy import deepcopy
 from pathlib import Path
 
 import torch
@@ -21,7 +22,19 @@ parser.add_argument("--batch", type=int, default=1024)
 parser.add_argument("--horizon", type=int, default=32)
 parser.add_argument("--repeats", type=int, default=3)
 parser.add_argument("--small", action="store_true")
+parser.add_argument(
+  "--compare-policy-graph",
+  action="store_true",
+  help="Compare complete fixed-input policy updates with/without actor CUDA replay",
+)
+parser.add_argument("--microbatch", type=int, default=1024)
 args = parser.parse_args()
+if args.compare_policy_graph and (args.rollout or args.compare_rollout):
+  parser.error("--compare-policy-graph is a separate benchmark mode")
+if args.compare_policy_graph and (
+  args.microbatch < 1 or args.batch < 1 or args.batch % args.microbatch
+):
+  parser.error("policy graph benchmark requires batch divisible by microbatch")
 torch.set_num_threads(1)
 torch.manual_seed(2027)
 device = "cuda:0"
@@ -50,7 +63,7 @@ def measure(fn, **metadata):
   Path(args.output).write_text(json.dumps(reports, indent=2))
 
 
-if not (args.rollout or args.compare_rollout):
+if not (args.rollout or args.compare_rollout or args.compare_policy_graph):
   from tests.test_estimator_belief_filter import _fixture
 
   from supermimic.belief import BeliefState
@@ -154,11 +167,12 @@ else:
         runner.wm_env,
         BeliefPolicyLearnerCfg(
           batch_size=args.batch,
-          microbatch_size=args.batch,
+          microbatch_size=args.microbatch if args.compare_policy_graph else args.batch,
           num_samples=1,
           horizon=args.horizon,
           noise=0,
         ),
+        compile_kernels=args.compare_policy_graph,
       )
       frames = runner.replay_buffer.retained_frames()
       ids = torch.arange(args.batch, device=device) % len(frames)
@@ -184,7 +198,61 @@ else:
         torch_version=torch.__version__,
         gpu=torch.cuda.get_device_name(),
       )
-      if args.compare_rollout:
+      if args.compare_policy_graph:
+        initial_actor = deepcopy(actor.state_dict())
+        initial_critic = deepcopy(critic.state_dict())
+        initial_policy = policy.state_dict()
+        fixed_noises = tuple(noise.unsqueeze(2) for noise in noises)
+        for enabled in (False, True):
+          policy.clear_actor_graph()
+          actor.load_state_dict(initial_actor)
+          critic.load_state_dict(initial_critic)
+          policy.load_state_dict(initial_policy)
+          policy.cuda_graphs = enabled
+          torch.cuda.synchronize()
+          torch.cuda.empty_cache()
+          torch.cuda.reset_peak_memory_stats()
+          begin = time.perf_counter()
+          # At least four microbatch calls: three warmups plus capture/replay.
+          warmups = max(
+            2,
+            (4 + args.batch // args.microbatch - 1) // (args.batch // args.microbatch),
+          )
+          for _ in range(warmups):
+            policy.update_from(starts, *fixed_noises)
+          if enabled and policy.graph_status.get("captures") != 1:
+            raise RuntimeError("Benchmark did not reach actor CUDA replay")
+          torch.cuda.synchronize()
+          setup_seconds = time.perf_counter() - begin
+          setup_peak = torch.cuda.max_memory_allocated()
+          torch.cuda.reset_peak_memory_stats()
+          times, profiles = [], []
+          for _ in range(args.repeats):
+            begin = time.perf_counter()
+            policy.update_from(starts, *fixed_noises)
+            torch.cuda.synchronize()
+            times.append((time.perf_counter() - begin) * 1000)
+            profiles.append(policy.last_profile.copy())
+          row = {
+            **metadata,
+            "kind": "graph_policy_update" if enabled else "compiled_policy_update",
+            "microbatch": args.microbatch,
+            "median_ms": statistics.median(times),
+            "times_ms": times,
+            "phase_median_ms": {
+              key: statistics.median(p[key] for p in profiles) * 1000
+              for key in profiles[0]
+            },
+            "setup_seconds": setup_seconds,
+            "setup_peak_allocated_bytes": setup_peak,
+            "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+            "peak_reserved_bytes": torch.cuda.max_memory_reserved(),
+            "graph": policy.graph_status,
+          }
+          reports.append(row)
+          print(json.dumps(row), flush=True)
+          Path(args.output).write_text(json.dumps(reports, indent=2))
+      elif args.compare_rollout:
         from supermimic.imagined_rollout import prepare_rollout
 
         def transactional():

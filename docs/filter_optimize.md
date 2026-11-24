@@ -173,8 +173,9 @@ bootstrap、GAE、microbatch 加权和 replay 初始 posterior 不重复融合�
 
 ### CUDA capture 边界
 
-生产训练已默认使用张量路径。本次提供 capture/replay 回归验证，不启用自动 graph
-缓存或捕获整个 optimizer/critic update。可捕获部分为：
+生产训练已默认使用张量路径。后续已接入显式启用的 actor graph 缓存，使用方式及
+固定缓冲区生命周期见 [EIT CUDA Graph Replay](eit_cuda_graphs.md)。optimizer/critic
+update 仍在图外。可捕获部分为：
 
 ```python
 # 图外，模型/reference/config 与 normalization 在本次 update 内只读。
@@ -194,7 +195,8 @@ storage 在该次 forward/backward 生命周期内必须保持只读；replay �
 到已捕获的固定地址，不能依赖 Python 对象替换。准备、版本检查、模式切换、日志、
 梯度裁剪、优化器和计数器仍在图外；batch/horizon/配置变化需另行准备/捕获。
 
-每个 microbatch 的前向/反向返回后读取一次设备失败状态。任一步失败会拒绝本次
+原路径每个 microbatch 返回后读取设备失败状态；replay 路径在 GPU 上合并标志，
+在整次 actor update 的 optimizer 前检查。任一步失败会拒绝本次
 actor update 并清空累计梯度；不会推进 actor/critic optimizer 或更新步数。
 在线 `reset/step/snapshot/restore` 继续使用原有事务和相同动作/噪声重试规则。
 

@@ -169,6 +169,11 @@ def _private_components(training):
     setattr(policy, name, cloned[name])
   policy._actor_forward = policy.actor
   policy._actor_with_aux = getattr(policy.actor, "forward_with_aux", None)
+  # A shallow copy must never replay a graph referencing the live parameters.
+  policy.cuda_graphs = False
+  policy.clear_actor_graph()
+  policy._actor_graph_stream = None
+  policy._graph_reason = "disabled"
   policy.wm_env = env
   return wm, learner, policy, env
 

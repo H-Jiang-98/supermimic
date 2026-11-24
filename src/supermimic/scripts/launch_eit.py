@@ -50,9 +50,9 @@ def _training_args(settings: dict) -> list[str]:
     if not name.isidentifier() or name in reserved:
       raise ValueError(f"Invalid [training] option: {name}")
     flag = "--" + name.replace("_", "-")
-    if name == "eager":
+    if name in ("eager", "policy_cuda_graphs"):
       if type(value) is not bool:
-        raise ValueError("training.eager must be a boolean")
+        raise ValueError(f"training.{name} must be a boolean")
       if value:
         args.append(flag)
     elif isinstance(value, list) and value and all(type(v) is int for v in value):
