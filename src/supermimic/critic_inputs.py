@@ -1,7 +1,6 @@
 """RPV-belief privileged critic inputs and explicitly updated normalizers.
 
-The common prefix is [truth68, truth_goal700, history465, remaining_seconds,
-context]. B/C append a relative RPV mean (12) and the right-local 9x9 marginal
+The common prefix is [truth68, truth_goal700, history465, context]. B/C append a relative RPV mean (12) and the right-local 9x9 marginal
 covariance (45). The provider still owns the full 70-dimensional belief.
 A never reads the supplied belief, including during eval.
 """
@@ -22,8 +21,8 @@ from supermimic.models import _CudaGraphNormalization, build_mlp
 from supermimic.utils.lie_state import TANGENT_VERSION, LieState
 from supermimic.utils.validation import check_covariance, validate_state_dict
 
-CRITIC_INPUT_VERSION = "eit_rpv_belief_critic_v2"
-COMMON_DIM = 1234
+CRITIC_INPUT_VERSION = "eit_rpv_belief_critic_v3"
+COMMON_DIM = 1233
 MEAN_DIM = 12
 COVARIANCE_DIM = 45
 
@@ -37,7 +36,6 @@ class CriticInputConfig:
   covariance_scales: tuple[float, ...] = (1.0,) * 3  # theta, rho, nu
   mean_scales: tuple[float, ...] = (1.0,) * 2  # position, velocity; rot6d is unitless
   epsilon_std: float = 1e-6
-  remaining_time_scale: float = 1.0
 
   def __post_init__(self):
     if self.group not in ("A", "B", "C"):
@@ -52,10 +50,8 @@ class CriticInputConfig:
       values = getattr(self, name)
       if len(values) != length or any(not math.isfinite(v) or v <= 0 for v in values):
         raise ValueError(f"{name} requires {length} finite positive scales")
-    for name in ("epsilon_std", "remaining_time_scale"):
-      value = getattr(self, name)
-      if not math.isfinite(value) or value <= 0:
-        raise ValueError(f"{name} must be finite and positive")
+    if not math.isfinite(self.epsilon_std) or self.epsilon_std <= 0:
+      raise ValueError("epsilon_std must be finite and positive")
 
   def input_dim(self, context_dim: int) -> int:
     if type(context_dim) is not int or context_dim < 0:
@@ -124,7 +120,6 @@ def build_critic_features(
   true_goal: torch.Tensor,
   history: torch.Tensor,
   sim_ctx: torch.Tensor,
-  remaining_time: torch.Tensor,
   belief: BeliefState | None = None,
   *,
   config: CriticInputConfig | None = None,
@@ -132,7 +127,7 @@ def build_critic_features(
 ) -> torch.Tensor:
   """Build raw critic features; the caller verifies provider frame identity.
 
-  Remaining time is in seconds. History contains five frames, oldest first,
+  History contains five frames, oldest first,
   with the actually executed previous action in each frame's final 29 channels.
   Validate the provider's complete belief, then project only RPV into B/C inputs.
   Marginal extraction preserves the rollout graph and never conditions on truth.
@@ -140,15 +135,12 @@ def build_critic_features(
   cfg = _config(config, group)
   truth.validate()
   batch = truth.position.shape[:-1]
-  if remaining_time.shape == batch:
-    remaining_time = remaining_time.unsqueeze(-1)
   if sim_ctx.ndim != len(batch) + 1 or sim_ctx.shape[:-1] != batch:
     raise ValueError("Critic context must match truth batch shape")
   for name, value, shape in (
     ("goal", true_goal, (*batch, 700)),
     ("history", history, (*batch, 5, 93)),
     ("context", sim_ctx, (*batch, sim_ctx.shape[-1])),
-    ("remaining_time", remaining_time, (*batch, 1)),
   ):
     if (
       value.shape != shape
@@ -157,13 +149,10 @@ def build_critic_features(
       or not torch.isfinite(value).all()
     ):
       raise ValueError(f"Invalid critic {name} shape, dtype, device or values")
-  if (remaining_time < 0).any():
-    raise ValueError("Critic remaining_time must be nonnegative")
   pieces = [
     critic_state_features(truth),
     true_goal,
     history.flatten(-2),
-    remaining_time / cfg.remaining_time_scale,
     sim_ctx,
   ]
   if cfg.group != "A":

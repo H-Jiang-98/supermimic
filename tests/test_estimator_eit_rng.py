@@ -42,7 +42,7 @@ def test_resume_rejects_prior_replay_contract_without_changing_rng(make_loop):
   loop = make_loop()
   checkpoint = loop.state_dict()
   assert checkpoint["version"] == (
-    "eit_training_v5" if checkpoint["stage"] == "policy" else "eit_model_training_v4"
+    "eit_training_v6" if checkpoint["stage"] == "policy" else "eit_model_training_v4"
   )
   checkpoint["version"] = "eit_training_v2"
   rng = torch.random.get_rng_state()
@@ -54,7 +54,7 @@ def test_resume_rejects_prior_replay_contract_without_changing_rng(make_loop):
 def test_shared_initialization_rejects_prior_replay_contract_without_changing_rng():
   loop = training()
   bundle = loop.initialization_bundle()
-  assert bundle["version"] == "eit_initialization_v3"
+  assert bundle["version"] == "eit_initialization_v4"
   bundle["version"] = "eit_initialization_v2"
   rng = torch.random.get_rng_state()
   with pytest.raises(ValueError, match="initialization"):

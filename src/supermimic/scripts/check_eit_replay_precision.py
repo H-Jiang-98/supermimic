@@ -115,16 +115,9 @@ def audit(training, steps):
   lower = covariance[:, rows, cols]
   episode_ids = starts.batch["episode_id"]
   horizon = policy.cfg.horizon
-  candidates = (
-    (
-      (starts.remaining_steps >= horizon)
-      & (episode_ids % training.cfg.validation_stride != 0)
-    )
-    .nonzero()
-    .flatten()
-  )
+  candidates = (episode_ids % training.cfg.validation_stride != 0).nonzero().flatten()
   if not len(candidates):
-    raise ValueError("Need a retained training frame with a complete policy horizon")
+    raise ValueError("Need a retained training frame")
   chosen = candidates[torch.randperm(len(candidates))[: policy.cfg.batch_size]]
   scored = starts.index(chosen).repeat_interleave(policy.cfg.num_samples)
   noises = tuple(v.flatten(1, 2) for v in policy.draw_noises(starts.index(chosen)))

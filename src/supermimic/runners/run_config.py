@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 import types
 from typing import Any, Union, get_args, get_origin, get_type_hints
 
@@ -14,16 +15,18 @@ from supermimic.runners.eit_snapshots import checkpoint_snapshot_interval
 from supermimic.runners.supermimic_runner import SuperMimicRunnerCfg
 
 EIT_TRAINING_VERSION = "eit_model_training_v4"
-EIT_POLICY_TRAINING_VERSION = "eit_training_v5"
-EIT_INITIALIZATION_VERSION = "eit_initialization_v3"
+EIT_POLICY_TRAINING_VERSION = "eit_training_v6"
+_LEGACY_POLICY_VERSION = "eit_training_v5"
+EIT_INITIALIZATION_VERSION = "eit_initialization_v4"
 
 
-def validate_eit_checkpoint_contract(saved: dict, *, stage: str | None = None) -> None:
+def validate_eit_checkpoint_contract(
+  saved: dict, *, stage: str | None = None, for_inference: bool = False
+) -> None:
   """Validate the EIT format and the joint trainer's critic layout before loading."""
-  if not isinstance(saved, dict) or saved.get("version") not in (
-    EIT_TRAINING_VERSION,
-    EIT_POLICY_TRAINING_VERSION,
-  ):
+  version = saved.get("version") if isinstance(saved, dict) else None
+  legacy = for_inference and version == _LEGACY_POLICY_VERSION
+  if version not in (EIT_TRAINING_VERSION, EIT_POLICY_TRAINING_VERSION) and not legacy:
     raise ValueError(
       f"Expected {EIT_TRAINING_VERSION} or {EIT_POLICY_TRAINING_VERSION} checkpoint"
     )
@@ -32,9 +35,7 @@ def validate_eit_checkpoint_contract(saved: dict, *, stage: str | None = None) -
   kind = saved.get("stage")
   if kind not in ("model", "policy") or (stage is not None and kind != stage):
     raise ValueError(f"Unexpected EIT training stage: {kind!r}")
-  expected_kind = (
-    "policy" if saved["version"] == EIT_POLICY_TRAINING_VERSION else "model"
-  )
+  expected_kind = "model" if saved["version"] == EIT_TRAINING_VERSION else "policy"
   if kind != expected_kind:
     raise ValueError("Checkpoint version and training stage disagree")
   replay_mode = saved.get("replay_mode")
@@ -52,7 +53,7 @@ def validate_eit_checkpoint_contract(saved: dict, *, stage: str | None = None) -
     settings = bundle.get(section) if isinstance(bundle, dict) else None
     if isinstance(settings, dict) and isinstance(noise := settings.get(key), dict):
       GaussianMeasurementConfig(**noise)
-  if saved["version"] == EIT_POLICY_TRAINING_VERSION:
+  if kind == "policy":
     from supermimic.posterior_replay import POSTERIOR_REPLAY_VERSION
 
     error = "Invalid incremental posterior replay checkpoint contract"
@@ -76,18 +77,29 @@ def validate_eit_checkpoint_contract(saved: dict, *, stage: str | None = None) -
     if "critic" in saved or "policy" in saved:
       raise ValueError("Model-stage checkpoint contains policy training state")
     return
-  error = f"EIT checkpoint requires the {CRITIC_INPUT_VERSION} critic contract"
+  critic_version = "eit_rpv_belief_critic_v2" if legacy else CRITIC_INPUT_VERSION
+  error = f"EIT checkpoint requires the {critic_version} critic contract"
   try:
     contract = saved["critic"]["contract"]
-    config_data = contract["config"]
+    config_data = dict(contract["config"])
+    if legacy:
+      # v5 actor inference only. Validate the extra critic column without loading it.
+      scale = config_data.pop("remaining_time_scale")
+      if (
+        not math.isfinite(scale)
+        or scale <= 0
+        or config_data["version"] != critic_version
+      ):
+        raise ValueError(error)
+      config_data["version"] = CRITIC_INPUT_VERSION
     config = CriticInputConfig(**config_data)
     group = saved["runner_config"]["estimator_inputs"]["group"]
     context_dim = contract["context_dim"]
-    input_dim = config.input_dim(context_dim)
+    input_dim = config.input_dim(context_dim) + int(legacy)
     context_scale = saved["world_model"]["sim_context"]["scale"]
     input_weight = saved["critic"]["state_dict"]["mlp.0.weight"]
     compatible = (
-      contract["version"] == config.version
+      contract["version"] == critic_version
       and config_data == dataclasses.asdict(config)
       and config.group == group
       and contract["input_dim"] == input_dim

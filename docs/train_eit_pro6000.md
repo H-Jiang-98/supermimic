@@ -1,10 +1,10 @@
 # PRO 6000 上的 EIT 训练、预算与续训
 
-当前联合训练协议为 `eit_training_v5`。EIT 保留在线 belief、后验 replay、随机世界模型与可微 imagined belief rollout；采集调用公共 `runner.step()`，更新由公共 `Ratio` 调度，优化器、critic fitting、权重文件和 W&B 记录复用 SuperMimic。采用 float32。CUDA 默认使用 TorchInductor 编译训练热点，CPU 使用 eager。单次训练加 `--eager` 或在 TOML 的 `[training]` 设置 `eager = true` 可切换回 eager。显式 learner CUDA Graph 独立于该开关，当前关闭。
+当前联合训练协议为 `eit_training_v6`。EIT 保留在线 belief、后验 replay、随机世界模型与可微 imagined belief rollout；采集调用公共 `runner.step()`，更新由公共 `Ratio` 调度，优化器、critic fitting、权重文件和 W&B 记录复用 SuperMimic。采用 float32。CUDA 默认使用 TorchInductor 编译训练热点，CPU 使用 eager。单次训练加 `--eager` 或在 TOML 的 `[training]` 设置 `eager = true` 可切换回 eager。显式 learner CUDA Graph 独立于该开关，当前关闭。
 
 下表记录服务器上的三组短程对照。长期收敛及 replay 填满后的耗时还需单独测量。
 
-2026-11-23 已在本地 RTX 5090（32 GiB）完成当前协议验证：[实测报告](validation/eit_v5_rtx5090.json)。C 组使用下表默认预算及完整网络宽度，Jacobian batch chunk=32、`PYTORCH_JIT=0`；采集 11 步后完成一组 10/18/1/20 更新。世界模型阶段 0.555 s，策略阶段 691.753 s（其中 critic 0.074 s）；PyTorch 峰值 allocated/reserved 为 15.20/17.76 GiB。新进程恢复至累计 14 步，优化器和调度状态一致，两次启动生成五个四文件 artifact，离线记录约 0.90 GiB。A/B/C 小批量 CUDA 下一次更新恢复逐位一致，完整回归 1095 项通过。
+2026-11-23 已在本地 RTX 5090（32 GiB）完成旧版 v5 协议验证：[实测报告](validation/eit_v5_rtx5090.json)。C 组使用下表默认预算及完整网络宽度，Jacobian batch chunk=32、`PYTORCH_JIT=0`；采集 11 步后完成一组 10/18/1/20 更新。世界模型阶段 0.555 s，策略阶段 691.753 s（其中 critic 0.074 s）；PyTorch 峰值 allocated/reserved 为 15.20/17.76 GiB。新进程恢复至累计 14 步，优化器和调度状态一致，两次启动生成五个四文件 artifact，离线记录约 0.90 GiB。A/B/C 小批量 CUDA 下一次更新恢复逐位一致，完整回归 1095 项通过。
 
 该实测只覆盖一个完整默认更新与恢复后的 warmup；1000 帧缓存已分配但尚未填满，未测稳定容量索引成本或收敛，也不能推算为 PRO 6000 性能。阶段计时存在包含关系，不能把父阶段与子阶段相加。
 
@@ -61,9 +61,9 @@
 
 每组依次执行 **10 mean → 18 covariance → 1 actor → 20 critic** 更新。mean 的名义窗口帧预算为 163,840，实际预测损失覆盖 143,360 个转移。covariance 预算按 `U × B × (H−1)` 推导，均匀、有放回抽取；默认为 17 个 8192 整批和一个 4096 尾批。阶段 NLL 按样本数加权。训练与验证抽样使用独立、可恢复的 RNG；只计算当前抽中转移的 detached 残差，不缓存全量残差。`--cov-pair-budget` 可覆盖训练预算，`--cov-validation-pairs` 控制验证抽样次数。
 
-buffer、policy horizon、samples 均不改变默认 covariance 预算。增大 buffer 会增加 replay/索引/一致性检查开销；增大 samples 主要增加想象轨迹数。默认每组最多想象 4096×1×32＝131,072 个转移。actor 完整逻辑 batch 累积后做 norm 1.0、逐元素 0.1 clipping，再更新一次。actor Adam betas 为 (0.9, 0.95)，critic 为 (0.9, 0.999)，二者学习率 2e-4，并复用公共 Muon 权重分组。
+buffer、policy horizon、samples 均不改变默认 covariance 预算。增大 buffer 会增加 replay/索引/一致性检查开销；增大 samples 主要增加想象轨迹数。每次 actor 更新默认想象 4096×1×32＝131,072 个转移。actor 完整逻辑 batch 累积后做 norm 1.0、逐元素 0.1 clipping，再更新一次。actor Adam betas 为 (0.9, 0.95)，critic 为 (0.9, 0.999)，二者学习率 2e-4，并复用公共 Muon 权重分组。
 
-critic 用原始 value 计算 GAE，只裁剪最终 target；MSE 不按累计 survival 加权。每次 actor 后用一次固定 permutation 训练 5×4 次，跨 epoch 复用。样本先按时间、轨迹顺序汇总，actor microbatch 不改变分组；不足四条有效样本时减少非空 minibatch 数。critic 保留剩余 clip 时间和片尾零 bootstrap；ReturnSampler 独立保留片尾均值 bootstrap。
+critic 用原始 value 计算 GAE，只裁剪最终 target；MSE 不按累计 survival 加权。每次 actor 后用一次固定 permutation 训练 5×4 次，跨 epoch 复用。样本先按时间、轨迹顺序汇总，actor microbatch 不改变分组；不足四条有效样本时减少非空 minibatch 数。想象训练固定展开 H 步。参考到达片尾后，目标窗口和逐步奖励继续使用完整末帧，包括其速度。critic 输入移除剩余时长，actor 在第 H 步按存活权重 bootstrap。真实采集和整段评估仍在片尾结束，ReturnSampler 沿用片尾均值 bootstrap。旧版 v5 快照可用于 actor 推理和整段评估，v6 训练使用新的共享初始化和输出目录。
 
 每个新训练帧、新保存 posterior 只更新一次对应归一化，包含 warmup；同一步多组优化不重复计数。验证 episode 固定为 `episode_id % validation_stride == 0`，不进入训练或归一化。
 
@@ -89,7 +89,7 @@ EIT CLI 不读取根目录 `train_config.toml`。`--save-interval`、`--log-inte
 ```bash
 export OMP_NUM_THREADS=1 PYTORCH_JIT=0 CUBLAS_WORKSPACE_CONFIG=:4096:8
 export WANDB_MODE=offline MPLCONFIGDIR=/tmp/supermimic-mpl
-EIT_ROOT="$PWD/artifacts/eit_pro6000_v5"
+EIT_ROOT="$PWD/artifacts/eit_pro6000_v6"
 EIT_MOTION="$PWD/data/motions/walk1_subject1.npz"
 EIT_PYTHON="$PWD/.venv/bin/python"
 mkdir -p "$EIT_ROOT/init"

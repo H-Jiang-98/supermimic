@@ -194,7 +194,7 @@ def _model_inputs(inputs, device):
 def _policy_start(payload, replay, device):
   return BeliefRolloutStart(
     TensorDict(
-      payload["batch"], batch_size=[len(payload["remaining_steps"])], device=device
+      payload["batch"], batch_size=[len(payload["batch"]["motion_time"])], device=device
     ),
     BeliefState(
       LieState(
@@ -206,7 +206,6 @@ def _policy_start(payload, replay, device):
     replay,
     replay.insert_count,
     payload["motion_digest"],
-    payload["remaining_steps"].to(device),
   )
 
 
@@ -300,7 +299,6 @@ def build_live_reference(training, checkpoint: Path, state: dict):
             for field in fields(starts.belief.mean)
           },
           "belief_covariance": starts.belief.covariance,
-          "remaining_steps": starts.remaining_steps,
           "model_revision": starts.model_version,
           "model_version": env.dynamics.model_version,
           "motion_digest": starts.motion_digest,

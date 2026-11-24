@@ -37,6 +37,19 @@ class ActorCriticPolicyLearnerCfg(BpttPolicyLearnerCfg):
   lam: float = 0.95
 
 
+def discounted_bootstrap(
+  value: torch.Tensor,
+  alive: torch.Tensor,
+  gamma: float,
+  horizon: int,
+  value_cap: float | None,
+) -> torch.Tensor:
+  """Discount the critic's differentiable endpoint value into the actor return."""
+  if value_cap is not None:
+    value = value.clamp(max=value_cap)
+  return gamma**horizon * value * alive
+
+
 def gae_returns(
   values: torch.Tensor,
   last_value: torch.Tensor,
@@ -173,9 +186,11 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
     self, obs: TensorDict, survival: torch.Tensor, term_prob: torch.Tensor
   ) -> torch.Tensor:
     self.critic.requires_grad_(False)
-    value = self.critic(obs["critic"]).clamp(max=self._v_max).squeeze(-1)
+    value = self.critic(obs["critic"]).squeeze(-1)
     alive = survival if self.cfg.survival_masking else 1.0 - term_prob
-    return self.cfg.gamma**self.cfg.horizon * value * alive
+    return discounted_bootstrap(
+      value, alive, self.cfg.gamma, self.cfg.horizon, self._v_max
+    )
 
   def _fit_critic(
     self, rollout: list[TensorDict], last_obs: TensorDict

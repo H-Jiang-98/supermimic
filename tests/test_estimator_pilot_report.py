@@ -543,6 +543,120 @@ def test_complete_artifacts_allow_physical_failures_and_slow_latency(
   assert report["groups"]["A"]["phase_costs"]["round_seconds"]["total_seconds"] == 0.2
 
 
+def set_diagnostic_terminations(folder, reasons, *, version=2):
+  record = torch.load(folder / "episodes.pt", weights_only=True)
+  evaluated = json.loads((folder / "evaluation.json").read_text())
+  offline = json.loads((folder / "offline.json").read_text())
+  offline["version"] = f"eit_independent_diagnostics_v{version}"
+  terminal = {"failure", "clip_complete"} if version == 1 else {"failure"}
+  critic = offline["critic"]
+  censored_frames = censored_episodes = 0
+  for ep, physical, scored, reason in zip(
+    record["episodes"], evaluated["episodes"], critic["episodes"], reasons, strict=True
+  ):
+    ep["reason"] = physical["reason"] = scored["reason"] = reason
+    if reason == "clip_complete":
+      ep["reference_steps"] = len(ep["reward"])
+    if reason not in terminal:
+      scored["discounted_return"] = None
+      censored_frames += len(ep["reward"])
+      censored_episodes += 1
+  critic.update(censored_samples=censored_frames, censored_episodes=censored_episodes)
+  for name in ("raw_value_error", "bootstrap_value_error"):
+    score = critic[name]
+    score["samples"] = (
+      sum(len(ep["reward"]) for ep in record["episodes"]) - censored_frames
+    )
+    if not score["samples"]:
+      score.update(bias=None, mae=None, rmse=None)
+  evaluated["censored_episodes"] = sum(
+    reason in ("timeout", "evaluation_truncated") for reason in reasons
+  )
+  evaluated["timeout_count"] = reasons.count("timeout")
+  evaluated["evaluation_complete"] = evaluated["censored_episodes"] == 0
+  if version == 1 and "actor_gradients" in offline:
+    gradient = offline["actor_gradients"]
+    gradient["effective_imagined_steps"] = gradient["samples_per_start"] * sum(
+      min(gradient["horizon"], ep["reference_steps"]) for ep in record["episodes"]
+    )
+  torch.save(record, folder / "episodes.pt")
+  offline["recording_sha256"] = file_sha256(folder / "episodes.pt")
+  write(folder / "evaluation.json", evaluated)
+  write(folder / "offline.json", offline)
+
+
+@pytest.mark.parametrize(
+  "version,reasons,status,samples",
+  [
+    (2, ("clip_complete", "clip_complete"), "unscorable_censored", 0),
+    (2, ("failure", "clip_complete"), "scored", 2),
+    (1, ("clip_complete", "clip_complete"), "scored", 4),
+  ],
+)
+def test_completed_clips_do_not_block_critic_audit(
+  tmp_path, monkeypatch, version, reasons, status, samples
+):
+  fixture(tmp_path, monkeypatch)
+  for relative in ("A/8", "B/8", "C/8", "A/8-truth"):
+    set_diagnostic_terminations(
+      tmp_path / "diagnostics" / relative, reasons, version=version
+    )
+  report = build_report(tmp_path)
+  assert report["status"] == "complete", report
+  assert report["pending"] == report["failures"] == []
+  extra = report["supplementary"]
+  assert extra["A_truth_critic_status"] == status
+  assert extra["A_truth_critic_error"]["samples"] == samples
+  if not samples:
+    assert extra["A_truth_critic_error"]["rmse"] is None
+    assert report["groups"]["A"]["curves"]["critic_rmse"][-1]["value"] is None
+
+
+@pytest.mark.parametrize("reason", ["timeout", "evaluation_truncated"])
+def test_censored_truth_evaluation_remains_pending(tmp_path, monkeypatch, reason):
+  fixture(tmp_path, monkeypatch)
+  set_diagnostic_terminations(tmp_path / "diagnostics/A/8-truth", (reason, reason))
+  report = build_report(tmp_path)
+  assert report["status"] == "pending", report
+  assert not report["failures"]
+  assert (
+    "A: independent truth-input episodes incomplete or censored" in report["pending"]
+  )
+
+
+def test_missing_truth_critic_score_remains_pending(tmp_path, monkeypatch):
+  fixture(tmp_path, monkeypatch)
+  (tmp_path / "diagnostics/A/8-truth/offline.json").unlink()
+  report = build_report(tmp_path)
+  assert report["status"] == "pending", report
+  assert report["supplementary"]["A_truth_critic_status"] == "missing"
+  assert "A: independent truth-input critic score missing" in report["pending"]
+
+
+@pytest.mark.parametrize("damage", ["samples", "censored_samples", "reason"])
+def test_critic_censoring_is_checked_against_recorded_episodes(
+  tmp_path, monkeypatch, damage
+):
+  fixture(tmp_path, monkeypatch)
+  folder = tmp_path / "diagnostics/A/8-truth"
+  set_diagnostic_terminations(folder, ("clip_complete", "clip_complete"))
+  path = folder / "offline.json"
+  data = json.loads(path.read_text())
+  critic = data["critic"]
+  if damage == "samples":
+    critic["bootstrap_value_error"].update(samples=4, bias=0, mae=0, rmse=0)
+  elif damage == "censored_samples":
+    critic["censored_samples"] = 0
+  else:
+    critic["episodes"][0]["reason"] = "timeout"
+  write(path, data)
+  report = build_report(tmp_path)
+  assert report["status"] == "failed", report
+  assert any(
+    "critic" in failure and "recording" in failure for failure in report["failures"]
+  )
+
+
 def test_missing_diagnostic_preserves_missing_curve_values(tmp_path, monkeypatch):
   fixture(tmp_path, monkeypatch)
   (tmp_path / "diagnostics/B/4/offline.json").unlink()

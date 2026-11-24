@@ -1,7 +1,7 @@
 """SVG gradients, termination indexing, global accumulation and atomic restore."""
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
 import torch
@@ -10,26 +10,21 @@ from torch import nn
 from supermimic.learners.belief_policy_learner import (
   BeliefActorCriticPolicyLearner,
   BeliefPolicyLearnerCfg,
-  lambda_returns,
 )
 
 
 @dataclass
 class Start:
   x: torch.Tensor
-  remaining_steps: torch.Tensor
 
   def __len__(self):
     return len(self.x)
 
   def index(self, selected):
-    return Start(self.x[selected], self.remaining_steps[selected])
+    return Start(self.x[selected])
 
   def repeat_interleave(self, repeats):
-    return Start(
-      self.x.repeat_interleave(repeats, 0),
-      self.remaining_steps.repeat_interleave(repeats),
-    )
+    return Start(self.x.repeat_interleave(repeats, 0))
 
 
 class Dynamics(nn.Linear):
@@ -61,7 +56,6 @@ class Env:
     self.mean = start.x.clone() + 0.03
     self.covariance = torch.full_like(start.x, 0.02)
     self.previous = torch.zeros_like(start.x)
-    self.remaining = start.remaining_steps.clone()
     return self.obs()
 
   def obs(self):
@@ -74,7 +68,6 @@ class Env:
     return actions.clamp(-5, 5)
 
   def step(self, actions, *, process_noise, measurement_noise):
-    assert (self.remaining > 0).all(), "Advanced an ended trajectory"
     actions = self.limit_actions(actions)
     self.state = (
       self.state
@@ -95,7 +88,6 @@ class Env:
     )
     done = torch.sigmoid(self.state - 2.0)
     self.previous = actions
-    self.remaining -= 1
     self.steps_taken += len(actions)
     return self.obs(), reward.squeeze(-1), done.squeeze(-1), {}
 
@@ -112,30 +104,9 @@ def setup(microbatch=2):
     batch_size=3, num_samples=2, microbatch_size=microbatch, horizon=3
   )
   learner = BeliefActorCriticPolicyLearner(actor, critic, env, cfg)
-  starts = Start(
-    torch.tensor([[0.1], [0.2], [0.3]], dtype=torch.float64), torch.tensor([1, 2, 5])
-  )
+  starts = Start(torch.tensor([[0.1], [0.2], [0.3]], dtype=torch.float64))
   noises = learner.draw_noises(starts)
   return learner, starts, noises
-
-
-def test_lambda_returns_match_hand_computation_and_terminal_reward():
-  reward = torch.tensor([[2.0], [3.0]])
-  values = torch.tensor([[4.0], [5.0], [6.0]])
-  continuation = torch.tensor([[0.5], [0.0]])
-  torch.testing.assert_close(
-    lambda_returns(reward, continuation, values, 0.9, 0), torch.tensor([[4.25], [3.0]])
-  )
-  torch.testing.assert_close(
-    lambda_returns(reward, continuation, values, 0.9, 1), torch.tensor([[3.35], [3.0]])
-  )
-  torch.testing.assert_close(
-    lambda_returns(reward, torch.zeros_like(reward), values, 0.9, 0.95), reward
-  )
-  torch.testing.assert_close(
-    lambda_returns(reward, torch.ones_like(reward), values, 0.9, 1),
-    torch.tensor([[9.56], [8.4]]),
-  )
 
 
 @pytest.mark.parametrize(
@@ -154,7 +125,7 @@ def test_configuration_rejects_invalid_values(field, value):
 
 
 def test_microbatch_accumulation_matches_full_gradients_and_updates():
-  small, starts, noises = setup(1)
+  small, starts, noises = setup(4)
   full, _, _ = setup(12)
   model_before = deepcopy(small.wm_env.dynamics.state_dict())
   stats_small = small.update_from(starts, *noises)
@@ -167,13 +138,69 @@ def test_microbatch_accumulation_matches_full_gradients_and_updates():
     for a, b in zip(module_a.parameters(), module_b.parameters(), strict=True):
       torch.testing.assert_close(a, b, rtol=1e-12, atol=1e-12)
       torch.testing.assert_close(a.grad, b.grad, rtol=1e-10, atol=1e-12)
-  assert small.wm_env.steps_taken == 2 * (1 + 2 + 3)
-  assert stats_small["Policy/valid_steps"] == 12
+  assert small.wm_env.steps_taken == 2 * 3 * 3
+  assert stats_small["Policy/valid_steps"] == 18
   assert small.wm_env.state is None
   assert small.actor_steps == 1 and small.critic_steps == 20
   for key, before in model_before.items():
     assert torch.equal(before, small.wm_env.dynamics.state_dict()[key])
   assert all(p.grad is None for p in small.wm_env.dynamics.parameters())
+
+
+@pytest.mark.parametrize(
+  "horizon,first_done,expected_bootstrap,expected_return,expected_targets",
+  [
+    (1, 0.25, 1.5, 3.5, [3.5]),
+    (2, 0.25, 0.375, 3.875, [3.78125, 5.0]),
+    (2, 1.0, 0.0, 2.0, [2.0, 5.0]),
+  ],
+)
+def test_actor_endpoint_and_gae_match_fixed_horizon_reference(
+  horizon,
+  first_done,
+  expected_bootstrap,
+  expected_return,
+  expected_targets,
+):
+  from supermimic.learners.policy_learner import (
+    ActorCriticPolicyLearner,
+    ActorCriticPolicyLearnerCfg,
+  )
+
+  learner, starts, noises = setup()
+  learner.cfg = replace(
+    learner.cfg, gamma=0.5, lam=0.75, horizon=horizon, value_clipping=False
+  )
+  baseline = ActorCriticPolicyLearner(
+    learner.actor,
+    learner.critic,
+    learner.wm_env,
+    ActorCriticPolicyLearnerCfg(gamma=0.5, horizon=horizon),
+    cuda_graphs=False,
+  )
+  with torch.no_grad():
+    learner.critic.weight.zero_()
+    learner.critic.bias.fill_(4.0)
+  env = learner.wm_env
+  transitions = iter([(2.0, first_done), (4.0, 0.5)])
+
+  def step(actions, **kwargs):
+    reward, done = next(transitions)
+    return env.obs(), actions.new_tensor([reward]), actions.new_tensor([done]), {}
+
+  env.step = step
+  returns, (_, targets), metrics = learner._rollout(
+    starts.index(slice(0, 1)), *(noise[:, 0, :1] for noise in noises), horizon
+  )
+  torch.testing.assert_close(targets[:, 0], targets.new_tensor(expected_targets))
+  assert returns.item() == pytest.approx(expected_return)
+  assert metrics["bootstrap"].item() == pytest.approx(expected_bootstrap)
+  endpoint = baseline._bootstrap(
+    env.obs(),
+    metrics["final_survival"],
+    returns.new_tensor([first_done if horizon == 1 else 0.5]),
+  )
+  torch.testing.assert_close(endpoint, metrics["bootstrap"].reshape(1))
 
 
 def test_fixed_noise_actor_gradient_includes_filter_bootstrap_and_survival():
@@ -386,8 +413,6 @@ def test_real_covariance_film_and_bootstrap_fixed_noise_directional_derivative()
 
 
 def test_critic_uses_raw_values_for_gae_and_only_clips_final_targets():
-  from dataclasses import replace
-
   learner, starts, noises = setup()
   learner.cfg = replace(learner.cfg, lam=0.0)
   learner._v_max = 1.0
@@ -414,14 +439,12 @@ def test_critic_uses_raw_values_for_gae_and_only_clips_final_targets():
   clipped_values_first = (
     torch.stack(rewards) + learner.cfg.gamma * torch.stack(continuations)
   ).clamp(max=1)
-  torch.testing.assert_close(data[1], expected.flatten())
+  torch.testing.assert_close(data[1], expected)
   assert not torch.allclose(data[1], clipped_values_first.flatten())
 
 
 @pytest.mark.parametrize("microbatch", [1, 2, 7])
 def test_critic_microbatch_is_independent_and_preserves_logical_updates(microbatch):
-  from dataclasses import replace
-
   full, starts, noises = setup(12)
   split, _, _ = setup(1)
   split.cfg = replace(split.cfg, critic_microbatch_size=microbatch)
@@ -434,7 +457,7 @@ def test_critic_microbatch_is_independent_and_preserves_logical_updates(microbat
   with split.critic.register_forward_pre_hook(record_scoring_batch):
     full_metrics = full.update_from(starts, *noises)
     split_metrics = split.update_from(starts, *noises)
-  assert sum(scored_sizes) == 12 and max(scored_sizes) <= microbatch
+  assert sum(scored_sizes) == 18 and max(scored_sizes) <= microbatch
   torch.testing.assert_close(
     split_metrics["Policy/explained_variance"],
     full_metrics["Policy/explained_variance"],

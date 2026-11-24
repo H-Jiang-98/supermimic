@@ -27,7 +27,7 @@ def inputs(dtype=torch.float64, device="cpu"):
   mean = boxplus(truth, rand(3, 70) * 0.1)
   factor = rand(3, 70, 70) * 0.005 + torch.eye(70, dtype=dtype, device=device) * 0.1
   belief = BeliefState(mean, factor @ factor.mT)
-  return truth, rand(3, 700), rand(3, 5, 93), rand(3, 4), rand(3).abs(), belief
+  return truth, rand(3, 700), rand(3, 5, 93), rand(3, 4), belief
 
 
 def test_groups_use_rpv_belief_and_a_never_reads_it():
@@ -37,9 +37,9 @@ def test_groups_use_rpv_belief_and_a_never_reads_it():
   torch.testing.assert_close(a, build_critic_features(*args[:-1], object(), group="A"))
   b = build_critic_features(*args, group="B")
   c = build_critic_features(*args, group="C")
-  assert a.shape == (3, 1238)
-  assert b.shape == c.shape == (3, 1295)
-  torch.testing.assert_close(a, b[:, :1238], atol=0, rtol=0)
+  assert a.shape == (3, 1237)
+  assert b.shape == c.shape == (3, 1294)
+  torch.testing.assert_close(a, b[:, :1237], atol=0, rtol=0)
   torch.testing.assert_close(b, c, atol=0, rtol=0)
   with pytest.raises(ValueError, match="complete BeliefState"):
     build_critic_features(*args[:-1], group="B")
@@ -49,8 +49,8 @@ def test_groups_use_rpv_belief_and_a_never_reads_it():
   changed.covariance[:, 7, 1] += 0.0001
   torch.testing.assert_close(build_critic_features(*args[:-1], changed, group="A"), a)
   different = build_critic_features(*args[:-1], changed, group="B")
-  assert (different[:, 1238:1250] != b[:, 1238:1250]).any()
-  assert (different[:, 1250:] != b[:, 1250:]).any()
+  assert (different[:, 1237:1249] != b[:, 1237:1249]).any()
+  assert (different[:, 1249:] != b[:, 1249:]).any()
 
 
 @pytest.mark.parametrize("group", ["B", "C"])
@@ -76,12 +76,10 @@ def test_rpv_critic_ignores_other_belief_coordinates(group, component):
 
 
 def test_rpv_mean_encoding_recovers_rotation_position_and_velocity_with_scales():
-  truth, goal, history, ctx, remaining, belief = inputs()
+  truth, goal, history, ctx, belief = inputs()
   cfg = CriticInputConfig(mean_scales=(2.0, 3.0))
-  features = build_critic_features(
-    truth, goal, history, ctx, remaining, belief, config=cfg
-  )
-  mean = features[:, 1238:1250]
+  features = build_critic_features(truth, goal, history, ctx, belief, config=cfg)
+  mean = features[:, 1237:1249]
   columns = mean[:, :6].reshape(3, 3, 2)
   relative_rotation = torch.cat(
     (columns, torch.linalg.cross(columns[..., 0], columns[..., 1]).unsqueeze(-1)),
@@ -97,12 +95,12 @@ def test_rpv_mean_encoding_recovers_rotation_position_and_velocity_with_scales()
   torch.testing.assert_close(position, belief.mean.position)
   torch.testing.assert_close(velocity, belief.mean.velocity)
   torch.testing.assert_close(
-    features[:, 1250:], encode_rpv_covariance(belief.covariance[:, :9, :9], cfg)
+    features[:, 1249:], encode_rpv_covariance(belief.covariance[:, :9, :9], cfg)
   )
 
 
 def test_horizontal_transform_preserves_all_features_and_near_pi_is_finite():
-  truth, goal, history, ctx, remaining, belief = inputs()
+  truth, goal, history, ctx, belief = inputs()
   rotation = so3_exp(torch.tensor([0.0, 0.0, 1.4], dtype=torch.float64))
   translation = torch.tensor([4.1, -3.2, 0.0], dtype=torch.float64)
 
@@ -115,15 +113,12 @@ def test_horizontal_transform_preserves_all_features_and_near_pi_is_finite():
     )
 
   for group in ("A", "B", "C"):
-    expected = build_critic_features(
-      truth, goal, history, ctx, remaining, belief, group=group
-    )
+    expected = build_critic_features(truth, goal, history, ctx, belief, group=group)
     actual = build_critic_features(
       transform(truth),
       goal,
       history,
       ctx,
-      remaining,
       BeliefState(transform(belief.mean), belief.covariance),
       group=group,
     )
@@ -133,7 +128,7 @@ def test_horizontal_transform_preserves_all_features_and_near_pi_is_finite():
     replace(belief.mean, rotation=truth.rotation @ turn), belief.covariance
   )
   assert torch.isfinite(
-    build_critic_features(truth, goal, history, ctx, remaining, almost_pi)
+    build_critic_features(truth, goal, history, ctx, almost_pi)
   ).all()
 
 
@@ -199,7 +194,7 @@ def test_critic_frozen_parameters_preserve_mean_and_covariance_directional_deriv
   group,
   component,
 ):
-  truth, goal, history, ctx, remaining, belief = inputs(device=device)
+  truth, goal, history, ctx, belief = inputs(device=device)
   parameter = torch.tensor(0.02, dtype=torch.float64, device=device, requires_grad=True)
   direction = torch.linspace(-0.4, 0.5, 70, dtype=torch.float64, device=device).expand(
     3, 70
@@ -219,9 +214,7 @@ def test_critic_frozen_parameters_preserve_mean_and_covariance_directional_deriv
       else belief.covariance,
     )
     return critic(
-      build_critic_features(
-        truth, goal, history, ctx, remaining, posterior, group=group
-      )
+      build_critic_features(truth, goal, history, ctx, posterior, group=group)
     ).sum()
 
   derivative = torch.autograd.grad(value(parameter), parameter)[0]
@@ -241,7 +234,7 @@ def test_rpv_projection_has_no_direct_gradient_to_other_belief_coordinates(group
   posterior = BeliefState(boxplus(belief.mean, tangent), covariance)
   features = build_critic_features(*args[:-1], posterior, group=group)
   mean_grad, covariance_grad = torch.autograd.grad(
-    features[:, 1238:].square().sum(), (tangent, covariance)
+    features[:, 1237:].square().sum(), (tangent, covariance)
   )
   assert torch.isfinite(mean_grad).all() and torch.isfinite(covariance_grad).all()
   assert torch.count_nonzero(mean_grad[:, :9]) > 0
@@ -356,7 +349,6 @@ def test_all_groups_reject_unknown_contract_before_loading_matching_weights(grou
     {"covariance_scales": (1,) * 6},
     {"version": "unknown_critic_version"},
     {"covariance_encoding": "unknown_encoding"},
-    {"remaining_time_scale": float("inf")},
   ],
 )
 def test_config_rejects_invalid_contract(kwargs):

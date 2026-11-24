@@ -29,10 +29,11 @@ OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.eval_eit \
 
 | 本地训练快照 | 支持的用途 |
 |---|---|
-| `eit_training_v5`，`stage=policy` | `train_eit` 续训、评估、播放和 ONNX actor 导出 |
+| `eit_training_v6`，`stage=policy` | `train_eit` 续训、评估、播放和 ONNX actor 导出 |
+| `eit_training_v5`，`stage=policy` | 评估、播放和 ONNX actor 导出 |
 | `eit_model_training_v4`，`stage=model` | `train_belief` 续训、固定 actor 的评估、播放和 ONNX actor 导出 |
 
-策略快照须声明 full replay 并包含本组的 `eit_rpv_belief_critic_v2` 契约。推理加载器核对契约与世界模型的 context 宽度及 critic 首层的输入宽度。启动训练、生成共享初始化包及继续训练的命令见[训练说明](README.md#estimator-第四步完整策略与模型交替训练)。
+策略快照须声明 full replay 并包含相应的 critic 契约（v6 使用 `eit_rpv_belief_critic_v3`，v5 使用 `eit_rpv_belief_critic_v2`）。推理加载器核对契约与世界模型的 context 宽度及 critic 首层的输入宽度。启动训练、生成共享初始化包及继续训练的命令见[训练说明](README.md#estimator-第四步完整策略与模型交替训练)。
 
 `eval_eit` 允许不同于训练数据的兼容 motion，记录训练和评估两份内容指纹；这不改变
 续训的严格 motion 校验。末端名单由 `--ee-body-names` 指定，默认使用 G1 的左右

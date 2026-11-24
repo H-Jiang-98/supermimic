@@ -20,7 +20,7 @@ from supermimic.learners.learner_utils import (
   fit_critic,
   validate_optimizer_state,
 )
-from supermimic.learners.policy_learner import gae_returns
+from supermimic.learners.policy_learner import discounted_bootstrap, gae_returns
 from supermimic.utils.compile import compile_eit_kernel
 from supermimic.utils.profiling import PhaseTimer
 
@@ -71,27 +71,6 @@ class BeliefPolicyLearnerCfg:
       raise ValueError("Policy requires 0 <= gamma < 1 and 0 <= lambda <= 1")
     if type(self.value_clipping) is not bool:
       raise ValueError("value_clipping must be boolean")
-
-
-def lambda_returns(rewards, continuation, values, gamma: float, lam: float):
-  """Time-major lambda returns; values includes the last bootstrap value.
-
-  continuation is a *single-step* multiplier, not accumulated survival. An
-  ending transition still receives its immediate reward.
-  """
-  if rewards.shape != continuation.shape or values.shape != (
-    rewards.shape[0] + 1,
-    *rewards.shape[1:],
-  ):
-    raise ValueError("Lambda-return shapes require T rewards and T+1 values")
-  following = values[-1]
-  targets = []
-  for t in reversed(range(len(rewards))):
-    following = rewards[t] + gamma * continuation[t] * (
-      (1 - lam) * values[t + 1] + lam * following
-    )
-    targets.append(following)
-  return torch.stack(targets[::-1])
 
 
 def policy_metrics_for_json(metrics):
@@ -147,10 +126,6 @@ class BeliefActorCriticPolicyLearner:
   @property
   def steps(self):
     return self.actor_steps
-
-  def _value(self, inputs):
-    value = self.critic(inputs).squeeze(-1)
-    return value.clamp(max=self._v_max) if self.cfg.value_clipping else value
 
   def draw_noises(self, starts):
     parameter = next(self.actor.parameters())
@@ -223,12 +198,12 @@ class BeliefActorCriticPolicyLearner:
   def _rollout(
     self, starts, process_noise, measurement_noise, horizon, *, return_components=False
   ):
-    """One equal-length subset; returns live returns and detached regression data."""
+    """Roll out one microbatch, returning live actor returns and time-major critic data."""
     cfg, env = self.cfg, self.wm_env
     obs = env.reset_prepared(starts)
     survival = process_noise.new_ones(len(starts))
     returns = torch.zeros_like(survival)
-    observations, rewards, continuations, weights = [], [], [], []
+    observations, rewards, dones, weights = [], [], [], []
     aux_loss = 0.0
     saturation = process_noise.new_zeros(())
     film_scale = process_noise.new_zeros(2)
@@ -249,36 +224,38 @@ class BeliefActorCriticPolicyLearner:
           process_noise=process_noise[t],
           measurement_noise=measurement_noise[t],
         )
-        continuation = (1 - done) * (starts.remaining_steps > t + 1)
         returns = returns + cfg.gamma**t * survival * reward
-        survival = survival * continuation
+        survival = survival * (1 - done)
         rewards.append(reward.detach())
-        continuations.append(continuation.detach())
-    bootstrap = cfg.gamma**horizon * survival * self._value(obs["critic"])
+        dones.append(done.detach())
+    bootstrap = discounted_bootstrap(
+      self.critic(obs["critic"]).squeeze(-1),
+      survival,
+      cfg.gamma,
+      horizon,
+      self._v_max if cfg.value_clipping else None,
+    )
     reward_return = returns
     returns = returns + bootstrap
     observations.append(obs["critic"].detach())
     observations = torch.stack(observations)
+    step_rewards = torch.stack(rewards)
     with torch.no_grad():
       raw_values = self.critic(observations).squeeze(-1)
       targets = gae_returns(
         raw_values[:-1],
         raw_values[-1],
-        torch.stack(rewards),
-        1 - torch.stack(continuations),
+        step_rewards,
+        torch.stack(dones),
         cfg.gamma,
         cfg.lam,
       )
       if cfg.value_clipping:
         targets.clamp_(max=self._v_max)
-    data = (
-      observations[:-1].flatten(0, 1),
-      targets.flatten(),
-      torch.stack(weights).flatten(),
-    )
+    data = observations[:-1], targets
     metrics = {
       "return": returns.detach().sum(),
-      "raw_reward_sum": torch.stack(rewards).sum(),
+      "raw_reward_sum": step_rewards.sum(),
       "bootstrap": bootstrap.detach().sum(),
       "final_survival": survival.detach().sum(),
       "valid_steps": returns.new_tensor(horizon * len(starts)),
@@ -307,12 +284,9 @@ class BeliefActorCriticPolicyLearner:
     starts = starts.repeat_interleave(cfg.num_samples)
     process_noise = process_noise.detach().flatten(1, 2)
     measurement_noise = measurement_noise.detach().flatten(1, 2)
-    lengths = starts.remaining_steps.clamp(max=cfg.horizon)
-    if (lengths < 1).any():
-      raise ValueError("Prepared policy starts must have a remaining scoring action")
     count = len(starts)
     modules = (self.actor, self.critic, env.dynamics, env.representation)
-    data, order, totals = [], [], {}
+    data, totals = [], {}
     # Analytical test environments and custom rollout environments may have no motion.
     with (
       getattr(env, "readonly_policy_motion", nullcontext)(),
@@ -327,33 +301,25 @@ class BeliefActorCriticPolicyLearner:
         optimizer.zero_grad(set_to_none=True)
       actor_start = timer.now()
       try:
-        for horizon in lengths.unique(sorted=True).tolist():
-          indices = (lengths == horizon).nonzero().flatten()
-          for selected in indices.split(cfg.microbatch_size):
-            returns, regression, metrics = self._rollout(
-              starts.index(selected),
-              process_noise[:, selected],
-              measurement_noise[:, selected],
-              horizon,
-            )
-            if not torch.isfinite(returns).all():
-              raise FloatingPointError(
-                "Non-finite imagined return; actor step rejected"
-              )
-            (
-              -returns.sum() / count + self._rollout_aux_loss * len(selected) / count
-            ).backward()
-            data.append(regression)
-            order.append(
-              (
-                torch.arange(horizon, device=selected.device)[:, None] * count
-                + selected
-              ).flatten()
-            )
-            for name, value in metrics.items():
-              totals[name] = totals.get(name, 0) + value
-            del returns
-            env.clear_rollout()
+        for offset in range(0, count, cfg.microbatch_size):
+          selected = slice(offset, offset + cfg.microbatch_size)
+          batch = starts.index(selected)
+          returns, regression, metrics = self._rollout(
+            batch,
+            process_noise[:, selected],
+            measurement_noise[:, selected],
+            cfg.horizon,
+          )
+          if not torch.isfinite(returns).all():
+            raise FloatingPointError("Non-finite imagined return; actor step rejected")
+          (
+            -returns.sum() / count + self._rollout_aux_loss * len(batch) / count
+          ).backward()
+          data.append(regression)
+          for name, value in metrics.items():
+            totals[name] = totals.get(name, 0) + value
+          del returns
+          env.clear_rollout()
 
         self._check_gradients(self.actor)
         actor_norm = torch.nn.utils.clip_grad_norm_(
@@ -368,13 +334,11 @@ class BeliefActorCriticPolicyLearner:
         critic_start = timer.now()
         self.actor.requires_grad_(False)
         self.critic.requires_grad_(True)
-        features, targets, weights = (
-          torch.cat([record[i] for record in data]) for i in range(3)
+        # Join the trajectory axis before flattening, preserving time-major sample order.
+        features, targets = (
+          torch.cat(chunks, dim=1).flatten(0, 1) for chunks in zip(*data, strict=True)
         )
-        # Restore time-major, then trajectory order before drawing the one
-        # permutation. Rollout chunk size and equal-length grouping cannot alter it.
-        permutation = torch.cat(order).argsort()
-        features, targets = features[permutation], targets[permutation]
+        del data
         critic_loss, critic_norm, updates = fit_critic(
           self.critic,
           self.critic_optimizers,

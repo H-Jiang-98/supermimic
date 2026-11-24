@@ -109,3 +109,25 @@ def test_gae_returns_discount_by_soft_done():
   )
 
   assert torch.allclose(returns, torch.tensor([[1.495], [1.0]]))
+
+
+@pytest.mark.parametrize(
+  "dones,lam,expected",
+  [
+    ([0.5, 1.0], 0, [4.25, 3.0]),
+    ([0.5, 1.0], 1, [3.35, 3.0]),
+    ([1.0, 1.0], 0.95, [2.0, 3.0]),
+    ([0.0, 0.0], 1, [9.56, 8.4]),
+  ],
+)
+def test_gae_returns_match_hand_computation_and_terminal_reward(dones, lam, expected):
+  values = torch.tensor([[4.0], [5.0], [6.0]])
+  returns = gae_returns(
+    values[:-1],
+    values[-1],
+    torch.tensor([[2.0], [3.0]]),
+    torch.tensor(dones)[:, None],
+    0.9,
+    lam,
+  )
+  torch.testing.assert_close(returns, torch.tensor(expected)[:, None])

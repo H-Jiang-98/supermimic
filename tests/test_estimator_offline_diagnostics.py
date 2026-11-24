@@ -29,7 +29,6 @@ def _episode(length, x=0, reason="failure"):
     "prior_covariance": torch.eye(70) * 0.01,
     "sensor": sensor,
     "true_goal": torch.zeros(length, 700),
-    "remaining_time": torch.ones(length),
     "reward": torch.arange(1, length + 1).float(),
     "action": torch.zeros(length, 29),
     "sim_ctx": torch.zeros(length, 2),
@@ -101,6 +100,7 @@ def test_hard_return_uses_terminal_reward_and_separates_censored_values():
     "episodes": [
       _episode(3),
       _episode(2, 1, "timeout"),
+      _episode(2, 3, "clip_complete"),
       _episode(1, 2, "evaluation_truncated"),
     ],
   }
@@ -109,7 +109,7 @@ def test_hard_return_uses_terminal_reward_and_separates_censored_values():
   assert result["episodes"][0]["raw_value"] == [8.0] * 3
   assert result["episodes"][0]["bootstrap_value"] == [4.0] * 3
   assert result["episodes"][1]["discounted_return"] is None
-  assert result["censored_episodes"] == 2 and result["censored_samples"] == 3
+  assert result["censored_episodes"] == 3 and result["censored_samples"] == 5
   assert result["bootstrap_value_error"]["samples"] == 3
   assert result["bootstrap_value_error"]["bias"] == pytest.approx((1.25 + 0.5 + 1) / 3)
   assert result["raw_value_error"]["bias"] == pytest.approx((5.25 + 4.5 + 5) / 3)
@@ -292,14 +292,16 @@ def test_positive_soft_tail_survives_numeric_underflow():
     device="cpu",
     clear_rollout=lambda: None,
     reset_prepared=lambda _: None,
+    motion=SimpleNamespace(last_frame=lambda times: times + 499),
     step=lambda *_args, **_kwargs: (None, torch.ones(1), torch.tensor([0.9]), {}),
   )
   start = SimpleNamespace(
-    remaining_steps=torch.tensor([500]), repeat_interleave=lambda _: None
+    motion_times=torch.zeros(1, dtype=torch.long), repeat_interleave=lambda _: None
   )
   report = _rollout(
     lambda _: torch.zeros(1, 29), env, start, 400, 1, 0.9, torch.Generator()
   )
   assert report["discounted_tail_weight_mean"] == 0.0
   assert report["samples_with_unscored_tail"] == 1
+  assert report["steps"] == 400
   assert not report["clip_horizon_reached"]

@@ -261,7 +261,7 @@ def diagnostic_cache_valid(arguments):
     ):
       return False
     return (
-      result.get("version") == "eit_independent_diagnostics_v1"
+      result.get("version") == "eit_independent_diagnostics_v2"
       and result.get("checkpoint_sha256") == file_sha256(Path(value("--checkpoint")))
       and result.get("recording_sha256") == file_sha256(Path(value("--recording")))
       and (

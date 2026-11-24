@@ -28,6 +28,7 @@ from supermimic.runners.run_config import EIT_INITIALIZATION_VERSION
 from supermimic.scripts import batch_eval_eit
 from supermimic.scripts.benchmark_eit_online import _summarize as summarize_latency
 from supermimic.scripts.pilot_report_diagnostics import (
+  critic_score_status,
   diagnostic_structure_errors,
   supplementary,
 )
@@ -296,10 +297,29 @@ def _verify_diagnostic_record(
         == frames,
         f"{group}: posterior calibration frame count differs from recording",
       )
+    critic = offline.get("critic", {})
     audit.require(
-      offline.get("critic", {}).get("bootstrap_value_error", {}).get("samples")
-      == frames,
-      f"{group}: critic sample count differs from complete recording",
+      observed
+      == [
+        (ep["env_id"], len(ep["raw_value"]), ep["reason"])
+        for ep in critic.get("episodes", [])
+      ],
+      f"{group}: critic episode lengths/terminations differ from recording",
+    )
+    terminal = {"failure"}
+    if offline.get("version") == "eit_independent_diagnostics_v1":
+      terminal.add("clip_complete")
+    censored = [ep for ep in episodes if ep["reason"] not in terminal]
+    censored_frames = sum(len(ep["reward"]) for ep in censored)
+    for name in ("raw_value_error", "bootstrap_value_error"):
+      audit.require(
+        critic.get(name, {}).get("samples") == frames - censored_frames,
+        f"{group}: critic {name} sample count differs from terminal recording frames",
+      )
+    audit.require(
+      critic.get("censored_samples") == censored_frames
+      and critic.get("censored_episodes") == len(censored),
+      f"{group}: critic censored counts differ from recording",
     )
   except (
     OSError,
@@ -904,15 +924,14 @@ def _audit_group(audit, group, p, validation, commands):
     coverage, coverage_frames = _coverage(offline.get("fixed_record_posterior", []))
     critic = offline.get("critic", {})
     error = critic.get("bootstrap_value_error", {})
+    critic_status = critic_score_status(critic)
     audit.data(
       coverage_frames > 0,
       f"{group}/{frames}: no independent posterior calibration frames",
     )
     audit.data(
-      error.get("samples", 0) > 0
-      and _finite(error.get("rmse"))
-      and critic.get("censored_episodes") == 0,
-      f"{group}/{frames}: independent critic score missing or censored",
+      critic_status != "missing",
+      f"{group}/{frames}: independent critic score missing",
     )
     audit.data(
       offline.get("process", {}).get("transitions", 0) > 0,
@@ -928,6 +947,7 @@ def _audit_group(audit, group, p, validation, commands):
         "coverage_95": coverage,
         "coverage_frames": coverage_frames,
         "critic_error": error,
+        "critic_status": critic_status,
         "process_transitions": offline.get("process", {}).get("transitions"),
       }
     )

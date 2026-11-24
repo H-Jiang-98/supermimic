@@ -45,7 +45,7 @@ def load_hashed_checkpoint(path: Path, device):
 
 def evaluation_config(saved: dict) -> SuperMimicRunnerCfg:
   """Decode a complete EIT checkpoint without importing training state."""
-  validate_eit_checkpoint_contract(saved)
+  validate_eit_checkpoint_contract(saved, for_inference=True)
   cfg = load_runner_cfg({"runner_cfg": saved["runner_config"]})
   if cfg.estimator_inputs is None or cfg.process_noise is None:
     raise ValueError("EIT evaluation requires estimator inputs and process noise")
@@ -64,7 +64,7 @@ def load_evaluation_models(env, cfg, saved: dict, device: str):
   physics. Call the adapter's reset after the final evaluation reset or clip seek.
   Motion identity is deliberately not a weight compatibility constraint here.
   """
-  validate_eit_checkpoint_contract(saved)
+  validate_eit_checkpoint_contract(saved, for_inference=True)
   if cfg.estimator_inputs is None or cfg.estimator_inputs.mode != "eval":
     raise ValueError("Evaluation models require estimator_inputs.mode='eval'")
   wm = build_world_model(cfg, env, device)

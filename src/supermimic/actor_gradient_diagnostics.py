@@ -44,7 +44,7 @@ def _gradient_summary(reward, bootstrap):
 def actor_objective_gradients(learner, starts, process_noise, measurement_noise):
   """Report gradients of the mean positive return, before clipping or optimization.
 
-  Uses the learner's actual rollout, clip-aware horizon, soft survival, value cap,
+  Uses the learner's actual rollout, fixed horizon, soft survival, value cap,
   sample replication and microbatch schedule. Both components come from the same
   graph. No optimizer, generator, parameter gradient, or normalizer is updated.
   The caller's transient imagined rollout is cleared on exit.
@@ -53,9 +53,6 @@ def actor_objective_gradients(learner, starts, process_noise, measurement_noise)
   cfg, env = learner.cfg, learner.wm_env
   n_starts = len(starts)
   starts = starts.repeat_interleave(cfg.num_samples)
-  lengths = starts.remaining_steps.clamp(max=cfg.horizon)
-  if (lengths < 1).any():
-    raise ValueError("Prepared policy starts must have a remaining scoring action")
   process = process_noise.detach().flatten(1, 2)
   measurement = measurement_noise.detach().flatten(1, 2)
   modules = (learner.actor, learner.critic, env.dynamics, env.representation)
@@ -83,35 +80,34 @@ def actor_objective_gradients(learner, starts, process_noise, measurement_noise)
     for module in modules[1:]:
       module.eval().requires_grad_(False)
     try:
-      for horizon in lengths.unique(sorted=True).tolist():
-        indices = (lengths == horizon).nonzero().flatten()
-        for selected in indices.split(cfg.microbatch_size):
-          returns, _, _, components = learner._rollout(
-            starts.index(selected),
-            process[:, selected],
-            measurement[:, selected],
-            horizon,
-            return_components=True,
-          )
-          if not torch.isfinite(returns).all():
-            raise FloatingPointError("Non-finite imagined diagnostic return")
-          for i, component in enumerate(components):
-            objective = component.sum() / len(starts)
-            totals[i] += float(objective.detach())
-            if objective.requires_grad:
-              values = torch.autograd.grad(
-                objective,
-                parameters,
-                allow_unused=True,
-                retain_graph=i == 0,
-              )
-              for accumulated, value in zip(gradients[i], values, strict=True):
-                if value is not None:
-                  if not torch.isfinite(value).all():
-                    raise FloatingPointError("Non-finite actor diagnostic gradient")
-                  accumulated.add_(value.detach())
-          del returns, components
-          env.clear_rollout()
+      for offset in range(0, len(starts), cfg.microbatch_size):
+        selected = slice(offset, offset + cfg.microbatch_size)
+        returns, _, _, components = learner._rollout(
+          starts.index(selected),
+          process[:, selected],
+          measurement[:, selected],
+          cfg.horizon,
+          return_components=True,
+        )
+        if not torch.isfinite(returns).all():
+          raise FloatingPointError("Non-finite imagined diagnostic return")
+        for i, component in enumerate(components):
+          objective = component.sum() / len(starts)
+          totals[i] += float(objective.detach())
+          if objective.requires_grad:
+            values = torch.autograd.grad(
+              objective,
+              parameters,
+              allow_unused=True,
+              retain_graph=i == 0,
+            )
+            for accumulated, value in zip(gradients[i], values, strict=True):
+              if value is not None:
+                if not torch.isfinite(value).all():
+                  raise FloatingPointError("Non-finite actor diagnostic gradient")
+                accumulated.add_(value.detach())
+        del returns, components
+        env.clear_rollout()
     finally:
       env.clear_rollout()
       with torch.no_grad():
@@ -127,7 +123,7 @@ def actor_objective_gradients(learner, starts, process_noise, measurement_noise)
     "samples_per_start": cfg.num_samples,
     "horizon": cfg.horizon,
     "microbatch_size": cfg.microbatch_size,
-    "effective_imagined_steps": int(lengths.sum()),
+    "effective_imagined_steps": len(starts) * cfg.horizon,
     "gamma": cfg.gamma,
     "bootstrap_value_cap": learner._v_max if cfg.value_clipping else None,
     "reward_return": totals[0],

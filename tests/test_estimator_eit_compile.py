@@ -1,6 +1,5 @@
 """Fixed-input CUDA parity for EIT policy gradients through the compiled filter."""
 
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -63,15 +62,14 @@ def test_fixed_policy_rollout_compiled(group, tmp_path):
       torch.arange(2, device=device), torch.zeros(2, device=device, dtype=torch.long)
     )
     tail = start.index(slice(0, 1))
-    tail.batch["motion_time"] = world._last_reference_frame(tail.motion_times)
-    tail = replace(tail, remaining_steps=torch.ones_like(tail.remaining_steps))
+    tail.batch["motion_time"] = world.motion.last_frame(tail.motion_times)
 
-    for inputs, horizon in ((start, 2), (tail, 1)):
+    for inputs in (start, tail):
       noises = [noise[:, :, 0] for noise in policy.draw_noises(inputs)]
       results = []
       for stance in ("force_eager", "default"):
         with torch.compiler.set_stance(stance):
-          returns, _, _ = policy._rollout(inputs, *noises, horizon)
+          returns, _, _ = policy._rollout(inputs, *noises, policy.cfg.horizon)
           posterior = world.posterior_provider.state.belief
           gradients = torch.autograd.grad(
             returns.sum(), tuple(policy.actor.parameters()), allow_unused=True

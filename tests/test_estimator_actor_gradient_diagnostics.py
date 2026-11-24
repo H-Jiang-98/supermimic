@@ -63,7 +63,7 @@ def test_gradient_components_sum_to_training_gradient_and_microbatches_agree():
   assert result["bootstrap_return"] == pytest.approx(
     float(training["Policy/bootstrap"]), rel=1e-12
   )
-  assert result["effective_imagined_steps"] == 12
+  assert result["effective_imagined_steps"] == 18
   assert result["reward_gradient_norm"] > 0
   assert result["bootstrap_gradient_norm"] > 0
 
@@ -139,9 +139,15 @@ def test_each_component_gradient_matches_fixed_noise_finite_difference():
   )
 
 
-def test_terminal_starts_have_zero_bootstrap_gradient_and_undefined_angle():
+def test_certain_failure_has_zero_bootstrap_gradient_and_undefined_angle():
   learner, starts, noises = setup()
-  starts.remaining_steps.fill_(1)
+  step = learner.wm_env.step
+
+  def fail(*args, **kwargs):
+    obs, reward, done, info = step(*args, **kwargs)
+    return obs, reward, torch.ones_like(done), info
+
+  learner.wm_env.step = fail
   result = actor_objective_gradients(learner, starts, *noises)
   assert result["bootstrap_return"] == 0
   assert result["bootstrap_gradient_norm"] == 0
@@ -188,7 +194,7 @@ def test_real_record_runs_training_horizon_gradient_diagnostic(tmp_path):
   assert gradient["horizon"] == 32
   assert gradient["samples_per_start"] == 1
   assert gradient["starts"] == 1
-  assert gradient["effective_imagined_steps"] == 8
+  assert gradient["effective_imagined_steps"] == 32
   assert gradient["actor_state_source"] == "posterior"
   assert gradient["bootstrap_value_cap"] == 0.25
   assert gradient["total_gradient_norm"] > 0

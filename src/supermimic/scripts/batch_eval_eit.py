@@ -215,7 +215,7 @@ def freeze(spec, base):
 
 
 def admit(state, run, index, training):
-  validate_eit_checkpoint_contract(state, stage="policy")
+  validate_eit_checkpoint_contract(state, stage="policy", for_inference=True)
   counters = {
     "mean_steps": state["learner"]["mean"]["steps"],
     "cov_steps": state["learner"]["cov"]["steps"],

@@ -603,15 +603,15 @@ A 的 critic 不含 belief；B/C 使用相同结构，额外读取 12 维 R/p/v 
 旋转占 6 维，位置、线速度各占 3 维。covariance 提取完整后验中按
 `[δθ, δρ, δν]` 排序的前 9×9 块，在后验均值的右局部切空间编码为 9 个 log std
 与 36 个上三角相关系数，保留 R/p/v 的交叉项，不做条件化。
-三组 critic 共同读取真值、参考、控制历史、剩余 clip 时间和 context；A 的总输入为
-`1234 + dim(context)`，B/C 为 `1291 + dim(context)`。后验角速度、关节位置和
+三组 critic 共同读取真值、参考、控制历史和 context。A 的总输入为
+`1233 + dim(context)`，B/C 为 `1290 + dim(context)`。后验角速度、关节位置和
 关节速度的均值，以及 9×9 块之外的 covariance，不直接进入 B/C critic。
 滤波器传播完整 70×70 covariance。上述压缩只发生在
 critic 特征入口，保留 R/p/v 均值和边缘 covariance 的梯度。它是任务相关的信息压缩，
 长期价值与控制性能需通过实验验证，不能认为与完整 belief critic 等价。
 策略想象的 K 条轨迹共享起点与后验，独立采样过程及测量噪声；冻结参数时保留
 动作穿过滤波、covariance、FiLM、soft survival 和价值 bootstrap 的导数。
-clip 最后一个评分动作后停止回报，普通策略 horizon 截断保留 bootstrap。
+所有起点固定展开 H 步，跨过片尾后目标窗口和单步奖励重复使用完整末帧，包括记录的速度。策略每步根据当前观测重新计算动作，第 H 步按折扣和存活权重 bootstrap。真实采集和整段评估在片尾结束。
 
 真实环境每帧执行在线滤波，并将转移写入主 replay。`--posterior-save-stride S` 控制后验的保存间隔，默认 1，取值范围为 1 到 `buffer_size`。在全局采集步 0、S、2S…，缓存写入已融合当前测量、尚未执行当前动作的后验。采集步跨轮次和单环境 reset 连续计数。
 
@@ -631,15 +631,15 @@ clip 最后一个评分动作后停止回报，普通策略 horizon 截断保留
 
 ```bash
 OMP_NUM_THREADS=1 PYTORCH_JIT=0 .venv/bin/python -m supermimic.scripts.check_eit_replay_precision \
-  --checkpoint logs/eit-v5/B/training.pt --motion-file data/motions/walk1_subject1.npz \
+  --checkpoint logs/eit-v6/B/training.pt --motion-file data/motions/walk1_subject1.npz \
   --num-envs 4 --steps 32 --output /tmp/eit-replay-precision.json
 ```
 
 `posterior_cache_normalization_seconds` 计入缓存读取和归一化的总耗时，`posterior_cache_read_seconds` 是其中的读取耗时。CUDA 计时在当前 stream 上记录事件，归一化结束时统一读取。默认 5 帧历史、4,096 个环境下，边界观测占约 5.81 MiB，另加索引。S=1、2、4 的实际缓存大小和三轮 CPU 耗时见[增量回放验收记录](docs/validation/incremental_posterior_replay.json)。
 
-A/B/C 的训练、评估和播放均要求联合 checkpoint 内嵌 `eit_rpv_belief_critic_v2` critic 契约。
+A/B/C 新版训练使用 `eit_rpv_belief_critic_v3` critic 契约。旧版 v5 策略快照仍可用于评估和播放。
 加载时校验组别、输入维度和 `rpv9_log_std_corr_v1` 编码。A 组也执行同一版本检查。
-新训练默认在输出目录的父目录创建或读取 `eit_initialization_v3_eit_rpv_belief_critic_v2_seed<seed>.pt`。
+新训练默认在输出目录的父目录创建或读取 `eit_initialization_v4_eit_rpv_belief_critic_v3_seed<seed>.pt`。
 同一 seed 的三组使用同一份初始化包，分别写入各自的训练目录。也可用 `--initialization` 指定当前契约的初始化包。
 各组独立采集与更新。当前默认使用公共 ReturnSampler，保留 `--sampling-mode uniform`。
 
@@ -650,7 +650,7 @@ A/B/C 的训练、评估和播放均要求联合 checkpoint 内嵌 `eit_rpv_beli
 WANDB_MODE=offline OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/supermimic-mpl \
   .venv/bin/python -m supermimic.scripts.train_eit \
   --motion-file data/motions/walk1_subject1.npz --device cuda:0 \
-  --group B --output logs/eit-v5/B --max-iterations 1000000 \
+  --group B --output logs/eit-v6/B --max-iterations 1000000 \
   --num-envs 1024 --buffer-size 1000 --replay-ratio 16 \
   --mean-updates 10 --mean-batch-size 2048 --mean-window-frames 8 \
   --cov-batch-size 8192 --cov-validation-pairs 8192 \
@@ -674,8 +674,7 @@ covariance 预算为 `10×2048×(8−1)=143,360` 次有放回抽样，分 17 个
 actor/critic 复用 Muon＋Adam，学习率均为 2e-4。actor 完整逻辑 batch 累积后做 norm 1.0
 及逐元素 0.1 clipping。critic 使用原始 value 计算 GAE，只裁剪最终 target，拟合不按累计
 survival 加权的 MSE；每次 actor 更新后 5 epoch×4 minibatch，复用一次 permutation。
-`--critic-microbatch-size` 独立配置，默认关闭。critic 的片尾零 bootstrap 与 ReturnSampler
-的片尾均值 bootstrap 各自独立。完整预算、后验缓存容量及 GPU 启动见
+`--critic-microbatch-size` 独立配置，默认关闭。actor 末端 bootstrap 和 critic GAE 复用原有训练代码。真实采集的 ReturnSampler 继续使用片尾均值 bootstrap。完整预算、后验缓存容量及 GPU 启动见
 [PRO 6000 说明](docs/train_eit_pro6000.md)；当前没有该规模的 PRO 6000 实测。
 
 唯一周期保存参数为公共 `runner.cfg.save_interval`，CLI 对应 `--save-interval`。
@@ -693,17 +692,16 @@ EIT 默认 `WANDB_MODE=offline`，测试可设 `disabled`，disabled 仍保存�
 ```bash
 WANDB_MODE=offline OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.train_eit \
   --motion-file data/motions/walk1_subject1.npz --device cuda:0 \
-  --output logs/eit-v5/B --resume logs/eit-v5/B/training.pt --max-iterations 2000000
+  --output logs/eit-v6/B --resume logs/eit-v6/B/training.pt --max-iterations 2000000
 OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.eval_eit \
-  --checkpoint logs/eit-v5/B/training.pt \
+  --checkpoint logs/eit-v6/B/training.pt \
   --motion-file data/motions/walk1_subject1.npz --device cuda:0 \
-  --num-envs 8 --output logs/eit-v5/B/evaluation.json
+  --num-envs 8 --output logs/eit-v6/B/evaluation.json
 ```
 
-当前策略 checkpoint 为 `eit_training_v5`，模型专用为 `eit_model_training_v4`；旧 checkpoint
-不兼容。完整状态保存优化器、归一化、独立 RNG、Ratio 余额、累计计数和 ReturnSampler 统计。
+策略续训使用 `eit_training_v6`，模型专用续训使用 `eit_model_training_v4`。完整状态保存优化器、归一化、独立 RNG、Ratio 余额、累计计数和 ReturnSampler 统计。
 恢复重建物理轨迹、replay、在线 belief 和轨迹相关窗口；累计调度及日志继续，新 replay 的
-posterior 保存序列从 0 开始。共享初始化仍为 `eit_initialization_v3`。
+posterior 保存序列从 0 开始。共享初始化为 `eit_initialization_v4`。
 
 RTX 5090 已完成默认预算的一组 10/18/1/20 更新、完整规模 checkpoint 恢复及离线 artifact 校验，
 A/B/C 小批量 CUDA 下一次更新恢复逐位一致，1095 项回归通过。[实测与范围](docs/validation/eit_v5_rtx5090.json)

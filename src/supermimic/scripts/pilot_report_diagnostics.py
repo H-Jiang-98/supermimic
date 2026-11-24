@@ -20,6 +20,15 @@ def _finite(value: object) -> TypeGuard[int | float]:
   )
 
 
+def critic_score_status(critic):
+  """Distinguish missing evidence from valid, entirely censored critic scores."""
+  if not critic:
+    return "missing"
+  if critic["bootstrap_value_error"]["samples"] > 0:
+    return "scored"
+  return "unscorable_censored"
+
+
 def diagnostic_structure_errors(
   result: object, *, mode: str = "all", require_gradients: bool = False
 ) -> list[str]:
@@ -75,8 +84,9 @@ def diagnostic_structure_errors(
   result = mapping(result, "diagnostic")
   finite_tree(result, "diagnostic")
   require(mode in ("all", "process", "posterior", "critic"), "Unknown diagnostic mode")
+  legacy = result.get("version") == "eit_independent_diagnostics_v1"
   require(
-    result.get("version") == "eit_independent_diagnostics_v1",
+    legacy or result.get("version") == "eit_independent_diagnostics_v2",
     "Invalid diagnostic version",
   )
   integer(result.get("episodes"), "episodes", 1)
@@ -195,7 +205,7 @@ def diagnostic_structure_errors(
         for j, value in enumerate(values):
           number(value, f"{prefix}.{key}[{j}]")
       returns = item.get("discounted_return")
-      if reason in ("failure", "clip_complete"):
+      if reason == "failure" or (legacy and reason == "clip_complete"):
         values = sequence(returns, f"{prefix}.discounted_return")
         require(len(values) == len(raw), f"{prefix} discounted return length mismatch")
         for j, value in enumerate(values):
@@ -302,9 +312,11 @@ def supplementary(
           record_path, weights_only=True, mmap=True, map_location="cpu"
         )
         heads = recorded["episodes"][: p.get("gradient_episodes", 4)]
-        expected_steps = p["policy"]["num_samples"] * sum(
-          min(p["policy"]["horizon"], ep["reference_steps"]) for ep in heads
-        )
+        horizon = p["policy"]["horizon"]
+        steps = horizon * len(heads)
+        if offline.get("version") == "eit_independent_diagnostics_v1":
+          steps = sum(min(horizon, ep["reference_steps"]) for ep in heads)
+        expected_steps = p["policy"]["num_samples"] * steps
         audit.require(
           gradient.get("starts") == len(heads)
           and gradient.get("episode_ids") == [ep["env_id"] for ep in heads]
@@ -364,11 +376,17 @@ def supplementary(
     audit.load_diagnostic(f"{folder}/offline.json", mode="critic"),
   )
   truth_error = truth.get("critic", {}).get("bootstrap_value_error", {})
+  truth_status = critic_score_status(truth.get("critic"))
   audit.data(
-    truth_error.get("samples", 0) > 0
-    and _finite(truth_error.get("rmse"))
-    and truth.get("critic", {}).get("censored_episodes") == 0,
-    "A: independent truth-input critic score missing or censored",
+    truth_status != "missing", "A: independent truth-input critic score missing"
+  )
+  audit.data(
+    truth_eval.get("evaluation_complete") is True
+    and truth_eval.get("censored_episodes") == 0
+    and truth_eval.get("timeout_count") == 0
+    and truth_eval.get("protocol") == "full_clip_v1"
+    and truth_eval.get("step_budget") is None,
+    "A: independent truth-input episodes incomplete or censored",
   )
   if truth:
     audit.require(
@@ -476,6 +494,7 @@ def supplementary(
   return {
     "actor_gradients": gradients,
     "A_truth_critic_error": truth_error,
+    "A_truth_critic_status": truth_status,
     "common_trajectories": common,
     "continuous_drift_recording": "Optional separate record_eit_drift artifact; not required by this base audit.",
   }

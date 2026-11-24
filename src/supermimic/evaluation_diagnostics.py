@@ -156,9 +156,6 @@ class EpisodeRecorder:
     goal, _, _ = build_motion_goal(
       RpvState(truth.rotation, truth.position, truth.velocity), reference
     )
-    remaining = (
-      command.motion.last_frame(command.time_steps) - command.time_steps + 1
-    ) * rep.dt
     values = {
       "time_index": state.time_index,
       "full_state": obs["full_state"],
@@ -166,7 +163,6 @@ class EpisodeRecorder:
       "action": actions,
       "sim_ctx": state.context,
       "true_goal": goal,
-      "remaining_time": remaining,
     }
     rows = active.nonzero().flatten().tolist()
     for name, tensor in values.items():

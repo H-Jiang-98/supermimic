@@ -12,6 +12,7 @@ import torch
 
 from supermimic.belief import BeliefState
 from supermimic.critic_inputs import (
+  CRITIC_INPUT_VERSION,
   BeliefCritic,
   CriticInputConfig,
   build_critic_features,
@@ -25,8 +26,8 @@ from supermimic.runners.belief_training import parameter_digest
 from supermimic.runners.eit_inference import evaluation_config, load_hashed_checkpoint
 from supermimic.utils.lie_state import LieState, local_error
 
-_TERMINAL = {"failure", "clip_complete"}
-_CENSORED = {"timeout", "evaluation_truncated"}
+_TERMINAL = {"failure"}
+_CENSORED = {"clip_complete", "timeout", "evaluation_truncated"}
 
 
 def _validate_record(record, saved):
@@ -62,7 +63,6 @@ def _validate_record(record, saved):
       "action": (n, 29),
       "sim_ctx": (n, context["scale"].numel()),
       "true_goal": (n, 700),
-      "remaining_time": (n,),
       "reward": (n,),
       "prior_mean": (71,),
       "prior_covariance": (70, 70),
@@ -241,6 +241,8 @@ def _errors(errors):
 def _load_critic(saved, cfg, record, digest, device):
   if saved["stage"] != "policy":
     raise ValueError("Critic scoring requires a policy-stage checkpoint")
+  if saved["critic"]["contract"]["version"] != CRITIC_INPUT_VERSION:
+    raise ValueError(f"Infinite-horizon critic scoring requires {CRITIC_INPUT_VERSION}")
   group = cfg.estimator_inputs.group
   if record["checkpoint_sha256"] != digest or record["group"] != group:
     raise ValueError("Critic Monte Carlo returns require episodes from this checkpoint")
@@ -318,7 +320,6 @@ def score_frames(estimator, record, device, bins, critic_info):
           ep["true_goal"][t : t + 1].to(device),
           history,
           ep["sim_ctx"][t : t + 1].to(device),
-          ep["remaining_time"][t : t + 1].to(device),
           belief,
           config=critic.config,
         )
@@ -388,7 +389,7 @@ def diagnose(
   independence = _training_overlap(saved, record)
   dynamics, representation = _load_model(saved, cfg, device)
   result = {
-    "version": "eit_independent_diagnostics_v1",
+    "version": "eit_independent_diagnostics_v2",
     "checkpoint_sha256": digest,
     "recording_sha256": record_digest,
     "recording_source": record["source"],

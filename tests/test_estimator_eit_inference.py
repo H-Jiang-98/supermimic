@@ -165,7 +165,8 @@ def test_adapter_reset_does_not_reset_physics_and_rejects_skipped_frames(tmp_pat
     assert adapter.time_index.tolist() == [0, 0]
 
 
-def test_evaluation_loader_is_private_and_checks_estimator_contract(tmp_path):
+@pytest.mark.parametrize("legacy", [False, True])
+def test_evaluation_loader_is_private_and_checks_estimator_contract(tmp_path, legacy):
   with physical_runner(tmp_path, "B") as runner:
     saved = {
       "version": EIT_POLICY_TRAINING_VERSION,
@@ -181,6 +182,16 @@ def test_evaluation_loader_is_private_and_checks_estimator_contract(tmp_path):
       "world_model": deepcopy(runner._wm.bundle()),
       "actor": deepcopy(actor_checkpoint(runner.policy_learner.actor, runner.cfg)),
     }
+    if legacy:
+      saved["version"] = "eit_training_v5"
+      contract = saved["critic"]["contract"]
+      contract["version"] = contract["config"]["version"] = "eit_rpv_belief_critic_v2"
+      contract["config"]["remaining_time_scale"] = 1.0
+      contract["input_dim"] += 1
+      weights = saved["critic"]["state_dict"]
+      weights["mlp.0.weight"] = torch.nn.functional.pad(weights["mlp.0.weight"], (0, 1))
+      with pytest.raises(ValueError, match=EIT_POLICY_TRAINING_VERSION):
+        validate_eit_checkpoint_contract(saved, stage="policy")
     saved["runner_config"]["wandb_run_path"] = "unused/source/run"
     saved["runner_config"]["estimator_inputs"]["mode"] = "train"
     saved["actor"]["input_config"]["mode"] = "train"

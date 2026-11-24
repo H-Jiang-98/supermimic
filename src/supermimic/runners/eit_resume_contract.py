@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-REFERENCE_VERSION = "eit_live_update_reference_v3"
+REFERENCE_VERSION = "eit_live_update_reference_v4"
 SUPPORTED_REFERENCE_VERSIONS = (
   "eit_live_update_reference_v1",
   "eit_live_update_reference_v2",
+  "eit_live_update_reference_v3",
   REFERENCE_VERSION,
 )
 

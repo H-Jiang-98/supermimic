@@ -1,6 +1,5 @@
 """Versioned policy starts reuse recorded measurements across K trajectories."""
 
-from dataclasses import replace
 from unittest.mock import Mock
 
 import pytest
@@ -20,7 +19,7 @@ def test_unique_prefix_then_repeat_without_refusion_and_variable_batch():
   assert provider.state is None
   expanded = start.repeat_interleave(2)
   assert len(expanded) == 6
-  assert expanded.remaining_steps.tolist() == [10, 10, 10, 10, 6, 6]
+  assert expanded.motion_times.tolist() == [0, 0, 0, 0, 4, 4]
   rng = torch.random.get_rng_state()
   obs = env.reset_prepared(expanded.index([0, 1]))
   assert env.num_envs == 2
@@ -42,7 +41,7 @@ def test_policy_start_sampler_filters_episodes_and_allows_last_record():
   env, _, _ = setup_env()
   start = env.sample_policy_starts(7, [2])
   assert start.batch["episode_id"].tolist() == [2] * 7
-  assert start.remaining_steps.tolist() == [1] * 7
+  assert start.motion_times.tolist() == [9] * 7
   assert start.batch["time_index"].tolist() == [0] * 7
   with pytest.raises(ValueError, match="No training frames"):
     env.sample_policy_starts(1, [])
@@ -97,27 +96,44 @@ def test_motion_mutation_is_rejected_during_policy_phase(replace_tensor):
     env.reset_prepared(env.prepare_policy_starts(torch.tensor([0]), torch.tensor([0])))
 
 
-def test_finished_clip_gets_zero_remaining_time_and_cannot_step_again():
+@torch.no_grad()
+def test_mixed_clip_starts_repeat_complete_last_frame_and_advance_belief():
   env, _, _ = setup_env()
   env.eit_critic = True
-  env.dynamics.requires_grad_(False)
-  start = env.sample_policy_starts(1, [2])
+  env.motion.motion_ends = torch.tensor([5, 10])
+  env.motion.body_lin_vel_w[4].fill_(0.27)
+  env.motion.body_ang_vel_w[9].fill_(0.39)
+  start = env.prepare_policy_starts(torch.arange(3), torch.zeros(3, dtype=torch.long))
+  start.batch["motion_time"][:] = torch.tensor([1, 3, 9])
   obs = env.reset_prepared(start)
-  assert obs["critic"].shape == (1, 1292)
-  assert obs["critic"][0, 1233] == pytest.approx(0.02)
-  obs, _, _, _ = env.step(
-    torch.zeros(1, 29),
-    process_noise=torch.zeros(1, 70),
-    measurement_noise=torch.zeros(1, 64),
-  )
-  assert obs["critic"][0, 1233] == 0
-  assert env.motion_times.tolist() == [9]
-  with pytest.raises(ValueError, match="Reference clip ended"):
-    env.step(torch.zeros(1, 29))
+  assert obs["critic"].shape == (3, 1291)
+  for step in range(1, 6):
+    actions = torch.full((3, 29), step * 0.01)
+    obs, reward, _, _ = env.step(
+      actions, process_noise=torch.zeros(3, 70), measurement_noise=torch.zeros(3, 64)
+    )
+    frames = torch.tensor([min(1 + step, 4), 4, 9])
+    assert torch.equal(env.motion_times, frames)
+    assert env.posterior_provider.state.time_index.tolist() == [step] * 3
+    torch.testing.assert_close(obs["history"][:, -1, -29:], actions)
+    assert torch.isfinite(reward).all()
+    expected = env._aligned_reference_bodies(
+      env.motion.body_state(frames), env.reference_alignment
+    )
+    torch.testing.assert_close(env._ref_body_state, expected)
+    window = env.representation.reference_window(
+      env.motion, frames, env.reference_alignment
+    )
+    torch.testing.assert_close(
+      window.joint_vel[1], env.motion.joint_vel[4].expand_as(window.joint_vel[1])
+    )
+    torch.testing.assert_close(
+      window.joint_vel[2], env.motion.joint_vel[9].expand_as(window.joint_vel[2])
+    )
 
 
 @pytest.mark.parametrize(
-  "field", ["state", "sensor_window", "motion_time", "segment_time", "remaining_steps"]
+  "field", ["state", "sensor_window", "motion_time", "segment_time"]
 )
 def test_invalid_prepared_frame_preserves_live_provider_and_batch_size(field):
   env, _, _ = setup_env()
@@ -126,9 +142,7 @@ def test_invalid_prepared_frame_preserves_live_provider_and_batch_size(field):
   original = env.reset_prepared(start)
   provider_state = env.posterior_provider.state
   changed = start.index([0])
-  if field == "remaining_steps":
-    changed = replace(changed, remaining_steps=changed.remaining_steps.float())
-  elif field == "motion_time":
+  if field == "motion_time":
     changed.batch[field].fill_(1000)
   elif field == "segment_time":
     changed.batch[field].fill_(10)
@@ -210,20 +224,24 @@ def test_eit_critic_step_preflight_preserves_transition_for_retry(monkeypatch):
   assert env._pending_belief_step is None
 
 
-def test_finished_snapshot_restore_cannot_add_another_scoring_action():
+def test_snapshot_at_held_frame_restores_next_transition():
   env, _, _ = setup_env()
   env.eit_critic = True
   env.dynamics.requires_grad_(False)
   env.reset_prepared(env.sample_policy_starts(1, [2]))
   final, _, _, _ = env.step(torch.zeros(1, 29))
   snapshot = env.snapshot()
+  action = torch.zeros(1, 29)
+  noises = dict(process_noise=torch.zeros(1, 70), measurement_noise=torch.zeros(1, 64))
+  expected = env.step(action, **noises)
   env.reset_prepared(env.sample_policy_starts(1, [0]))
   restored = env.restore(snapshot)
   for name, value in final.items():
     torch.testing.assert_close(restored[name], value)
-  assert restored["critic"][0, 1233] == 0
-  with pytest.raises(ValueError, match="Reference clip ended"):
-    env.step(torch.zeros(1, 29))
+  observed = env.step(action, **noises)
+  for name in expected[0].keys():
+    torch.testing.assert_close(observed[0][name], expected[0][name], atol=0, rtol=0)
+  torch.testing.assert_close(observed[1:3], expected[1:3], atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("change", ["scale", "legacy_version"])
@@ -234,7 +252,7 @@ def test_eit_critic_snapshot_contract_rejects_encoding_changes(change):
   snapshot = env.snapshot()
   state = env.posterior_provider.state
   if change == "scale":
-    env.critic_input_config = CriticInputConfig(group="C", remaining_time_scale=2.0)
+    env.critic_input_config = CriticInputConfig(group="C", mean_scales=(2.0, 1.0))
   else:
     snapshot["critic_config"]["version"] = "unknown_critic_version"
   with pytest.raises(ValueError, match="critic configuration"):

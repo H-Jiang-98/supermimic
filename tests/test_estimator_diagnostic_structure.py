@@ -9,7 +9,7 @@ from supermimic.scripts.pilot_report_diagnostics import diagnostic_structure_err
 
 def valid_diagnostic_score():
   return {
-    "version": "eit_independent_diagnostics_v1",
+    "version": "eit_independent_diagnostics_v2",
     "training_overlap_check": {"status": "distinct_seed"},
     "episodes": 2,
     "process": {
@@ -146,3 +146,15 @@ def test_zero_pair_and_censored_scores_keep_explicit_null_statistics():
   malformed = deepcopy(result)
   malformed["critic"]["episodes"][0]["discounted_return"] = [0, 0]
   assert diagnostic_structure_errors(malformed)
+
+
+def test_clip_completion_is_censored_only_for_infinite_horizon_scores():
+  result = valid_diagnostic_score()
+  episode = result["critic"]["episodes"][0]
+  episode["reason"] = "clip_complete"
+  assert diagnostic_structure_errors(result)
+  result["version"] = "eit_independent_diagnostics_v1"
+  assert diagnostic_structure_errors(result) == []
+  result["version"] = "eit_independent_diagnostics_v2"
+  episode["discounted_return"] = None
+  assert diagnostic_structure_errors(result) == []

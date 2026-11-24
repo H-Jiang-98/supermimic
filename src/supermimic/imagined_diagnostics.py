@@ -50,7 +50,6 @@ def _head(ep, env, estimator, motion_digest):
     ep["prior_covariance"][None].to(device),
   )
   belief = estimator.correct(prior, sensor[:, :64])
-  remaining = env.motion.last_frame(batch["motion_time"]) - batch["motion_time"] + 1
   return BeliefRolloutStart(
     batch,
     belief,
@@ -58,7 +57,6 @@ def _head(ep, env, estimator, motion_digest):
     env.replay_buffer,
     env.replay_buffer.insert_count,
     motion_digest,
-    remaining,
   )
 
 
@@ -66,12 +64,11 @@ def _head(ep, env, estimator, motion_digest):
 def _rollout(actor, env, start, horizon, samples, gamma, generator):
   env.clear_rollout()
   obs = env.reset_prepared(start.repeat_interleave(samples))
-  remaining = int(start.remaining_steps.item())
-  steps = min(horizon, remaining)
+  last_frame = env.motion.last_frame(start.motion_times)
   survival = torch.ones(samples, device=env.device, dtype=torch.float64)
   live_tail = torch.full((samples,), gamma > 0, device=env.device, dtype=torch.bool)
   returns = torch.zeros_like(survival)
-  for t in range(steps):
+  for t in range(horizon):
     obs, reward, done, _ = env.step(
       actor(obs),
       process_noise=torch.randn(samples, 70, device=env.device, generator=generator),
@@ -80,17 +77,19 @@ def _rollout(actor, env, start, horizon, samples, gamma, generator):
       ),
     )
     returns += gamma**t * survival * reward
-    continuation = (1 - done) * (remaining > t + 1)
+    continuation = 1 - done
     survival *= continuation
     # A product of positive continuations can underflow before a path ends.
     live_tail &= continuation > 0
   return {
-    "steps": steps,
-    "clip_horizon_reached": steps == remaining,
+    "steps": horizon,
+    "clip_horizon_reached": bool(
+      (start.motion_times + horizon - 1 >= last_frame).item()
+    ),
     "return_samples": returns.tolist(),
     "return_mean": float(returns.mean()),
     "samples_with_unscored_tail": int(live_tail.sum()),
-    "discounted_tail_weight_mean": float(gamma**steps * survival.mean()),
+    "discounted_tail_weight_mean": float(gamma**horizon * survival.mean()),
   }
 
 

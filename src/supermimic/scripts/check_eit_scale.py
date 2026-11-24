@@ -20,7 +20,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import mjlab.tasks  # noqa: F401
-import numpy as np
 import torch
 import warp as wp
 from mjlab.tasks.registry import load_env_cfg
@@ -73,8 +72,6 @@ def main():
     < 1
   ):
     parser.error("Sizes and repetitions must be positive")
-  if max(args.horizons) > 32:
-    parser.error("Generated reference supports at most 32 scoring actions")
   torch.set_num_threads(1)
   torch.manual_seed(2026)
   torch.compiler.set_stance("force_eager")
@@ -89,15 +86,7 @@ def main():
 
   with tempfile.TemporaryDirectory(prefix="supermimic-eit-scale-") as directory:
     motion_path = Path(directory) / "motion.npz"
-    stationary_motion(motion_path)
-    with np.load(motion_path) as source:
-      expanded = {
-        name: np.tile(source[name], (4,) + (1,) * (source[name].ndim - 1))
-        if source[name].ndim
-        else source[name]
-        for name in source.files
-      }
-    np.savez(motion_path, **expanded)
+    stationary_motion(motion_path, frames=32)
     cfg = load_env_cfg("SuperMimic-GenCoord-G1")
     cfg.commands["motion"].motion_file = str(motion_path)
     cfg.commands["motion"].sampling_mode = "start"
@@ -151,10 +140,8 @@ def main():
 
       policy = learner(base_cfg)
       frames = runner.replay_buffer.retained_frames()
-      heads = frames[frames["motion_time"] == 0]
-      assert len(heads), "Need retained clip-head frames for complete H-step timing"
-      selected = torch.arange(args.batch_size, device=args.device) % len(heads)
-      keys = (heads["episode_id"][selected], heads["time_index"][selected])
+      selected = torch.arange(args.batch_size, device=args.device) % len(frames)
+      keys = (frames["episode_id"][selected], frames["time_index"][selected])
       sync()
       begin = time.perf_counter()
       starts = runner.wm_env.prepare_policy_starts(*keys)
