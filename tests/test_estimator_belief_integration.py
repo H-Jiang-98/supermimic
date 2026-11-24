@@ -558,7 +558,7 @@ def test_training_segments_follow_overwrites_and_independent_resets(monkeypatch)
   template = buffer._storage[:, 0].clone()
   ids = torch.arange(BATCH)
   times = torch.zeros_like(ids)
-  action = torch.zeros(BATCH, 29)
+  action = template["action"].clone()
   for k in range(1, 7):
     record = template.clone()
     record["prev_action"] = action

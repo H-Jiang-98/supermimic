@@ -489,6 +489,7 @@ def test_invalid_heldout_frame_preserves_published_round_and_can_resume(tmp_path
     slot = (replay._step - 2) % replay.buffer_size
     assert replay._storage["episode_id"][0, slot] % 2 == 0
     replay._storage["state"][0, slot, 7] = float("nan")
+    replay.validate_contents()  # Explicit audit after bypassing the write boundary.
     seal()
 
   with (

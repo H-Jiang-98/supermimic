@@ -158,14 +158,23 @@ async def run_queue(gpu: int, commands: list[list[str]], environment: Path):
     ("CUBLAS_WORKSPACE_CONFIG", ":4096:8"),
   ):
     env.setdefault(key, value)
+  # Replay validation/indexing grows until the ring fills. Expandable segments
+  # reuse memory for changing sizes while the policy graph retains its private pool.
+  # Honor either spelling of an explicitly configured PyTorch allocator.
   setup = environment / "env.sh"
+  if not setup.is_file() and not any(
+    key in env for key in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")
+  ):
+    env["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
   for command in commands:
     print(f"GPU {gpu}  {shlex.join(command)}", flush=True)
     if setup.is_file():
       command = [
         "bash",
         "-c",
-        'source "$1" && shift && exec "$@"',
+        'source "$1" && shift && '
+        "if [[ ! -v PYTORCH_ALLOC_CONF && ! -v PYTORCH_CUDA_ALLOC_CONF ]]; then "
+        'export PYTORCH_ALLOC_CONF=expandable_segments:True; fi && exec "$@"',
         "eit",
         str(setup),
         *command,

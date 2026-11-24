@@ -11,7 +11,7 @@ from supermimic.posterior_replay import (
   unpack_belief,
 )
 from supermimic.utils.lie_state import LieState
-from supermimic.utils.validation import validate_rotation
+from supermimic.utils.validation import rotation_valid
 
 MODEL_REPLAY_FIELDS = frozenset(
   ("state", "action", "sim_ctx", "episode_id", "time_index", "terminated", "truncated")
@@ -225,6 +225,56 @@ class ReplayBuffer:
     ):
       raise ValueError("Executed action disagrees with the successor's previous action")
 
+  @torch.no_grad()
+  def _validate_frame(self, frame: TensorDict, previous: TensorDict | None = None):
+    """Validate one stored-dtype frame and its newly recorded successor edge."""
+    invalid = {}
+    for field in ("state", "action", "sim_ctx"):
+      if field in frame.keys():
+        invalid[f"Non-finite replay {field}"] = ~torch.isfinite(frame[field]).all()
+    if "episode_id" in frame.keys():
+      invalid["Invalid replay state rotation"] = ~rotation_valid(
+        LieState.from_full(frame["state"]).rotation
+      ).all()
+      if self.replay_mode == "full":
+        invalid["Recorded sensor action disagrees with the previous action"] = (
+          frame["actor_obs"][..., 64:] != frame["prev_action"]
+        ).any()
+      if previous is not None:
+        consecutive = (
+          (previous["episode_id"] == frame["episode_id"])
+          & (previous["time_index"] + 1 == frame["time_index"])
+          & ~(previous["terminated"] | previous["truncated"])
+        )
+        if self.replay_mode == "full":
+          invalid["Executed action disagrees with the successor's previous action"] = (
+            consecutive & (previous["action"] != frame["prev_action"]).any(dim=-1)
+          ).any()
+        invalid["Inconsistent simulation context across a replay transition"] = (
+          consecutive & (previous["sim_ctx"] != frame["sim_ctx"]).any(dim=-1)
+        ).any()
+    if invalid:
+      flags = torch.stack(tuple(invalid.values()))
+      # One host decision on the success path, irrespective of replay length.
+      if flags.any():
+        raise ValueError(tuple(invalid)[flags.tolist().index(True)])
+
+  @torch.no_grad()
+  def validate_contents(self) -> None:
+    """Explicit numerical/edge audit for debugging private storage mutations.
+
+    Normal collection validates at insert. Read APIs return independent data.
+    Use this to diagnose out-of-band numerical corruption of private storage;
+    it neither rebuilds metadata indexes nor draws random priors.
+    The scan is bounded to one frame at a time.
+    """
+    base = self._step if self.num_transitions == self.buffer_size else 0
+    previous = None
+    for age in range(self.num_transitions):
+      frame = self._storage[:, (base + age) % self.buffer_size]
+      self._validate_frame(frame, previous)
+      previous = frame
+
   def insert(
     self,
     td: TensorDict,
@@ -247,6 +297,23 @@ class ReplayBuffer:
       target = self._storage[name][:, self._step]
       if value.shape != target.shape:
         raise ValueError(f"Invalid replay field shape for {name}")
+    # Check the values that will actually be stored (including cast overflow),
+    # before changing the ring, posterior cache, head priors or commit token.
+    td = TensorDict(
+      {
+        name: value.to(
+          device=self._storage[name].device, dtype=self._storage[name].dtype
+        )
+        for name, value in td.items()
+      },
+      batch_size=td.batch_size,
+    )
+    previous = (
+      self._storage[:, (self._step - 1) % self.buffer_size]
+      if self.num_transitions
+      else None
+    )
+    self._validate_frame(td, previous)
     if isinstance(head_priors, RecordedEpisodeHeads):
       # Contents were validated and detached before env.step. Check the identity
       # again at commit without another full covariance eigendecomposition.
@@ -298,7 +365,7 @@ class ReplayBuffer:
 
   @torch.no_grad()
   def _sealed_round(self) -> _ReplayRound:
-    """Validate and index retained transitions once per sealed collection round."""
+    """Index already-validated transitions once per sealed collection round."""
     if self._round_index is not None:
       return self._round_index
     if "episode_id" not in self._storage.keys() or not self.num_transitions:
@@ -309,28 +376,9 @@ class ReplayBuffer:
     ) % self.buffer_size
     episodes = self._storage["episode_id"][:, slots]
     n = self.num_transitions
-    for field in ("state", "action", "sim_ctx"):
-      if not torch.isfinite(self._storage[field][:, :n]).all():
-        raise ValueError(f"Non-finite replay {field}")
-    # Compare only recorded physical successors, including the pair across wrap.
+    # Numerical and adjacent-frame invariants were checked before each commit.
+    # Sealing only rebuilds the episode/window index from retained metadata.
     successors = self._recorded_successors(slots, episodes)
-    rows, ages = successors.nonzero(as_tuple=True)
-    current, successor = slots[ages], slots[ages + 1]
-    if self.replay_mode == "full":
-      previous_actions = self._storage["prev_action"]
-      if not torch.equal(
-        self._storage["actor_obs"][:, :n, 64:], previous_actions[:, :n]
-      ):
-        raise ValueError("Recorded sensor action disagrees with the previous action")
-      if not torch.equal(
-        self._storage["action"][rows, current], previous_actions[rows, successor]
-      ):
-        raise ValueError(
-          "Executed action disagrees with the successor's previous action"
-        )
-    context = self._storage["sim_ctx"]
-    if not torch.equal(context[rows, current], context[rows, successor]):
-      raise ValueError("Inconsistent simulation context across a replay transition")
 
     begins = torch.ones_like(episodes, dtype=torch.bool)
     begins[:, 1:] = episodes[:, 1:] != episodes[:, :-1]
@@ -347,10 +395,6 @@ class ReplayBuffer:
     episode_lengths = dict(sorted(zip(ids, lengths.tolist(), strict=True)))
     if self.replay_mode == "full" and self.posterior_cache is None:
       self._realize_training_heads(rows, slots[ages], ids)
-    else:
-      # Full replay checks these rotations when drawing the segment priors.
-      head_states = self._storage["state"][rows, slots[ages]]
-      validate_rotation(LieState.from_full(head_states).rotation)
     self._round_index = _ReplayRound(slots, episodes, successors, episode_lengths)
     return self._round_index
 

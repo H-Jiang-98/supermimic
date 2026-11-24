@@ -25,16 +25,42 @@ def config():
   }
 
 
-def test_launch_shared_seeds_and_gpu_queues(config, tmp_path):
+@pytest.mark.parametrize(
+  "allocator_env,from_setup",
+  [
+    (None, False),
+    ("PYTORCH_ALLOC_CONF", False),
+    ("PYTORCH_CUDA_ALLOC_CONF", False),
+    ("PYTORCH_ALLOC_CONF", True),
+    ("PYTORCH_CUDA_ALLOC_CONF", True),
+  ],
+)
+def test_launch_shared_seeds_and_gpu_queues(
+  config, tmp_path, monkeypatch, allocator_env, from_setup
+):
+  for key in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"):
+    monkeypatch.delenv(key, raising=False)
+  if allocator_env is not None and not from_setup:
+    monkeypatch.setenv(allocator_env, "expandable_segments:False")
+  expected_allocator = {
+    allocator_env or "PYTORCH_ALLOC_CONF": (
+      "expandable_segments:False" if allocator_env else "expandable_segments:True"
+    )
+  }
   environment, motion, phases = plan(config, tmp_path)
   assert motion == tmp_path / "data/motions/*.npz"
   python = environment / ".venv/bin/python"
   python.parent.mkdir(parents=True)
-  (environment / "env.sh").write_text(f"export EIT_TEST_DIR={tmp_path}\n")
+  setup = f"export EIT_TEST_DIR={tmp_path}\n"
+  if from_setup:
+    setup += f"export {allocator_env}=expandable_segments:False\n"
+  (environment / "env.sh").write_text(setup)
   # A tiny worker claims its physical card for the life of the process. A
   # second worker on the same card would fail the exclusive file creation.
   python.write_text(
     f"#!{sys.executable}\n"
+    + "import os\nassert {k: os.environ[k] for k in "
+    + f"('PYTORCH_ALLOC_CONF', 'PYTORCH_CUDA_ALLOC_CONF') if k in os.environ}} == {expected_allocator!r}\n"
     + """
 import json, os, sys, time
 from pathlib import Path

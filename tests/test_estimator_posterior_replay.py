@@ -343,6 +343,7 @@ def test_custom_correlated_head_preserves_float32_factor_exactly():
   b.covariance_sqrt[:, 1, 0] = 0.25
   b.mean.position.fill_(1.001)
   frame = replay._storage[:, 0].clone()
+  frame["state"][:, 3] = 1  # Valid identity quaternion at the write boundary.
   frame["episode_id"] = torch.arange(3)
   replay.insert(
     frame,

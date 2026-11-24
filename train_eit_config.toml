@@ -5,12 +5,12 @@ environment_root = "/mnt/cpfs/zbl-cpfs-new/USERS/leojiang/supermimic_ws" # 使�
 dataset_root = "/mnt/cpfs/zbl-cpfs-new/dataset/leojiang/supermimic_ws"
 motion_file = "motions/*.npz" # 相对 dataset_root，也可用 "motions/*.npz"
 checkpoint_root = "/mnt/cpfs/zbl-cpfs-new/CKPT/leojiang/supermimic_ws"
-experiment = "eit_v6_Lafan_compiled_plc_micb_1024" # 输出：checkpoint_root/experiment/seed<seed>/<方法>/
+experiment = "eit_v6_Lafan_compiled_h32_2048envs_stride1" # 输出：checkpoint_root/experiment/seed<seed>/<方法>/
 
 [training]
 jacobian_backend = "increment" # 35 维网络增量求导，再通过积分组装 70x70 Jacobian。
 eager = false # CUDA 默认编译训练热点，true 用于 eager 对照。
-policy_cuda_graphs = false # 显式启用 actor rollout/backward replay；尾批整次回退，eager=true 关闭。
+policy_cuda_graphs = true # 显式启用 actor rollout/backward replay；尾批整次回退，eager=true 关闭。
 num_envs = 2048
 max_iterations = 300_000 # 每个环境的累计物理步数
 buffer_size = 1000
@@ -18,7 +18,7 @@ replay_ratio = 16
 sampling_mode = "return"
 log_interval = 10
 save_interval = 1000
-posterior_save_stride = 2
+posterior_save_stride = 1
 
 mean_lr = 2e-4
 mean_updates = 10

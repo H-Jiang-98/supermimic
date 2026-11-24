@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 from time import perf_counter
 
@@ -78,12 +79,32 @@ def runtime_metadata(parameter, *, reset_peak=False):
     "cuda_peak_reserved_bytes": None,
     "cuda_allocated_bytes": None,
     "cuda_reserved_bytes": None,
+    "cuda_allocator_backend": None,
+    "cuda_allocator_config": None,
+    "cuda_active_bytes": None,
+    "cuda_inactive_split_bytes": None,
+    "cuda_allocation_retries": None,
+    "cuda_ooms": None,
+    "cuda_free_bytes": None,
+    "cuda_total_bytes": None,
   }
   if device.type == "cuda":
     torch.cuda.synchronize(device)
     if reset_peak:
       torch.cuda.reset_peak_memory_stats(device)
+    stats = torch.cuda.memory_stats(device)
+    free, total = torch.cuda.mem_get_info(device)
     result.update(
+      cuda_allocator_backend=torch.cuda.get_allocator_backend(),
+      cuda_allocator_config=os.environ.get(
+        "PYTORCH_ALLOC_CONF", os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
+      ),
+      cuda_active_bytes=stats.get("active_bytes.all.current", 0),
+      cuda_inactive_split_bytes=stats.get("inactive_split_bytes.all.current", 0),
+      cuda_allocation_retries=stats.get("num_alloc_retries", 0),
+      cuda_ooms=stats.get("num_ooms", 0),
+      cuda_free_bytes=free,
+      cuda_total_bytes=total,
       device_name=torch.cuda.get_device_name(device),
       cuda_peak_allocated_bytes=torch.cuda.max_memory_allocated(device),
       cuda_peak_reserved_bytes=torch.cuda.max_memory_reserved(device),

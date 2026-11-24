@@ -1,0 +1,2775 @@
+{
+  "date": "2026-11-25",
+  "source_head": "3ee558edb84d556750519dfbb6f19ecc36bd2ec3",
+  "scope": "Remote supermimic; A production-size runs. A/B/C covered by GPU graph parity tests.",
+  "finding": "Growing replay finite-value scans accumulate differently sized reusable segments in the native allocator. A fixed policy graph private pool retains about 49 GiB in addition. This is cached reservation growth, not tens of GiB of live autograd tensors.",
+  "limitation": "Original exception trace was not saved. The fresh native 1050-step run recovered twice through allocator cache flushing and did not throw OOM; the historical terminal OOM stack is not established.",
+  "configuration": {
+    "jacobian_backend": "increment",
+    "eager": false,
+    "policy_cuda_graphs": true,
+    "num_envs": 2048,
+    "max_iterations": 300000,
+    "buffer_size": 1000,
+    "replay_ratio": 16,
+    "sampling_mode": "return",
+    "log_interval": 10,
+    "save_interval": 1000,
+    "posterior_save_stride": 4,
+    "mean_lr": 0.0002,
+    "mean_updates": 10,
+    "mean_batch_size": 2048,
+    "mean_window_frames": 8,
+    "cov_lr": 0.0002,
+    "cov_batch_size": 8192,
+    "cov_validation_pairs": 8192,
+    "policy_lr": 0.0002,
+    "critic_lr": 0.0002,
+    "policy_updates": 1,
+    "policy_batch_size": 2048,
+    "policy_microbatch_size": 1024,
+    "policy_horizon": 32,
+    "samples": 1,
+    "critic_epochs": 5,
+    "critic_minibatches": 4,
+    "exploration": 0.0,
+    "hidden_dims": [
+      2048,
+      2048,
+      2048
+    ],
+    "actor_hidden_dims": [
+      2048,
+      1024,
+      512,
+      256
+    ],
+    "critic_hidden_dims": [
+      256,
+      128
+    ],
+    "jacobian_batch_chunk_size": 512
+  },
+  "probe_overrides": {
+    "group": "A",
+    "seed": 2027,
+    "max_iterations": 1050,
+    "save_interval": 10000,
+    "wandb": "disabled",
+    "memory_history": true
+  },
+  "original_runs": [
+    {
+      "path": "/mnt/cpfs/zbl-cpfs-new/CKPT/leojiang/supermimic_ws/eit_v6_Lafan_compiled_h32_2048envs/seed2027/A/profiling.jsonl",
+      "last_step": 900,
+      "last_runtime": {
+        "device": "cuda:0",
+        "dtype": "torch.float32",
+        "cpu_threads": 1,
+        "cpu_interop_threads": 90,
+        "torch_version": "2.14.0+cu130",
+        "cuda_synchronized": true,
+        "cuda_peak_allocated_bytes": 65376051712,
+        "cuda_peak_reserved_bytes": 99025420288,
+        "cuda_allocated_bytes": 14571983360,
+        "cuda_reserved_bytes": 98165587968,
+        "device_name": "NVIDIA RPBZZZ6",
+        "policy_cuda_graph": {
+          "requested": true,
+          "scope": "actor_critic",
+          "reason": "enabled",
+          "warmup_calls": 3,
+          "replay_calls": 176,
+          "captures": 1,
+          "warmup_seconds": 78.85500227380544,
+          "capture_seconds": 9.424827107228339
+        },
+        "eit_execution": "inductor",
+        "compile_seconds_total": 107.795131876,
+        "compiled_graphs_total": 19
+      },
+      "max_logged_reserved_bytes": 98631155712
+    },
+    {
+      "path": "/mnt/cpfs/zbl-cpfs-new/CKPT/leojiang/supermimic_ws/eit_v6_Lafan_compiled_h32_2048envs/seed2027/B/profiling.jsonl",
+      "last_step": 670,
+      "last_runtime": {
+        "device": "cuda:0",
+        "dtype": "torch.float32",
+        "cpu_threads": 1,
+        "cpu_interop_threads": 90,
+        "torch_version": "2.14.0+cu130",
+        "cuda_synchronized": true,
+        "cuda_peak_allocated_bytes": 65403838464,
+        "cuda_peak_reserved_bytes": 98796830720,
+        "cuda_allocated_bytes": 14461253632,
+        "cuda_reserved_bytes": 69998739456,
+        "device_name": "NVIDIA RPBZZZ6",
+        "policy_cuda_graph": {
+          "requested": true,
+          "scope": "actor_critic",
+          "reason": "enabled",
+          "warmup_calls": 3,
+          "replay_calls": 130,
+          "captures": 1,
+          "warmup_seconds": 126.39543824130669,
+          "capture_seconds": 11.13549954816699
+        },
+        "eit_execution": "inductor",
+        "compile_seconds_total": 144.80439567899998,
+        "compiled_graphs_total": 19
+      },
+      "max_logged_reserved_bytes": 98796830720
+    },
+    {
+      "path": "/mnt/cpfs/zbl-cpfs-new/CKPT/leojiang/supermimic_ws/eit_v6_Lafan_compiled_h32_2048envs/seed2027/C/profiling.jsonl",
+      "last_step": 660,
+      "last_runtime": {
+        "device": "cuda:0",
+        "dtype": "torch.float32",
+        "cpu_threads": 1,
+        "cpu_interop_threads": 90,
+        "torch_version": "2.14.0+cu130",
+        "cuda_synchronized": true,
+        "cuda_peak_allocated_bytes": 66671173120,
+        "cuda_peak_reserved_bytes": 98020884480,
+        "cuda_allocated_bytes": 14469081088,
+        "cuda_reserved_bytes": 98020884480,
+        "device_name": "NVIDIA RPBZZZ6",
+        "policy_cuda_graph": {
+          "requested": true,
+          "scope": "actor_critic",
+          "reason": "enabled",
+          "warmup_calls": 3,
+          "replay_calls": 128,
+          "captures": 1,
+          "warmup_seconds": 126.70969301322475,
+          "capture_seconds": 11.512646190822124
+        },
+        "eit_execution": "inductor",
+        "compile_seconds_total": 144.688716015,
+        "compiled_graphs_total": 19
+      },
+      "max_logged_reserved_bytes": 98020884480
+    },
+    {
+      "path": "/mnt/cpfs/zbl-cpfs-new/CKPT/leojiang/supermimic_ws/eit_v6_Lafan_compiled_h32_2048envs_stride4/seed2027/A/profiling.jsonl",
+      "last_step": 680,
+      "last_runtime": {
+        "device": "cuda:0",
+        "dtype": "torch.float32",
+        "cpu_threads": 1,
+        "cpu_interop_threads": 90,
+        "torch_version": "2.14.0+cu130",
+        "cuda_synchronized": true,
+        "cuda_peak_allocated_bytes": 60127856128,
+        "cuda_peak_reserved_bytes": 95407833088,
+        "cuda_allocated_bytes": 9228654080,
+        "cuda_reserved_bytes": 95407833088,
+        "device_name": "NVIDIA RPBZZZ6",
+        "policy_cuda_graph": {
+          "requested": true,
+          "scope": "actor_critic",
+          "reason": "enabled",
+          "warmup_calls": 3,
+          "replay_calls": 132,
+          "captures": 1,
+          "warmup_seconds": 33.36350546404719,
+          "capture_seconds": 9.840444021858275
+        },
+        "eit_execution": "inductor",
+        "compile_seconds_total": 34.402360645,
+        "compiled_graphs_total": 20
+      },
+      "max_logged_reserved_bytes": 95407833088
+    },
+    {
+      "path": "/mnt/cpfs/zbl-cpfs-new/CKPT/leojiang/supermimic_ws/eit_v6_Lafan_compiled_h32_2048envs_stride4/seed2027/B/profiling.jsonl",
+      "last_step": 520,
+      "last_runtime": {
+        "device": "cuda:0",
+        "dtype": "torch.float32",
+        "cpu_threads": 1,
+        "cpu_interop_threads": 90,
+        "torch_version": "2.14.0+cu130",
+        "cuda_synchronized": true,
+        "cuda_peak_allocated_bytes": 60154770432,
+        "cuda_peak_reserved_bytes": 80018931712,
+        "cuda_allocated_bytes": 9132586496,
+        "cuda_reserved_bytes": 80018931712,
+        "device_name": "NVIDIA RPBZZZ6",
+        "policy_cuda_graph": {
+          "requested": true,
+          "scope": "actor_critic",
+          "reason": "enabled",
+          "warmup_calls": 3,
+          "replay_calls": 100,
+          "captures": 1,
+          "warmup_seconds": 36.27399623673409,
+          "capture_seconds": 11.199718273244798
+        },
+        "eit_execution": "inductor",
+        "compile_seconds_total": 34.364368461,
+        "compiled_graphs_total": 20
+      },
+      "max_logged_reserved_bytes": 80018931712
+    },
+    {
+      "path": "/mnt/cpfs/zbl-cpfs-new/CKPT/leojiang/supermimic_ws/eit_v6_Lafan_compiled_h32_2048envs_stride4/seed2027/C/profiling.jsonl",
+      "last_step": 510,
+      "last_runtime": {
+        "device": "cuda:0",
+        "dtype": "torch.float32",
+        "cpu_threads": 1,
+        "cpu_interop_threads": 90,
+        "torch_version": "2.14.0+cu130",
+        "cuda_synchronized": true,
+        "cuda_peak_allocated_bytes": 61420439040,
+        "cuda_peak_reserved_bytes": 78334918656,
+        "cuda_allocated_bytes": 9133421568,
+        "cuda_reserved_bytes": 78334918656,
+        "device_name": "NVIDIA RPBZZZ6",
+        "policy_cuda_graph": {
+          "requested": true,
+          "scope": "actor_critic",
+          "reason": "enabled",
+          "warmup_calls": 3,
+          "replay_calls": 98,
+          "captures": 1,
+          "warmup_seconds": 37.90816009789705,
+          "capture_seconds": 10.478040262125432
+        },
+        "eit_execution": "inductor",
+        "compile_seconds_total": 34.049893154,
+        "compiled_graphs_total": 20
+      },
+      "max_logged_reserved_bytes": 78334918656
+    }
+  ],
+  "reproductions": {
+    "native-long2": {
+      "samples": [
+        {
+          "step": 10,
+          "allocated_bytes.all.current": 8269857280,
+          "reserved_bytes.all.current": 9634316288,
+          "inactive_split_bytes.all.current": 89390592,
+          "active_bytes.all.current": 8269857280,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 91175452672,
+          "heads": 21143616
+        },
+        {
+          "step": 20,
+          "allocated_bytes.all.current": 8821956608,
+          "reserved_bytes.all.current": 63067652096,
+          "inactive_split_bytes.all.current": 806068224,
+          "active_bytes.all.current": 8821956608,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 37626707968,
+          "heads": 23315344
+        },
+        {
+          "step": 30,
+          "allocated_bytes.all.current": 8830266880,
+          "reserved_bytes.all.current": 62618861568,
+          "inactive_split_bytes.all.current": 804049408,
+          "active_bytes.all.current": 8830266880,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 36542480384,
+          "heads": 30445168
+        },
+        {
+          "step": 40,
+          "allocated_bytes.all.current": 8837277184,
+          "reserved_bytes.all.current": 63667437568,
+          "inactive_split_bytes.all.current": 797039104,
+          "active_bytes.all.current": 8837277184,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 35493904384,
+          "heads": 37534016
+        },
+        {
+          "step": 50,
+          "allocated_bytes.all.current": 8844327936,
+          "reserved_bytes.all.current": 63675826176,
+          "inactive_split_bytes.all.current": 789988352,
+          "active_bytes.all.current": 8844327936,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 35485515776,
+          "heads": 44397496
+        },
+        {
+          "step": 60,
+          "allocated_bytes.all.current": 8851771392,
+          "reserved_bytes.all.current": 63682117632,
+          "inactive_split_bytes.all.current": 782544896,
+          "active_bytes.all.current": 8851771392,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 35479224320,
+          "heads": 51650248
+        },
+        {
+          "step": 70,
+          "allocated_bytes.all.current": 8857799680,
+          "reserved_bytes.all.current": 63688409088,
+          "inactive_split_bytes.all.current": 778613760,
+          "active_bytes.all.current": 8857799680,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 35472932864,
+          "heads": 57622500
+        },
+        {
+          "step": 80,
+          "allocated_bytes.all.current": 8864541696,
+          "reserved_bytes.all.current": 63694700544,
+          "inactive_split_bytes.all.current": 769774592,
+          "active_bytes.all.current": 8864541696,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 35466641408,
+          "heads": 63676704
+        },
+        {
+          "step": 90,
+          "allocated_bytes.all.current": 8869827072,
+          "reserved_bytes.all.current": 63698894848,
+          "inactive_split_bytes.all.current": 772877824,
+          "active_bytes.all.current": 8869827072,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 35462447104,
+          "heads": 69679688
+        },
+        {
+          "step": 100,
+          "allocated_bytes.all.current": 8875788800,
+          "reserved_bytes.all.current": 63707283456,
+          "inactive_split_bytes.all.current": 773207552,
+          "active_bytes.all.current": 8875788800,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 35454058496,
+          "heads": 75406084
+        },
+        {
+          "step": 110,
+          "allocated_bytes.all.current": 8881924608,
+          "reserved_bytes.all.current": 63711477760,
+          "inactive_split_bytes.all.current": 773363200,
+          "active_bytes.all.current": 8881924608,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 35449864192,
+          "heads": 81450044
+        },
+        {
+          "step": 120,
+          "allocated_bytes.all.current": 8889205760,
+          "reserved_bytes.all.current": 63719866368,
+          "inactive_split_bytes.all.current": 770276352,
+          "active_bytes.all.current": 8889205760,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 35441475584,
+          "heads": 87616932
+        },
+        {
+          "step": 130,
+          "allocated_bytes.all.current": 8893945856,
+          "reserved_bytes.all.current": 63724060672,
+          "inactive_split_bytes.all.current": 773924864,
+          "active_bytes.all.current": 8893945856,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 35437281280,
+          "heads": 93404792
+        },
+        {
+          "step": 140,
+          "allocated_bytes.all.current": 8900881920,
+          "reserved_bytes.all.current": 63730352128,
+          "inactive_split_bytes.all.current": 773280256,
+          "active_bytes.all.current": 8900881920,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 35430989824,
+          "heads": 99581924
+        },
+        {
+          "step": 150,
+          "allocated_bytes.all.current": 8906993664,
+          "reserved_bytes.all.current": 63736643584,
+          "inactive_split_bytes.all.current": 773459968,
+          "active_bytes.all.current": 8906993664,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 35424698368,
+          "heads": 105287832
+        },
+        {
+          "step": 160,
+          "allocated_bytes.all.current": 8912507392,
+          "reserved_bytes.all.current": 63742935040,
+          "inactive_split_bytes.all.current": 776334848,
+          "active_bytes.all.current": 8912507392,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 35418406912,
+          "heads": 111383012
+        },
+        {
+          "step": 170,
+          "allocated_bytes.all.current": 8919098368,
+          "reserved_bytes.all.current": 63747129344,
+          "inactive_split_bytes.all.current": 776035328,
+          "active_bytes.all.current": 8919098368,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 35414212608,
+          "heads": 117334776
+        },
+        {
+          "step": 180,
+          "allocated_bytes.all.current": 8925593600,
+          "reserved_bytes.all.current": 63753420800,
+          "inactive_split_bytes.all.current": 775831552,
+          "active_bytes.all.current": 8925593600,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 35407921152,
+          "heads": 123071416
+        },
+        {
+          "step": 190,
+          "allocated_bytes.all.current": 8931333120,
+          "reserved_bytes.all.current": 63761809408,
+          "inactive_split_bytes.all.current": 778480640,
+          "active_bytes.all.current": 8931333120,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 35399532544,
+          "heads": 128910496
+        },
+        {
+          "step": 200,
+          "allocated_bytes.all.current": 8938302976,
+          "reserved_bytes.all.current": 63766003712,
+          "inactive_split_bytes.all.current": 775705088,
+          "active_bytes.all.current": 8938302976,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 35395338240,
+          "heads": 135251532
+        },
+        {
+          "step": 210,
+          "allocated_bytes.all.current": 8944331264,
+          "reserved_bytes.all.current": 63772295168,
+          "inactive_split_bytes.all.current": 778065408,
+          "active_bytes.all.current": 8944331264,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 35389046784,
+          "heads": 141387688
+        },
+        {
+          "step": 220,
+          "allocated_bytes.all.current": 8950268416,
+          "reserved_bytes.all.current": 63778586624,
+          "inactive_split_bytes.all.current": 778419712,
+          "active_bytes.all.current": 8950268416,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 35382755328,
+          "heads": 147165304
+        },
+        {
+          "step": 230,
+          "allocated_bytes.all.current": 8956275200,
+          "reserved_bytes.all.current": 63784878080,
+          "inactive_split_bytes.all.current": 780801536,
+          "active_bytes.all.current": 8956275200,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 35376463872,
+          "heads": 153147800
+        },
+        {
+          "step": 240,
+          "allocated_bytes.all.current": 8962577408,
+          "reserved_bytes.all.current": 63789072384,
+          "inactive_split_bytes.all.current": 780790784,
+          "active_bytes.all.current": 8962577408,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 35372269568,
+          "heads": 159171272
+        },
+        {
+          "step": 250,
+          "allocated_bytes.all.current": 8968544768,
+          "reserved_bytes.all.current": 63795363840,
+          "inactive_split_bytes.all.current": 779017728,
+          "active_bytes.all.current": 8968544768,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 35365978112,
+          "heads": 165112792
+        },
+        {
+          "step": 260,
+          "allocated_bytes.all.current": 8974823936,
+          "reserved_bytes.all.current": 63801655296,
+          "inactive_split_bytes.all.current": 781127168,
+          "active_bytes.all.current": 8974823936,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 35359686656,
+          "heads": 171300168
+        },
+        {
+          "step": 270,
+          "allocated_bytes.all.current": 8980272128,
+          "reserved_bytes.all.current": 63807946752,
+          "inactive_split_bytes.all.current": 784067584,
+          "active_bytes.all.current": 8980272128,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 35353395200,
+          "heads": 177108516
+        },
+        {
+          "step": 280,
+          "allocated_bytes.all.current": 8988182016,
+          "reserved_bytes.all.current": 63977816064,
+          "inactive_split_bytes.all.current": 784546304,
+          "active_bytes.all.current": 8988182016,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 35183525888,
+          "heads": 183244672
+        },
+        {
+          "step": 290,
+          "allocated_bytes.all.current": 8994170368,
+          "reserved_bytes.all.current": 64487424000,
+          "inactive_split_bytes.all.current": 784849408,
+          "active_bytes.all.current": 8994170368,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 34673917952,
+          "heads": 189339852
+        },
+        {
+          "step": 300,
+          "allocated_bytes.all.current": 8999972864,
+          "reserved_bytes.all.current": 65015906304,
+          "inactive_split_bytes.all.current": 783241216,
+          "active_bytes.all.current": 8999972864,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 34145435648,
+          "heads": 195117468
+        },
+        {
+          "step": 310,
+          "allocated_bytes.all.current": 9005414400,
+          "reserved_bytes.all.current": 65380810752,
+          "inactive_split_bytes.all.current": 788285440,
+          "active_bytes.all.current": 9005414400,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 33780531200,
+          "heads": 201120452
+        },
+        {
+          "step": 320,
+          "allocated_bytes.all.current": 9011919872,
+          "reserved_bytes.all.current": 65940750336,
+          "inactive_split_bytes.all.current": 785974272,
+          "active_bytes.all.current": 9011919872,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 33220591616,
+          "heads": 207010752
+        },
+        {
+          "step": 330,
+          "allocated_bytes.all.current": 9018082304,
+          "reserved_bytes.all.current": 66517467136,
+          "inactive_split_bytes.all.current": 788200448,
+          "active_bytes.all.current": 9018082304,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 32643874816,
+          "heads": 213146908
+        },
+        {
+          "step": 340,
+          "allocated_bytes.all.current": 9024334336,
+          "reserved_bytes.all.current": 67117252608,
+          "inactive_split_bytes.all.current": 788239872,
+          "active_bytes.all.current": 9024334336,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 32044089344,
+          "heads": 219160136
+        },
+        {
+          "step": 350,
+          "allocated_bytes.all.current": 9030260736,
+          "reserved_bytes.all.current": 67731718144,
+          "inactive_split_bytes.all.current": 788604928,
+          "active_bytes.all.current": 9030260736,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 31429623808,
+          "heads": 225029948
+        },
+        {
+          "step": 360,
+          "allocated_bytes.all.current": 9035812352,
+          "reserved_bytes.all.current": 68155342848,
+          "inactive_split_bytes.all.current": 791441920,
+          "active_bytes.all.current": 9035812352,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 31005999104,
+          "heads": 230899760
+        },
+        {
+          "step": 370,
+          "allocated_bytes.all.current": 9041747968,
+          "reserved_bytes.all.current": 68803362816,
+          "inactive_split_bytes.all.current": 791797760,
+          "active_bytes.all.current": 9041747968,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 30357979136,
+          "heads": 236646644
+        },
+        {
+          "step": 380,
+          "allocated_bytes.all.current": 9047973376,
+          "reserved_bytes.all.current": 69470257152,
+          "inactive_split_bytes.all.current": 793960960,
+          "active_bytes.all.current": 9047973376,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 29691084800,
+          "heads": 242721336
+        },
+        {
+          "step": 390,
+          "allocated_bytes.all.current": 9054551040,
+          "reserved_bytes.all.current": 70153928704,
+          "inactive_split_bytes.all.current": 793674752,
+          "active_bytes.all.current": 9054551040,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 29007413248,
+          "heads": 248427244
+        },
+        {
+          "step": 400,
+          "allocated_bytes.all.current": 9059825152,
+          "reserved_bytes.all.current": 70623690752,
+          "inactive_split_bytes.all.current": 796789248,
+          "active_bytes.all.current": 9059825152,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 28537651200,
+          "heads": 254153640
+        },
+        {
+          "step": 410,
+          "allocated_bytes.all.current": 9066506752,
+          "reserved_bytes.all.current": 71340916736,
+          "inactive_split_bytes.all.current": 794301952,
+          "active_bytes.all.current": 9066506752,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 27820425216,
+          "heads": 260136136
+        },
+        {
+          "step": 420,
+          "allocated_bytes.all.current": 9072431616,
+          "reserved_bytes.all.current": 72079114240,
+          "inactive_split_bytes.all.current": 792571392,
+          "active_bytes.all.current": 9072431616,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 27082227712,
+          "heads": 265739604
+        },
+        {
+          "step": 430,
+          "allocated_bytes.all.current": 9078052864,
+          "reserved_bytes.all.current": 72831991808,
+          "inactive_split_bytes.all.current": 795338752,
+          "active_bytes.all.current": 9078052864,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 26329350144,
+          "heads": 271302096
+        },
+        {
+          "step": 440,
+          "allocated_bytes.all.current": 9083267072,
+          "reserved_bytes.all.current": 73605840896,
+          "inactive_split_bytes.all.current": 796416000,
+          "active_bytes.all.current": 9083267072,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 25555501056,
+          "heads": 276936296
+        },
+        {
+          "step": 450,
+          "allocated_bytes.all.current": 9090088448,
+          "reserved_bytes.all.current": 74134323200,
+          "inactive_split_bytes.all.current": 795886080,
+          "active_bytes.all.current": 9090088448,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 25027018752,
+          "heads": 282826596
+        },
+        {
+          "step": 460,
+          "allocated_bytes.all.current": 9095222272,
+          "reserved_bytes.all.current": 74937532416,
+          "inactive_split_bytes.all.current": 799140864,
+          "active_bytes.all.current": 9095222272,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 24223809536,
+          "heads": 288532504
+        },
+        {
+          "step": 470,
+          "allocated_bytes.all.current": 9101298688,
+          "reserved_bytes.all.current": 75761713152,
+          "inactive_split_bytes.all.current": 801453056,
+          "active_bytes.all.current": 9101298688,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 23399628800,
+          "heads": 294320364
+        },
+        {
+          "step": 480,
+          "allocated_bytes.all.current": 9107432448,
+          "reserved_bytes.all.current": 76604768256,
+          "inactive_split_bytes.all.current": 799513600,
+          "active_bytes.all.current": 9107432448,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 22556573696,
+          "heads": 299800904
+        },
+        {
+          "step": 490,
+          "allocated_bytes.all.current": 9112991232,
+          "reserved_bytes.all.current": 77177290752,
+          "inactive_split_bytes.all.current": 800246272,
+          "active_bytes.all.current": 9112991232,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 21984051200,
+          "heads": 305332664
+        },
+        {
+          "step": 500,
+          "allocated_bytes.all.current": 9119041536,
+          "reserved_bytes.all.current": 78051803136,
+          "inactive_split_bytes.all.current": 800487424,
+          "active_bytes.all.current": 9119041536,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 21109538816,
+          "heads": 311356136
+        },
+        {
+          "step": 510,
+          "allocated_bytes.all.current": 9123693056,
+          "reserved_bytes.all.current": 78945189888,
+          "inactive_split_bytes.all.current": 802127360,
+          "active_bytes.all.current": 9123693056,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 20216152064,
+          "heads": 316652284
+        },
+        {
+          "step": 520,
+          "allocated_bytes.all.current": 9130534400,
+          "reserved_bytes.all.current": 79855353856,
+          "inactive_split_bytes.all.current": 799480320,
+          "active_bytes.all.current": 9130534400,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 19305988096,
+          "heads": 322071360
+        },
+        {
+          "step": 530,
+          "allocated_bytes.all.current": 9136819200,
+          "reserved_bytes.all.current": 80474013696,
+          "inactive_split_bytes.all.current": 797389824,
+          "active_bytes.all.current": 9136819200,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 18687328256,
+          "heads": 327357264
+        },
+        {
+          "step": 540,
+          "allocated_bytes.all.current": 9141670400,
+          "reserved_bytes.all.current": 81415634944,
+          "inactive_split_bytes.all.current": 800927232,
+          "active_bytes.all.current": 9141670400,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 17745707008,
+          "heads": 332909512
+        },
+        {
+          "step": 550,
+          "allocated_bytes.all.current": 9148316160,
+          "reserved_bytes.all.current": 82378227712,
+          "inactive_split_bytes.all.current": 798475776,
+          "active_bytes.all.current": 9148316160,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 16783114240,
+          "heads": 338615420
+        },
+        {
+          "step": 560,
+          "allocated_bytes.all.current": 9152976896,
+          "reserved_bytes.all.current": 83359694848,
+          "inactive_split_bytes.all.current": 800106496,
+          "active_bytes.all.current": 9152976896,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 15801647104,
+          "heads": 343870592
+        },
+        {
+          "step": 570,
+          "allocated_bytes.all.current": 9158958080,
+          "reserved_bytes.all.current": 84360036352,
+          "inactive_split_bytes.all.current": 798319616,
+          "active_bytes.all.current": 9158958080,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 14801305600,
+          "heads": 349228204
+        },
+        {
+          "step": 580,
+          "allocated_bytes.all.current": 9164897792,
+          "reserved_bytes.all.current": 85037416448,
+          "inactive_split_bytes.all.current": 800768512,
+          "active_bytes.all.current": 9164897792,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 14123925504,
+          "heads": 354718988
+        },
+        {
+          "step": 590,
+          "allocated_bytes.all.current": 9171373568,
+          "reserved_bytes.all.current": 86067118080,
+          "inactive_split_bytes.all.current": 798487040,
+          "active_bytes.all.current": 9171373568,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 13094223872,
+          "heads": 359881964
+        },
+        {
+          "step": 600,
+          "allocated_bytes.all.current": 9176658432,
+          "reserved_bytes.all.current": 87119888384,
+          "inactive_split_bytes.all.current": 799493632,
+          "active_bytes.all.current": 9176658432,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 12041453568,
+          "heads": 365290796
+        },
+        {
+          "step": 610,
+          "allocated_bytes.all.current": 9181318656,
+          "reserved_bytes.all.current": 88187338752,
+          "inactive_split_bytes.all.current": 799027712,
+          "active_bytes.all.current": 9181318656,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 10974003200,
+          "heads": 370668896
+        },
+        {
+          "step": 620,
+          "allocated_bytes.all.current": 9187441152,
+          "reserved_bytes.all.current": 88912953344,
+          "inactive_split_bytes.all.current": 801293824,
+          "active_bytes.all.current": 9187441152,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 10248388608,
+          "heads": 375934312
+        },
+        {
+          "step": 630,
+          "allocated_bytes.all.current": 9192450048,
+          "reserved_bytes.all.current": 90013958144,
+          "inactive_split_bytes.all.current": 802576384,
+          "active_bytes.all.current": 9192450048,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 9147383808,
+          "heads": 381691440
+        },
+        {
+          "step": 640,
+          "allocated_bytes.all.current": 9197794304,
+          "reserved_bytes.all.current": 91131740160,
+          "inactive_split_bytes.all.current": 805620736,
+          "active_bytes.all.current": 9197794304,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 8029601792,
+          "heads": 387049052
+        },
+        {
+          "step": 650,
+          "allocated_bytes.all.current": 9203279872,
+          "reserved_bytes.all.current": 92270493696,
+          "inactive_split_bytes.all.current": 804329472,
+          "active_bytes.all.current": 9203279872,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 6890848256,
+          "heads": 392509104
+        },
+        {
+          "step": 660,
+          "allocated_bytes.all.current": 9210208256,
+          "reserved_bytes.all.current": 93426024448,
+          "inactive_split_bytes.all.current": 801595392,
+          "active_bytes.all.current": 9210208256,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 5735317504,
+          "heads": 398071596
+        },
+        {
+          "step": 670,
+          "allocated_bytes.all.current": 9214318592,
+          "reserved_bytes.all.current": 94210359296,
+          "inactive_split_bytes.all.current": 805873664,
+          "active_bytes.all.current": 9214318592,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 4950982656,
+          "heads": 403009204
+        },
+        {
+          "step": 680,
+          "allocated_bytes.all.current": 9220009984,
+          "reserved_bytes.all.current": 95401541632,
+          "inactive_split_bytes.all.current": 806473728,
+          "active_bytes.all.current": 9220009984,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 3759800320,
+          "heads": 408674136
+        },
+        {
+          "step": 690,
+          "allocated_bytes.all.current": 9226324480,
+          "reserved_bytes.all.current": 96605306880,
+          "inactive_split_bytes.all.current": 804353536,
+          "active_bytes.all.current": 9226324480,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 2556035072,
+          "heads": 414154676
+        },
+        {
+          "step": 700,
+          "allocated_bytes.all.current": 9231214080,
+          "reserved_bytes.all.current": 97832140800,
+          "inactive_split_bytes.all.current": 805755392,
+          "active_bytes.all.current": 9231214080,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 1329201152,
+          "heads": 419829852
+        },
+        {
+          "step": 710,
+          "allocated_bytes.all.current": 9237553664,
+          "reserved_bytes.all.current": 98660515840,
+          "inactive_split_bytes.all.current": 820387328,
+          "active_bytes.all.current": 9237553664,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "free": 500826112,
+          "heads": 425187464
+        },
+        {
+          "step": 720,
+          "allocated_bytes.all.current": 9242001408,
+          "reserved_bytes.all.current": 64315457536,
+          "inactive_split_bytes.all.current": 889339904,
+          "active_bytes.all.current": 9242001408,
+          "num_alloc_retries": 1,
+          "num_ooms": 0,
+          "free": 34845884416,
+          "heads": 430381172
+        },
+        {
+          "step": 730,
+          "allocated_bytes.all.current": 9248116736,
+          "reserved_bytes.all.current": 65592623104,
+          "inactive_split_bytes.all.current": 887418880,
+          "active_bytes.all.current": 9248116736,
+          "num_alloc_retries": 1,
+          "num_ooms": 0,
+          "free": 33568718848,
+          "heads": 435871956
+        },
+        {
+          "step": 740,
+          "allocated_bytes.all.current": 9253451776,
+          "reserved_bytes.all.current": 66888663040,
+          "inactive_split_bytes.all.current": 871598080,
+          "active_bytes.all.current": 9253451776,
+          "num_alloc_retries": 1,
+          "num_ooms": 0,
+          "free": 32272678912,
+          "heads": 441178348
+        },
+        {
+          "step": 750,
+          "allocated_bytes.all.current": 9258857472,
+          "reserved_bytes.all.current": 68201480192,
+          "inactive_split_bytes.all.current": 872483840,
+          "active_bytes.all.current": 9258857472,
+          "num_alloc_retries": 1,
+          "num_ooms": 0,
+          "free": 30959861760,
+          "heads": 446454008
+        },
+        {
+          "step": 760,
+          "allocated_bytes.all.current": 9265408000,
+          "reserved_bytes.all.current": 69088575488,
+          "inactive_split_bytes.all.current": 872224768,
+          "active_bytes.all.current": 9265408000,
+          "num_alloc_retries": 1,
+          "num_ooms": 0,
+          "free": 30072766464,
+          "heads": 451975524
+        },
+        {
+          "step": 770,
+          "allocated_bytes.all.current": 9270766080,
+          "reserved_bytes.all.current": 70434947072,
+          "inactive_split_bytes.all.current": 871060992,
+          "active_bytes.all.current": 9270766080,
+          "num_alloc_retries": 1,
+          "num_ooms": 0,
+          "free": 28726394880,
+          "heads": 457240940
+        },
+        {
+          "step": 780,
+          "allocated_bytes.all.current": 9275155968,
+          "reserved_bytes.all.current": 71800193024,
+          "inactive_split_bytes.all.current": 770202112,
+          "active_bytes.all.current": 9275155968,
+          "num_alloc_retries": 1,
+          "num_ooms": 0,
+          "free": 27361148928,
+          "heads": 462455136
+        },
+        {
+          "step": 790,
+          "allocated_bytes.all.current": 9280627200,
+          "reserved_bytes.all.current": 73182216192,
+          "inactive_split_bytes.all.current": 873782784,
+          "active_bytes.all.current": 9280627200,
+          "num_alloc_retries": 1,
+          "num_ooms": 0,
+          "free": 25979125760,
+          "heads": 467546404
+        },
+        {
+          "step": 800,
+          "allocated_bytes.all.current": 9286009344,
+          "reserved_bytes.all.current": 74115448832,
+          "inactive_split_bytes.all.current": 874692096,
+          "active_bytes.all.current": 9286009344,
+          "num_alloc_retries": 1,
+          "num_ooms": 0,
+          "free": 25045893120,
+          "heads": 472801576
+        },
+        {
+          "step": 810,
+          "allocated_bytes.all.current": 9291291648,
+          "reserved_bytes.all.current": 75531026432,
+          "inactive_split_bytes.all.current": 873604096,
+          "active_bytes.all.current": 9291291648,
+          "num_alloc_retries": 1,
+          "num_ooms": 0,
+          "free": 23630315520,
+          "heads": 477636744
+        },
+        {
+          "step": 820,
+          "allocated_bytes.all.current": 9297401856,
+          "reserved_bytes.all.current": 76963381248,
+          "inactive_split_bytes.all.current": 873785344,
+          "active_bytes.all.current": 9297401856,
+          "num_alloc_retries": 1,
+          "num_ooms": 0,
+          "free": 22197960704,
+          "heads": 482635816
+        },
+        {
+          "step": 830,
+          "allocated_bytes.all.current": 9303436800,
+          "reserved_bytes.all.current": 78414610432,
+          "inactive_split_bytes.all.current": 871944704,
+          "active_bytes.all.current": 9303436800,
+          "num_alloc_retries": 1,
+          "num_ooms": 0,
+          "free": 20746731520,
+          "heads": 488044648
+        },
+        {
+          "step": 840,
+          "allocated_bytes.all.current": 9308526080,
+          "reserved_bytes.all.current": 79396077568,
+          "inactive_split_bytes.all.current": 873146880,
+          "active_bytes.all.current": 9308526080,
+          "num_alloc_retries": 1,
+          "num_ooms": 0,
+          "free": 19765264384,
+          "heads": 493258844
+        },
+        {
+          "step": 850,
+          "allocated_bytes.all.current": 9313440768,
+          "reserved_bytes.all.current": 80880861184,
+          "inactive_split_bytes.all.current": 876620800,
+          "active_bytes.all.current": 9313440768,
+          "num_alloc_retries": 1,
+          "num_ooms": 0,
+          "free": 18280480768,
+          "heads": 498636944
+        },
+        {
+          "step": 860,
+          "allocated_bytes.all.current": 9318418944,
+          "reserved_bytes.all.current": 82384519168,
+          "inactive_split_bytes.all.current": 877934080,
+          "active_bytes.all.current": 9318418944,
+          "num_alloc_retries": 1,
+          "num_ooms": 0,
+          "free": 16776822784,
+          "heads": 503769188
+        },
+        {
+          "step": 870,
+          "allocated_bytes.all.current": 9323753984,
+          "reserved_bytes.all.current": 83904954368,
+          "inactive_split_bytes.all.current": 876793344,
+          "active_bytes.all.current": 9323753984,
+          "num_alloc_retries": 1,
+          "num_ooms": 0,
+          "free": 15256387584,
+          "heads": 508758016
+        },
+        {
+          "step": 880,
+          "allocated_bytes.all.current": 9330053632,
+          "reserved_bytes.all.current": 85444263936,
+          "inactive_split_bytes.all.current": 874688000,
+          "active_bytes.all.current": 9330053632,
+          "num_alloc_retries": 1,
+          "num_ooms": 0,
+          "free": 13717078016,
+          "heads": 514095140
+        },
+        {
+          "step": 890,
+          "allocated_bytes.all.current": 9334237184,
+          "reserved_bytes.all.current": 86484451328,
+          "inactive_split_bytes.all.current": 876795904,
+          "active_bytes.all.current": 9334237184,
+          "num_alloc_retries": 1,
+          "num_ooms": 0,
+          "free": 12676890624,
+          "heads": 518961040
+        },
+        {
+          "step": 900,
+          "allocated_bytes.all.current": 9339200000,
+          "reserved_bytes.all.current": 88055218176,
+          "inactive_split_bytes.all.current": 876027392,
+          "active_bytes.all.current": 9339200000,
+          "num_alloc_retries": 1,
+          "num_ooms": 0,
+          "free": 11106123776,
+          "heads": 523857672
+        },
+        {
+          "step": 910,
+          "allocated_bytes.all.current": 9345122816,
+          "reserved_bytes.all.current": 89644859392,
+          "inactive_split_bytes.all.current": 895270400,
+          "active_bytes.all.current": 9345122816,
+          "num_alloc_retries": 1,
+          "num_ooms": 0,
+          "free": 9516482560,
+          "heads": 529266504
+        },
+        {
+          "step": 920,
+          "allocated_bytes.all.current": 9349774848,
+          "reserved_bytes.all.current": 91257569280,
+          "inactive_split_bytes.all.current": 878035456,
+          "active_bytes.all.current": 9349774848,
+          "num_alloc_retries": 1,
+          "num_ooms": 0,
+          "free": 7903772672,
+          "heads": 534337284
+        },
+        {
+          "step": 930,
+          "allocated_bytes.all.current": 9354602496,
+          "reserved_bytes.all.current": 92341796864,
+          "inactive_split_bytes.all.current": 877402112,
+          "active_bytes.all.current": 9354602496,
+          "num_alloc_retries": 1,
+          "num_ooms": 0,
+          "free": 6819545088,
+          "heads": 538895864
+        },
+        {
+          "step": 940,
+          "allocated_bytes.all.current": 9359858176,
+          "reserved_bytes.all.current": 93979672576,
+          "inactive_split_bytes.all.current": 878437888,
+          "active_bytes.all.current": 9359858176,
+          "num_alloc_retries": 1,
+          "num_ooms": 0,
+          "free": 5181669376,
+          "heads": 544007620
+        },
+        {
+          "step": 950,
+          "allocated_bytes.all.current": 9364709376,
+          "reserved_bytes.all.current": 95640616960,
+          "inactive_split_bytes.all.current": 775020544,
+          "active_bytes.all.current": 9364709376,
+          "num_alloc_retries": 1,
+          "num_ooms": 0,
+          "free": 3520724992,
+          "heads": 549139864
+        },
+        {
+          "step": 960,
+          "allocated_bytes.all.current": 9371358720,
+          "reserved_bytes.all.current": 97320435712,
+          "inactive_split_bytes.all.current": 873228800,
+          "active_bytes.all.current": 9371358720,
+          "num_alloc_retries": 1,
+          "num_ooms": 0,
+          "free": 1840906240,
+          "heads": 554108204
+        },
+        {
+          "step": 970,
+          "allocated_bytes.all.current": 9376517120,
+          "reserved_bytes.all.current": 99019128832,
+          "inactive_split_bytes.all.current": 874361856,
+          "active_bytes.all.current": 9376517120,
+          "num_alloc_retries": 1,
+          "num_ooms": 0,
+          "free": 142213120,
+          "heads": 559199472
+        },
+        {
+          "step": 980,
+          "allocated_bytes.all.current": 9382031360,
+          "reserved_bytes.all.current": 64749568000,
+          "inactive_split_bytes.all.current": 772378624,
+          "active_bytes.all.current": 9382031360,
+          "num_alloc_retries": 2,
+          "num_ooms": 0,
+          "free": 34411773952,
+          "heads": 564352204
+        },
+        {
+          "step": 990,
+          "allocated_bytes.all.current": 9385915904,
+          "reserved_bytes.all.current": 66479718400,
+          "inactive_split_bytes.all.current": 772688384,
+          "active_bytes.all.current": 9385915904,
+          "num_alloc_retries": 2,
+          "num_ooms": 0,
+          "free": 32681623552,
+          "heads": 568808344
+        },
+        {
+          "step": 1000,
+          "allocated_bytes.all.current": 9391068672,
+          "reserved_bytes.all.current": 68228743168,
+          "inactive_split_bytes.all.current": 769632768,
+          "active_bytes.all.current": 9391068672,
+          "num_alloc_retries": 2,
+          "num_ooms": 0,
+          "free": 30932598784,
+          "heads": 573592292
+        },
+        {
+          "step": 1010,
+          "allocated_bytes.all.current": 9374649856,
+          "reserved_bytes.all.current": 68230840320,
+          "inactive_split_bytes.all.current": 769274368,
+          "active_bytes.all.current": 9374649856,
+          "num_alloc_retries": 2,
+          "num_ooms": 0,
+          "free": 30930501632,
+          "heads": 556976524
+        },
+        {
+          "step": 1020,
+          "allocated_bytes.all.current": 9375742976,
+          "reserved_bytes.all.current": 68235034624,
+          "inactive_split_bytes.all.current": 774472704,
+          "active_bytes.all.current": 9375742976,
+          "num_alloc_retries": 2,
+          "num_ooms": 0,
+          "free": 30926307328,
+          "heads": 559527280
+        },
+        {
+          "step": 1030,
+          "allocated_bytes.all.current": 9375257088,
+          "reserved_bytes.all.current": 68235034624,
+          "inactive_split_bytes.all.current": 772861440,
+          "active_bytes.all.current": 9375257088,
+          "num_alloc_retries": 2,
+          "num_ooms": 0,
+          "free": 30926307328,
+          "heads": 556945792
+        },
+        {
+          "step": 1040,
+          "allocated_bytes.all.current": 9372530176,
+          "reserved_bytes.all.current": 68235034624,
+          "inactive_split_bytes.all.current": 775588352,
+          "active_bytes.all.current": 9372530176,
+          "num_alloc_retries": 2,
+          "num_ooms": 0,
+          "free": 30926307328,
+          "heads": 554159424
+        },
+        {
+          "step": 1050,
+          "allocated_bytes.all.current": 9368401408,
+          "reserved_bytes.all.current": 68235034624,
+          "inactive_split_bytes.all.current": 884574720,
+          "active_bytes.all.current": 9368401408,
+          "num_alloc_retries": 2,
+          "num_ooms": 0,
+          "free": 30926307328,
+          "heads": 551475496
+        }
+      ],
+      "max_logged_reserved_bytes": 99019128832,
+      "min_logged_free_bytes": 142213120,
+      "last_profile": {
+        "step": 1049,
+        "seconds": {
+          "physical_collection_seconds": 1.558729893527925,
+          "model_normalization_seconds": 0.02971616853028536,
+          "posterior_cache_read_seconds": 0.039240959733724594,
+          "posterior_cache_normalization_seconds": 1.2504187511801719,
+          "world_model_seconds": 0.42402631836012006,
+          "mean_rollout_update_seconds": 0.19685259275138378,
+          "residual_extraction_seconds": 0.08400584198534489,
+          "covariance_fit_seconds": 0.12279034685343504,
+          "model_validation_seconds": 0.009142735041677952,
+          "policy_seconds": 3.0392662780359387,
+          "policy_prepare_seconds": 0.2587717049755156,
+          "policy_update_seconds": 2.3813772099092603,
+          "policy_check_seconds": 0.002706511877477169,
+          "checkpoint_save_seconds": 0.7303881370462477
+        },
+        "runtime": {
+          "device": "cuda:0",
+          "dtype": "torch.float32",
+          "cpu_threads": 1,
+          "cpu_interop_threads": 90,
+          "torch_version": "2.14.0+cu130",
+          "cuda_synchronized": true,
+          "cuda_peak_allocated_bytes": 60127856128,
+          "cuda_peak_reserved_bytes": 99079946240,
+          "cuda_allocated_bytes": 9368401408,
+          "cuda_reserved_bytes": 68235034624,
+          "cuda_active_bytes": 9368401408,
+          "cuda_inactive_split_bytes": 884574720,
+          "cuda_allocation_retries": 2,
+          "cuda_ooms": 0,
+          "cuda_free_bytes": 30926307328,
+          "cuda_total_bytes": 101973950464,
+          "device_name": "NVIDIA RPBZZZ6",
+          "policy_cuda_graph": {
+            "requested": true,
+            "scope": "actor_critic",
+            "reason": "enabled",
+            "warmup_calls": 3,
+            "replay_calls": 205,
+            "captures": 1,
+            "warmup_seconds": 36.81826128484681,
+            "capture_seconds": 10.639720116741955
+          },
+          "eit_execution": "inductor",
+          "compile_seconds_total": 30.37363478,
+          "compiled_graphs_total": 20
+        }
+      }
+    },
+    "expandable": {
+      "samples": [
+        {
+          "step": 10,
+          "allocated_bytes.all.current": 8262127104,
+          "reserved_bytes.all.current": 9288286208,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8262127104,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 21143616
+        },
+        {
+          "step": 20,
+          "allocated_bytes.all.current": 8810356736,
+          "reserved_bytes.all.current": 61320724480,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8810356736,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 23315344
+        },
+        {
+          "step": 30,
+          "allocated_bytes.all.current": 8818571776,
+          "reserved_bytes.all.current": 60662218752,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8818571776,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 30414436
+        },
+        {
+          "step": 40,
+          "allocated_bytes.all.current": 8825480704,
+          "reserved_bytes.all.current": 61324918784,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8825480704,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 37493040
+        },
+        {
+          "step": 50,
+          "allocated_bytes.all.current": 8832705536,
+          "reserved_bytes.all.current": 61331210240,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8832705536,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 44489692
+        },
+        {
+          "step": 60,
+          "allocated_bytes.all.current": 8839973376,
+          "reserved_bytes.all.current": 61337501696,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8839973376,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 51568296
+        },
+        {
+          "step": 70,
+          "allocated_bytes.all.current": 8845474816,
+          "reserved_bytes.all.current": 61343793152,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8845474816,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 57376644
+        },
+        {
+          "step": 80,
+          "allocated_bytes.all.current": 8852225536,
+          "reserved_bytes.all.current": 61350084608,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8852225536,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 63420604
+        },
+        {
+          "step": 90,
+          "allocated_bytes.all.current": 8858350592,
+          "reserved_bytes.all.current": 61356376064,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8858350592,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 69536272
+        },
+        {
+          "step": 100,
+          "allocated_bytes.all.current": 8864037888,
+          "reserved_bytes.all.current": 61364764672,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8864037888,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 75272912
+        },
+        {
+          "step": 110,
+          "allocated_bytes.all.current": 8870447616,
+          "reserved_bytes.all.current": 61366861824,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8870447616,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 81255408
+        },
+        {
+          "step": 120,
+          "allocated_bytes.all.current": 8876565504,
+          "reserved_bytes.all.current": 61375250432,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8876565504,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 87422296
+        },
+        {
+          "step": 130,
+          "allocated_bytes.all.current": 8883038720,
+          "reserved_bytes.all.current": 61381541888,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8883038720,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 93486744
+        },
+        {
+          "step": 140,
+          "allocated_bytes.all.current": 8888823808,
+          "reserved_bytes.all.current": 61385736192,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8888823808,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 99182408
+        },
+        {
+          "step": 150,
+          "allocated_bytes.all.current": 8894645760,
+          "reserved_bytes.all.current": 61392027648,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8894645760,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 104755144
+        },
+        {
+          "step": 160,
+          "allocated_bytes.all.current": 8900523008,
+          "reserved_bytes.all.current": 61398319104,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8900523008,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 110543004
+        },
+        {
+          "step": 170,
+          "allocated_bytes.all.current": 8906557440,
+          "reserved_bytes.all.current": 61404610560,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8906557440,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 116228424
+        },
+        {
+          "step": 180,
+          "allocated_bytes.all.current": 8912762368,
+          "reserved_bytes.all.current": 61408804864,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8912762368,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 122303116
+        },
+        {
+          "step": 190,
+          "allocated_bytes.all.current": 8918969856,
+          "reserved_bytes.all.current": 61415096320,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8918969856,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 128459760
+        },
+        {
+          "step": 200,
+          "allocated_bytes.all.current": 8924649984,
+          "reserved_bytes.all.current": 61421387776,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8924649984,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 133971032
+        },
+        {
+          "step": 210,
+          "allocated_bytes.all.current": 8930477056,
+          "reserved_bytes.all.current": 61425582080,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8930477056,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 139687184
+        },
+        {
+          "step": 220,
+          "allocated_bytes.all.current": 8936445440,
+          "reserved_bytes.all.current": 61433970688,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8936445440,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 145444312
+        },
+        {
+          "step": 230,
+          "allocated_bytes.all.current": 8942287872,
+          "reserved_bytes.all.current": 61440262144,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8942287872,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 150996560
+        },
+        {
+          "step": 240,
+          "allocated_bytes.all.current": 8948554752,
+          "reserved_bytes.all.current": 61444456448,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8948554752,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 156835640
+        },
+        {
+          "step": 250,
+          "allocated_bytes.all.current": 8954113024,
+          "reserved_bytes.all.current": 61450747904,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8954113024,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 162562036
+        },
+        {
+          "step": 260,
+          "allocated_bytes.all.current": 8960610816,
+          "reserved_bytes.all.current": 61457039360,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8960610816,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 168790388
+        },
+        {
+          "step": 270,
+          "allocated_bytes.all.current": 8966779392,
+          "reserved_bytes.all.current": 61461233664,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8966779392,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 174629468
+        },
+        {
+          "step": 280,
+          "allocated_bytes.all.current": 8973521408,
+          "reserved_bytes.all.current": 61467525120,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8973521408,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 180745136
+        },
+        {
+          "step": 290,
+          "allocated_bytes.all.current": 8979305984,
+          "reserved_bytes.all.current": 61473816576,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8979305984,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 186737876
+        },
+        {
+          "step": 300,
+          "allocated_bytes.all.current": 8985536512,
+          "reserved_bytes.all.current": 61480108032,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8985536512,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 192996960
+        },
+        {
+          "step": 310,
+          "allocated_bytes.all.current": 8991816192,
+          "reserved_bytes.all.current": 61486399488,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8991816192,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 198948724
+        },
+        {
+          "step": 320,
+          "allocated_bytes.all.current": 8997947904,
+          "reserved_bytes.all.current": 61494788096,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 8997947904,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 204910732
+        },
+        {
+          "step": 330,
+          "allocated_bytes.all.current": 9004212224,
+          "reserved_bytes.all.current": 61496885248,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9004212224,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 210923960
+        },
+        {
+          "step": 340,
+          "allocated_bytes.all.current": 9009978880,
+          "reserved_bytes.all.current": 61505273856,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9009978880,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 216640112
+        },
+        {
+          "step": 350,
+          "allocated_bytes.all.current": 9017039872,
+          "reserved_bytes.all.current": 61511565312,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9017039872,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 223052856
+        },
+        {
+          "step": 360,
+          "allocated_bytes.all.current": 9022658048,
+          "reserved_bytes.all.current": 61517856768,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9022658048,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 228820228
+        },
+        {
+          "step": 370,
+          "allocated_bytes.all.current": 9029078016,
+          "reserved_bytes.all.current": 61524148224,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9029078016,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 234792480
+        },
+        {
+          "step": 380,
+          "allocated_bytes.all.current": 9035024384,
+          "reserved_bytes.all.current": 61528342528,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9035024384,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 240805708
+        },
+        {
+          "step": 390,
+          "allocated_bytes.all.current": 9041405952,
+          "reserved_bytes.all.current": 61534633984,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9041405952,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 247075036
+        },
+        {
+          "step": 400,
+          "allocated_bytes.all.current": 9047257600,
+          "reserved_bytes.all.current": 61540925440,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9047257600,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 252678504
+        },
+        {
+          "step": 410,
+          "allocated_bytes.all.current": 9053306880,
+          "reserved_bytes.all.current": 61547216896,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9053306880,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 258579048
+        },
+        {
+          "step": 420,
+          "allocated_bytes.all.current": 9059277824,
+          "reserved_bytes.all.current": 61551411200,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9059277824,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 264121052
+        },
+        {
+          "step": 430,
+          "allocated_bytes.all.current": 9065260032,
+          "reserved_bytes.all.current": 61557702656,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9065260032,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 270113792
+        },
+        {
+          "step": 440,
+          "allocated_bytes.all.current": 9071310848,
+          "reserved_bytes.all.current": 61563994112,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9071310848,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 276034824
+        },
+        {
+          "step": 450,
+          "allocated_bytes.all.current": 9077075456,
+          "reserved_bytes.all.current": 61570285568,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9077075456,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 281730488
+        },
+        {
+          "step": 460,
+          "allocated_bytes.all.current": 9083487744,
+          "reserved_bytes.all.current": 61576577024,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9083487744,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 287774448
+        },
+        {
+          "step": 470,
+          "allocated_bytes.all.current": 9089556480,
+          "reserved_bytes.all.current": 61582868480,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9089556480,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 293613528
+        },
+        {
+          "step": 480,
+          "allocated_bytes.all.current": 9095323136,
+          "reserved_bytes.all.current": 61587062784,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9095323136,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 299411632
+        },
+        {
+          "step": 490,
+          "allocated_bytes.all.current": 9101265408,
+          "reserved_bytes.all.current": 61593354240,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9101265408,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 305004856
+        },
+        {
+          "step": 500,
+          "allocated_bytes.all.current": 9107554304,
+          "reserved_bytes.all.current": 61599645696,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9107554304,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 310884912
+        },
+        {
+          "step": 510,
+          "allocated_bytes.all.current": 9112925696,
+          "reserved_bytes.all.current": 61605937152,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9112925696,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 316365452
+        },
+        {
+          "step": 520,
+          "allocated_bytes.all.current": 9118740992,
+          "reserved_bytes.all.current": 61610131456,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9118740992,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 322009896
+        },
+        {
+          "step": 530,
+          "allocated_bytes.all.current": 9124747264,
+          "reserved_bytes.all.current": 61616422912,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9124747264,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 327664584
+        },
+        {
+          "step": 540,
+          "allocated_bytes.all.current": 9130557952,
+          "reserved_bytes.all.current": 61620617216,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9130557952,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 333227076
+        },
+        {
+          "step": 550,
+          "allocated_bytes.all.current": 9136335872,
+          "reserved_bytes.all.current": 61626908672,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9136335872,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 338635908
+        },
+        {
+          "step": 560,
+          "allocated_bytes.all.current": 9141972992,
+          "reserved_bytes.all.current": 61631102976,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9141972992,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 344321328
+        },
+        {
+          "step": 570,
+          "allocated_bytes.all.current": 9147983360,
+          "reserved_bytes.all.current": 61637394432,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9147983360,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 350221872
+        },
+        {
+          "step": 580,
+          "allocated_bytes.all.current": 9153332224,
+          "reserved_bytes.all.current": 61643685888,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9153332224,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 355599972
+        },
+        {
+          "step": 590,
+          "allocated_bytes.all.current": 9159694336,
+          "reserved_bytes.all.current": 61647880192,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9159694336,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 361275148
+        },
+        {
+          "step": 600,
+          "allocated_bytes.all.current": 9165187072,
+          "reserved_bytes.all.current": 61654171648,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9165187072,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 366817152
+        },
+        {
+          "step": 610,
+          "allocated_bytes.all.current": 9171722752,
+          "reserved_bytes.all.current": 61660463104,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9171722752,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 372943064
+        },
+        {
+          "step": 620,
+          "allocated_bytes.all.current": 9177310720,
+          "reserved_bytes.all.current": 61666754560,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9177310720,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 378659216
+        },
+        {
+          "step": 630,
+          "allocated_bytes.all.current": 9182777856,
+          "reserved_bytes.all.current": 61673046016,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9182777856,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 383975852
+        },
+        {
+          "step": 640,
+          "allocated_bytes.all.current": 9188695040,
+          "reserved_bytes.all.current": 61677240320,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9188695040,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 389722736
+        },
+        {
+          "step": 650,
+          "allocated_bytes.all.current": 9194516480,
+          "reserved_bytes.all.current": 61683531776,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9194516480,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 395254496
+        },
+        {
+          "step": 660,
+          "allocated_bytes.all.current": 9200665600,
+          "reserved_bytes.all.current": 61689823232,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9200665600,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 401114064
+        },
+        {
+          "step": 670,
+          "allocated_bytes.all.current": 9206643200,
+          "reserved_bytes.all.current": 61696114688,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9206643200,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 406922412
+        },
+        {
+          "step": 680,
+          "allocated_bytes.all.current": 9211974656,
+          "reserved_bytes.all.current": 61700308992,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9211974656,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 412443928
+        },
+        {
+          "step": 690,
+          "allocated_bytes.all.current": 9218392064,
+          "reserved_bytes.all.current": 61706600448,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9218392064,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 418231788
+        },
+        {
+          "step": 700,
+          "allocated_bytes.all.current": 9224027136,
+          "reserved_bytes.all.current": 61712891904,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9224027136,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 423855744
+        },
+        {
+          "step": 710,
+          "allocated_bytes.all.current": 9230107136,
+          "reserved_bytes.all.current": 61717086208,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9230107136,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 429346528
+        },
+        {
+          "step": 720,
+          "allocated_bytes.all.current": 9235321856,
+          "reserved_bytes.all.current": 61723377664,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9235321856,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 434929508
+        },
+        {
+          "step": 730,
+          "allocated_bytes.all.current": 9241255936,
+          "reserved_bytes.all.current": 61727571968,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9241255936,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 440532976
+        },
+        {
+          "step": 740,
+          "allocated_bytes.all.current": 9246806016,
+          "reserved_bytes.all.current": 61733863424,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9246806016,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 445931564
+        },
+        {
+          "step": 750,
+          "allocated_bytes.all.current": 9252608000,
+          "reserved_bytes.all.current": 61740154880,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9252608000,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 451504300
+        },
+        {
+          "step": 760,
+          "allocated_bytes.all.current": 9257926144,
+          "reserved_bytes.all.current": 61744349184,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9257926144,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 456534104
+        },
+        {
+          "step": 770,
+          "allocated_bytes.all.current": 9263038976,
+          "reserved_bytes.all.current": 61750640640,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9263038976,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 461594640
+        },
+        {
+          "step": 780,
+          "allocated_bytes.all.current": 9268283392,
+          "reserved_bytes.all.current": 61754834944,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9268283392,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 466849812
+        },
+        {
+          "step": 790,
+          "allocated_bytes.all.current": 9273674752,
+          "reserved_bytes.all.current": 61761126400,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9273674752,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 471910348
+        },
+        {
+          "step": 800,
+          "allocated_bytes.all.current": 9279433216,
+          "reserved_bytes.all.current": 61765320704,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9279433216,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 477319180
+        },
+        {
+          "step": 810,
+          "allocated_bytes.all.current": 9284974592,
+          "reserved_bytes.all.current": 61769515008,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9284974592,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 482471912
+        },
+        {
+          "step": 820,
+          "allocated_bytes.all.current": 9290102784,
+          "reserved_bytes.all.current": 61775806464,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9290102784,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 487706596
+        },
+        {
+          "step": 830,
+          "allocated_bytes.all.current": 9295720960,
+          "reserved_bytes.all.current": 61782097920,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9295720960,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 493135916
+        },
+        {
+          "step": 840,
+          "allocated_bytes.all.current": 9301262848,
+          "reserved_bytes.all.current": 61786292224,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9301262848,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 498350112
+        },
+        {
+          "step": 850,
+          "allocated_bytes.all.current": 9306503680,
+          "reserved_bytes.all.current": 61790486528,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9306503680,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 503461868
+        },
+        {
+          "step": 860,
+          "allocated_bytes.all.current": 9311349248,
+          "reserved_bytes.all.current": 61796777984,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9311349248,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 508358500
+        },
+        {
+          "step": 870,
+          "allocated_bytes.all.current": 9316586496,
+          "reserved_bytes.all.current": 61800972288,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9316586496,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 513285864
+        },
+        {
+          "step": 880,
+          "allocated_bytes.all.current": 9321816576,
+          "reserved_bytes.all.current": 61807263744,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9321816576,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 518284936
+        },
+        {
+          "step": 890,
+          "allocated_bytes.all.current": 9326976512,
+          "reserved_bytes.all.current": 61811458048,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9326976512,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 523314740
+        },
+        {
+          "step": 900,
+          "allocated_bytes.all.current": 9332425728,
+          "reserved_bytes.all.current": 61817749504,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9332425728,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 528375276
+        },
+        {
+          "step": 910,
+          "allocated_bytes.all.current": 9337355264,
+          "reserved_bytes.all.current": 61824040960,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9337355264,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 533394836
+        },
+        {
+          "step": 920,
+          "allocated_bytes.all.current": 9342968832,
+          "reserved_bytes.all.current": 61828235264,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9342968832,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 538578300
+        },
+        {
+          "step": 930,
+          "allocated_bytes.all.current": 9347871232,
+          "reserved_bytes.all.current": 61853401088,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9347871232,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 543649080
+        },
+        {
+          "step": 940,
+          "allocated_bytes.all.current": 9353067008,
+          "reserved_bytes.all.current": 61857595392,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9353067008,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 548576444
+        },
+        {
+          "step": 950,
+          "allocated_bytes.all.current": 9358215680,
+          "reserved_bytes.all.current": 61882761216,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9358215680,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 553555028
+        },
+        {
+          "step": 960,
+          "allocated_bytes.all.current": 9363612160,
+          "reserved_bytes.all.current": 61891149824,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9363612160,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 558461904
+        },
+        {
+          "step": 970,
+          "allocated_bytes.all.current": 9368292352,
+          "reserved_bytes.all.current": 61895344128,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9368292352,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 563092192
+        },
+        {
+          "step": 980,
+          "allocated_bytes.all.current": 9372941824,
+          "reserved_bytes.all.current": 61922607104,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9372941824,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 567712236
+        },
+        {
+          "step": 990,
+          "allocated_bytes.all.current": 9378027520,
+          "reserved_bytes.all.current": 61924704256,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9378027520,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 572485940
+        },
+        {
+          "step": 1000,
+          "allocated_bytes.all.current": 9382586368,
+          "reserved_bytes.all.current": 61949870080,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9382586368,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 577116228
+        },
+        {
+          "step": 1010,
+          "allocated_bytes.all.current": 9366039552,
+          "reserved_bytes.all.current": 61954064384,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9366039552,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 560346800
+        },
+        {
+          "step": 1020,
+          "allocated_bytes.all.current": 9368563200,
+          "reserved_bytes.all.current": 62105059328,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9368563200,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 562692676
+        },
+        {
+          "step": 1030,
+          "allocated_bytes.all.current": 9365838336,
+          "reserved_bytes.all.current": 62105059328,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9365838336,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 559988260
+        },
+        {
+          "step": 1040,
+          "allocated_bytes.all.current": 9362838528,
+          "reserved_bytes.all.current": 62105059328,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9362838528,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 557068720
+        },
+        {
+          "step": 1050,
+          "allocated_bytes.all.current": 9360097792,
+          "reserved_bytes.all.current": 62105059328,
+          "inactive_split_bytes.all.current": 0,
+          "active_bytes.all.current": 9360097792,
+          "num_alloc_retries": 0,
+          "num_ooms": 0,
+          "heads": 554569184
+        }
+      ],
+      "max_logged_reserved_bytes": 62105059328,
+      "min_logged_free_bytes": null,
+      "last_profile": {
+        "step": 1049,
+        "seconds": {
+          "physical_collection_seconds": 1.774760780390352,
+          "model_normalization_seconds": 0.03345209872350097,
+          "posterior_cache_read_seconds": 0.041901504039764406,
+          "posterior_cache_normalization_seconds": 1.4439883934259414,
+          "world_model_seconds": 0.44358986895531416,
+          "mean_rollout_update_seconds": 0.1990058682858944,
+          "residual_extraction_seconds": 0.09711001859977841,
+          "covariance_fit_seconds": 0.12573956279084086,
+          "model_validation_seconds": 0.010188065003603697,
+          "policy_seconds": 3.0739606581628323,
+          "policy_prepare_seconds": 0.2882576007395983,
+          "policy_update_seconds": 2.388879259582609,
+          "policy_check_seconds": 0.002875629812479019,
+          "checkpoint_save_seconds": 0.7114611277356744
+        },
+        "runtime": {
+          "device": "cuda:0",
+          "dtype": "torch.float32",
+          "cpu_threads": 1,
+          "cpu_interop_threads": 90,
+          "torch_version": "2.14.0+cu130",
+          "cuda_synchronized": true,
+          "cuda_peak_allocated_bytes": 59714286592,
+          "cuda_peak_reserved_bytes": 62105059328,
+          "cuda_allocated_bytes": 9360097792,
+          "cuda_reserved_bytes": 62105059328,
+          "device_name": "NVIDIA RPBZZZ6",
+          "policy_cuda_graph": {
+            "requested": true,
+            "scope": "actor_critic",
+            "reason": "enabled",
+            "warmup_calls": 3,
+            "replay_calls": 205,
+            "captures": 1,
+            "warmup_seconds": 39.93102240562439,
+            "capture_seconds": 12.13738145492971
+          },
+          "eit_execution": "inductor",
+          "compile_seconds_total": 30.407845925,
+          "compiled_graphs_total": 20
+        }
+      }
+    }
+  },
+  "minimal_reproduction": {
+    "code": "state = torch.zeros(2048, 1000, 71, device=\"cuda\")\nfor n in range(1, 1001):\n    assert torch.isfinite(state[:, :n]).all()",
+    "native": [
+      {
+        "step": 100,
+        "allocated": 581632000,
+        "reserved": 1365245952,
+        "inactive_split": 1376256
+      },
+      {
+        "step": 200,
+        "allocated": 581632000,
+        "reserved": 3860856832,
+        "inactive_split": 1376256
+      },
+      {
+        "step": 300,
+        "allocated": 581632000,
+        "reserved": 8000634880,
+        "inactive_split": 1376256
+      },
+      {
+        "step": 400,
+        "allocated": 581632000,
+        "reserved": 13549699072,
+        "inactive_split": 1376256
+      },
+      {
+        "step": 500,
+        "allocated": 581632000,
+        "reserved": 20919091200,
+        "inactive_split": 1376256
+      },
+      {
+        "step": 600,
+        "allocated": 581632000,
+        "reserved": 29932650496,
+        "inactive_split": 1376256
+      },
+      {
+        "step": 700,
+        "allocated": 581632000,
+        "reserved": 40590376960,
+        "inactive_split": 1376256
+      },
+      {
+        "step": 800,
+        "allocated": 581632000,
+        "reserved": 52424605696,
+        "inactive_split": 1376256
+      },
+      {
+        "step": 900,
+        "allocated": 581632000,
+        "reserved": 66311946240,
+        "inactive_split": 1376256
+      },
+      {
+        "step": 1000,
+        "allocated": 581632000,
+        "reserved": 81843453952,
+        "inactive_split": 1376256
+      }
+    ],
+    "expandable": [
+      {
+        "step": 100,
+        "allocated": 581632000,
+        "reserved": 696254464,
+        "inactive_split": 0
+      },
+      {
+        "step": 200,
+        "allocated": 581632000,
+        "reserved": 801112064,
+        "inactive_split": 0
+      },
+      {
+        "step": 300,
+        "allocated": 581632000,
+        "reserved": 905969664,
+        "inactive_split": 0
+      },
+      {
+        "step": 400,
+        "allocated": 581632000,
+        "reserved": 1010827264,
+        "inactive_split": 0
+      },
+      {
+        "step": 500,
+        "allocated": 581632000,
+        "reserved": 1115684864,
+        "inactive_split": 0
+      },
+      {
+        "step": 600,
+        "allocated": 581632000,
+        "reserved": 1199570944,
+        "inactive_split": 0
+      },
+      {
+        "step": 700,
+        "allocated": 581632000,
+        "reserved": 1304428544,
+        "inactive_split": 0
+      },
+      {
+        "step": 800,
+        "allocated": 581632000,
+        "reserved": 1409286144,
+        "inactive_split": 0
+      },
+      {
+        "step": 900,
+        "allocated": 581632000,
+        "reserved": 1514143744,
+        "inactive_split": 0
+      },
+      {
+        "step": 1000,
+        "allocated": 581632000,
+        "reserved": 1619001344,
+        "inactive_split": 0
+      }
+    ]
+  },
+  "snapshots": [
+    {
+      "snapshot": "/tmp/eit-memory-debug/native-long2/snapshot-700.pickle",
+      "pools": {
+        "(0, 0)": {
+          "total_size": 45434798080,
+          "active_size": 9231205888,
+          "allocated_size": 9231205888,
+          "segments": 493
+        },
+        "(1, 0)": {
+          "total_size": 52397342720,
+          "active_size": 8192,
+          "allocated_size": 8192,
+          "segments": 1394
+        }
+      },
+      "inactive_global_segments_by_allocation_site": [
+        [
+          "other",
+          34919677952
+        ],
+        [
+          "supermimic/models.py:230:noise_factor",
+          484442112
+        ]
+      ]
+    },
+    {
+      "snapshot": "/tmp/eit-memory-debug/expandable/snapshot-700.pickle",
+      "pools": {
+        "(0, 0)": {
+          "total_size": 10647240704,
+          "active_size": 9224018944,
+          "allocated_size": 9224018944,
+          "segments": 7
+        },
+        "(1, 0)": {
+          "total_size": 51065651200,
+          "active_size": 8192,
+          "allocated_size": 8192,
+          "segments": 2
+        }
+      },
+      "inactive_global_segments_by_allocation_site": [
+        [
+          "other",
+          2097152
+        ]
+      ]
+    },
+    {
+      "snapshot": "/tmp/eit-memory-debug/expandable/snapshot-1050.pickle",
+      "pools": {
+        "(0, 0)": {
+          "total_size": 11039408128,
+          "active_size": 9360089600,
+          "allocated_size": 9360089600,
+          "segments": 7
+        },
+        "(1, 0)": {
+          "total_size": 51065651200,
+          "active_size": 8192,
+          "allocated_size": 8192,
+          "segments": 2
+        }
+      },
+      "inactive_global_segments_by_allocation_site": [
+        [
+          "other",
+          2097152
+        ]
+      ]
+    }
+  ],
+  "validation": {
+    "cpu_tests": 43,
+    "gpu_graph_tests": 22,
+    "ruff": "passed",
+    "diff_check": "passed",
+    "gpu_runtime_metadata_smoke": "passed",
+    "pyright": "4 pre-existing torch export/stub errors, identical on baseline; no new diagnostics"
+  },
+  "raw_artifacts": "/tmp/eit-memory-debug"
+}

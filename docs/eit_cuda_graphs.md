@@ -98,3 +98,51 @@ rollout/backward，不能代表当前单图实现。本轮对照以实施前工�
 另一次关闭 replay 的测量为 15.614 s/update，但采用两次预热，仅作为辅助对照。
 完整逐次计时、环境信息和源码摘要见
 [本轮验证记录](validation/eit_policy_graph_float32.json)。
+
+## 训练中显存增长的排查
+
+`launch_eit.py` 在没有显式设置 `PYTORCH_ALLOC_CONF` 或 `PYTORCH_CUDA_ALLOC_CONF` 时，为子进程默认设置 `PYTORCH_ALLOC_CONF=expandable_segments:True`；已有任一变量时保留用户配置。直接运行 `train_eit.py` 时可在启动前设置同一变量。
+
+Replay 填满前，每一步的索引和校验临时张量尺寸都在变化。普通缓存分配器可能保留大量不同尺寸的空闲段；同时，policy CUDA Graph 的私有池必须保留捕获时的工作区。扩展段让尺寸变化的分配复用同一段。该设置不改变 replay 容量、训练 batch、损失或更新次数。
+
+`profiling.jsonl` 的 runtime 新增 active、inactive split、allocation retries、OOM 次数和设备 free/total bytes。allocated 不包含已经释放张量但仍为图回放保留的全部工作区；inactive split 也不代表全部 reserved。设备 free bytes 包含 PyTorch 之外的 CUDA 占用，因此不能只根据 allocated 判断剩余容量。
+
+分配器选项见 [PyTorch CUDA 内存管理文档](https://docs.pytorch.org/docs/stable/notes/cuda.html#memory-management)。
+
+### 2026-11-25 实测
+
+定位点：`ReplayBuffer._sealed_round()` 中对 `self._storage[field][:, :n]` 的 `torch.isfinite(...).all()`；n 随 replay 填充递增。700 步快照的最大空闲段请求尺寸为 407142400 bytes，恰好是 2048 × 700 × 71 × 4；相邻缓存段对应 699、695、692 等不同长度。同期普通池有约 32.97 GiB 的完全空闲段，policy 图私有池约 48.80 GiB，捕获次数始终为 1。
+
+仅执行以下校验即可复现，无需训练模型：
+
+```python
+state = torch.zeros(2048, 1000, 71, device="cuda")
+for n in range(1, 1001):
+    assert torch.isfinite(state[:, :n]).all()
+```
+
+1000 次校验后，存活张量都只有 0.54 GiB，普通分配器 reserved 为 76.22 GiB，扩展段为 1.51 GiB。
+
+完整 A 配置（2048 envs、H=32、microbatch=1024、stride=4、seed=2027）运行 1050 步：
+
+| 指标 | 普通分配器 | 扩展段 |
+|---|---:|---:|
+| peak reserved | 92.28 GiB | 57.84 GiB |
+| 最终 allocated | 8.73 GiB | 8.72 GiB |
+| 分配重试/缓存回收 | 2 | 0 |
+| 捕获次数 / replay 次数 | 1 / 205 | 1 / 205 |
+| 本次抛出的 OOM | 0 | 0 |
+
+此对照已跨过 1000 帧 ring 覆盖边界。原训练的异常栈未保存；本次普通分配器运行靠缓存回收继续完成，因此确认了显存增长机制，尚不能确定历史 OOM 的具体抛出位置。43 项 CPU 测试和覆盖 A/B/C 的 22 项 GPU 图一致性测试通过；Pyright 的 4 项 torch 导出声明告警与修改前一致。
+
+参数、原实验记录、逐点内存和快照摘要见 [验证记录](validation/eit_gpu_memory.json)。远端原始快照和最小复现位于 `/tmp/eit-memory-debug/`。
+
+### 后续修复：写入时增量校验
+
+Replay 的数值校验现已移到 `insert()` 提交之前，只检查本次新增帧和它与上一帧的有效相邻关系，包括 state/action/sim_ctx 有限值、旋转、观测中的上一动作、执行动作和上下文一致性。先转换为实际存储 dtype，再检查，避免有限的高精度数值在转换后溢出。失败时不更新环形数据、posterior cache、计数或去重 token。
+
+`_sealed_round()` 保留 episode/time 索引构建及 episode ID 结构检查，不再扫描全部浮点数据。reset、时间缺口和 terminated/truncated 边界不比较跨边界动作或上下文。显式 `validate_contents()` 供调试数值损坏时使用，逐帧扫描，不重建索引、不抽取随机先验；训练期间直接修改私有 `_storage` 不受写入校验保护。
+
+普通分配器下，对相同的 model replay（2048 环境、1000 帧容量）连续执行写入、建索引和定期窗口检查 1100 步，peak reserved 从约 76.52 GiB 降到 1.15 GiB。该测试不含策略 CUDA Graph 工作区，因此数字不代表完整训练总显存。扩展内存段仍保留为启动器默认值。
+
+本轮验证与原始样本见 [增量校验验证记录](validation/eit_incremental_validation.json)。

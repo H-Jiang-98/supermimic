@@ -423,9 +423,9 @@ def test_model_replay_rejects_invalid_heldout_head_before_fitting():
   fresh = replay.retained_frames([0], fields=("state", "action"))
   state = fit.state_dict()
   rng = torch.random.get_rng_state()
-  with pytest.raises(ValueError, match="Rotation"):
-    replay.finish_collection_round()
-  with pytest.raises(ValueError, match="Rotation"):
+  # Private mutation bypassed insert; auditing is explicit before fitting.
+  with pytest.raises(ValueError, match="rotation"):
+    replay.validate_contents()
     fit.fit(replay, [0], [1], fresh, 2)
   assert_tree(fit.state_dict(), state)
   assert torch.equal(torch.random.get_rng_state(), rng)

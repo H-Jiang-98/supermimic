@@ -120,7 +120,7 @@ def test_invalid_head_metadata_leaves_replay_unchanged():
     ("sim_ctx", "simulation context"),
   ],
 )
-def test_model_window_selection_rejects_inconsistent_replay_across_wrap(fault, message):
+def test_insert_rejects_inconsistent_replay_across_wrap(fault, message):
   env, _, _ = setup_env("B")
   replay = env.replay_buffer
   frame = replay._storage[:, 0].clone()
@@ -139,10 +139,13 @@ def test_model_window_selection_rejects_inconsistent_replay_across_wrap(fault, m
     frame["actor_obs"][1, 64] += 0.5
   else:
     frame["sim_ctx"][1, 0] += 0.5
-  replay.insert(frame)
+  before = replay._storage.clone()
+  count, step = replay.insert_count, replay._step
   rng = torch.random.get_rng_state()
   with pytest.raises(ValueError, match=message):
-    replay.model_window_starts([0], 2)
+    replay.insert(frame)
+  torch.testing.assert_close(replay._storage, before)
+  assert (replay.insert_count, replay._step) == (count, step)
   assert replay._training_heads is heads
   assert torch.equal(torch.random.get_rng_state(), rng)
 

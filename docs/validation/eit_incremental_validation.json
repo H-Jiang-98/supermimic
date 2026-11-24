@@ -1,0 +1,442 @@
+{
+  "date": "2026-11-25",
+  "source_head": "3ee558edb84d556750519dfbb6f19ecc36bd2ec3",
+  "change": "Validate incoming stored-dtype values and the new successor edge before replay commit; sealing rebuilds only metadata indices. Explicit validate_contents audits private numerical corruption one frame at a time.",
+  "benchmark": {
+    "description": "Model replay insert + seal, with window selection assertions every 100 steps; ordinary native allocator, no expandable segments, no policy graph or simulator. Independent processes on GPU 6.",
+    "before": {
+      "baseline": true,
+      "num_envs": 2048,
+      "capacity": 1000,
+      "samples": [
+        {
+          "step": 100,
+          "elapsed_seconds": 0.5636779591441154,
+          "allocated": 909896704,
+          "reserved": 1692401664,
+          "peak_allocated": 1012732928,
+          "peak_reserved": 1692401664,
+          "allocation_retries": 0
+        },
+        {
+          "step": 200,
+          "elapsed_seconds": 0.8085880419239402,
+          "allocated": 911740928,
+          "reserved": 4188012544,
+          "peak_allocated": 1115183104,
+          "peak_reserved": 4188012544,
+          "allocation_retries": 0
+        },
+        {
+          "step": 300,
+          "elapsed_seconds": 1.069537676870823,
+          "allocated": 913584640,
+          "reserved": 8327790592,
+          "peak_allocated": 1218746880,
+          "peak_reserved": 8327790592,
+          "allocation_retries": 0
+        },
+        {
+          "step": 400,
+          "elapsed_seconds": 1.3664307529106736,
+          "allocated": 915428864,
+          "reserved": 13876854784,
+          "peak_allocated": 1322442240,
+          "peak_reserved": 13876854784,
+          "allocation_retries": 0
+        },
+        {
+          "step": 500,
+          "elapsed_seconds": 1.713669802993536,
+          "allocated": 917272576,
+          "reserved": 21246246912,
+          "peak_allocated": 1426563072,
+          "peak_reserved": 21246246912,
+          "allocation_retries": 0
+        },
+        {
+          "step": 600,
+          "elapsed_seconds": 2.0772305261343718,
+          "allocated": 919116800,
+          "reserved": 30259806208,
+          "peak_allocated": 1529439232,
+          "peak_reserved": 30259806208,
+          "allocation_retries": 0
+        },
+        {
+          "step": 700,
+          "elapsed_seconds": 2.477307726163417,
+          "allocated": 921036288,
+          "reserved": 40917532672,
+          "peak_allocated": 1633003008,
+          "peak_reserved": 40917532672,
+          "allocation_retries": 0
+        },
+        {
+          "step": 800,
+          "elapsed_seconds": 2.918551358859986,
+          "allocated": 923300352,
+          "reserved": 52751761408,
+          "peak_allocated": 1735715328,
+          "peak_reserved": 52751761408,
+          "allocation_retries": 0
+        },
+        {
+          "step": 900,
+          "elapsed_seconds": 3.3821500800549984,
+          "allocated": 924937728,
+          "reserved": 66639101952,
+          "peak_allocated": 1839697408,
+          "peak_reserved": 66639101952,
+          "allocation_retries": 0
+        },
+        {
+          "step": 1000,
+          "elapsed_seconds": 3.8897372111678123,
+          "allocated": 927479808,
+          "reserved": 82170609664,
+          "peak_allocated": 1942794240,
+          "peak_reserved": 82170609664,
+          "allocation_retries": 0
+        },
+        {
+          "step": 1100,
+          "elapsed_seconds": 4.393190416973084,
+          "allocated": 927479808,
+          "reserved": 82170609664,
+          "peak_allocated": 1942794240,
+          "peak_reserved": 82170609664,
+          "allocation_retries": 0
+        }
+      ]
+    },
+    "after": {
+      "baseline": false,
+      "num_envs": 2048,
+      "capacity": 1000,
+      "samples": [
+        {
+          "step": 100,
+          "elapsed_seconds": 0.5424944800324738,
+          "allocated": 909896704,
+          "reserved": 933232640,
+          "peak_allocated": 918277632,
+          "peak_reserved": 933232640,
+          "allocation_retries": 0
+        },
+        {
+          "step": 200,
+          "elapsed_seconds": 0.7209026790224016,
+          "allocated": 911740928,
+          "reserved": 954204160,
+          "peak_allocated": 929133056,
+          "peak_reserved": 954204160,
+          "allocation_retries": 0
+        },
+        {
+          "step": 300,
+          "elapsed_seconds": 0.899749378208071,
+          "allocated": 913584640,
+          "reserved": 954204160,
+          "peak_allocated": 939987968,
+          "peak_reserved": 954204160,
+          "allocation_retries": 0
+        },
+        {
+          "step": 400,
+          "elapsed_seconds": 1.0815019281581044,
+          "allocated": 915428864,
+          "reserved": 968884224,
+          "peak_allocated": 950843392,
+          "peak_reserved": 968884224,
+          "allocation_retries": 0
+        },
+        {
+          "step": 500,
+          "elapsed_seconds": 1.2636211584322155,
+          "allocated": 917272576,
+          "reserved": 985661440,
+          "peak_allocated": 963041792,
+          "peak_reserved": 985661440,
+          "allocation_retries": 0
+        },
+        {
+          "step": 600,
+          "elapsed_seconds": 1.4456971799954772,
+          "allocated": 919397376,
+          "reserved": 1006632960,
+          "peak_allocated": 973647360,
+          "peak_reserved": 1006632960,
+          "allocation_retries": 0
+        },
+        {
+          "step": 700,
+          "elapsed_seconds": 1.6347790923900902,
+          "allocated": 921036288,
+          "reserved": 1052770304,
+          "peak_allocated": 984578048,
+          "peak_reserved": 1052770304,
+          "allocation_retries": 0
+        },
+        {
+          "step": 800,
+          "elapsed_seconds": 1.8177706054411829,
+          "allocated": 923202048,
+          "reserved": 1107296256,
+          "peak_allocated": 994788352,
+          "peak_reserved": 1107296256,
+          "allocation_retries": 0
+        },
+        {
+          "step": 900,
+          "elapsed_seconds": 2.000198357272893,
+          "allocated": 924937728,
+          "reserved": 1166016512,
+          "peak_allocated": 1005856768,
+          "peak_reserved": 1166016512,
+          "allocation_retries": 0
+        },
+        {
+          "step": 1000,
+          "elapsed_seconds": 2.182595930993557,
+          "allocated": 926885888,
+          "reserved": 1233125376,
+          "peak_allocated": 1019017728,
+          "peak_reserved": 1233125376,
+          "allocation_retries": 0
+        },
+        {
+          "step": 1100,
+          "elapsed_seconds": 2.3646388263441622,
+          "allocated": 926885888,
+          "reserved": 1233125376,
+          "peak_allocated": 1019017728,
+          "peak_reserved": 1233125376,
+          "allocation_retries": 0
+        }
+      ]
+    },
+    "source": "import argparse, importlib.util, json, sys, time\nfrom pathlib import Path\nimport torch\nfrom tensordict import TensorDict\n\nparser=argparse.ArgumentParser()\nparser.add_argument(\"--baseline\",action=\"store_true\")\nparser.add_argument(\"--output\",required=True)\nargs=parser.parse_args()\ntorch.set_num_threads(1)\nif args.baseline:\n  spec=importlib.util.spec_from_file_location(\"replay_baseline\",\"/tmp/eit-replay-baseline.py\")\n  mod=importlib.util.module_from_spec(spec)\n  sys.modules[spec.name]=mod\n  spec.loader.exec_module(mod)\nelse:\n  import supermimic.replay_buffer as mod\nE,T=2048,1000\nschema={\"state\":mod.FieldSpec(71),\"action\":mod.FieldSpec(29),\"sim_ctx\":mod.FieldSpec(2),\n        \"episode_id\":mod.FieldSpec(dtype=torch.long),\"time_index\":mod.FieldSpec(dtype=torch.long),\n        \"terminated\":mod.FieldSpec(dtype=torch.bool),\"truncated\":mod.FieldSpec(dtype=torch.bool)}\nreplay=mod.ReplayBuffer(schema,T,E,device=\"cuda\",replay_mode=\"model\")\nstate=torch.zeros(E,71,device=\"cuda\");state[:,3]=1\nframe=TensorDict({\"state\":state,\"action\":torch.zeros(E,29,device=\"cuda\"),\n \"sim_ctx\":torch.zeros(E,2,device=\"cuda\"),\"episode_id\":torch.arange(E,device=\"cuda\"),\n \"time_index\":torch.zeros(E,dtype=torch.long,device=\"cuda\"),\n \"terminated\":torch.zeros(E,dtype=torch.bool,device=\"cuda\"),\n \"truncated\":torch.zeros(E,dtype=torch.bool,device=\"cuda\")},[E])\ntorch.cuda.synchronize();begin=time.perf_counter();samples=[]\nfor step in range(1100):\n  frame[\"time_index\"].fill_(step)\n  frame[\"state\"][:,7]=step\n  replay.insert(frame)\n  replay.finish_collection_round()\n  if (step+1)%100==0:\n    starts=replay.model_window_starts([0],8)\n    assert starts.shape==(min(step+1,T)-7,2)\n    first_time=int(replay.model_windows(starts[:1],8)[\"state\"][0,0,7])\n    assert first_time==max(0,step+1-T)\n    del starts\n    torch.cuda.synchronize()\n    r={\"step\":step+1,\"elapsed_seconds\":time.perf_counter()-begin,\n       \"allocated\":torch.cuda.memory_allocated(),\"reserved\":torch.cuda.memory_reserved(),\n       \"peak_allocated\":torch.cuda.max_memory_allocated(),\n       \"peak_reserved\":torch.cuda.max_memory_reserved(),\n       \"allocation_retries\":torch.cuda.memory_stats()[\"num_alloc_retries\"]}\n    samples.append(r);print(json.dumps(r),flush=True)\nPath(args.output).write_text(json.dumps({\"baseline\":args.baseline,\"num_envs\":E,\"capacity\":T,\"samples\":samples},indent=2))\n"
+  },
+  "tests": {
+    "core": 308,
+    "additional_integration": 106,
+    "gpu_graph": 22,
+    "skipped": 1,
+    "total_passed": 436,
+    "new_regressions": "tests/test_estimator_replay_validation.py",
+    "coverage": [
+      "NaN/Inf",
+      "float64-to-float32 overflow",
+      "invalid rotation",
+      "failed commit atomicity including posterior cache and token",
+      "explicit numerical and edge audit",
+      "reset/gap/terminated/truncated",
+      "ring wrap and capacity one",
+      "sampling windows",
+      "bounded finite-value checks",
+      "A/B/C graph parity and restore"
+    ]
+  },
+  "production_smoke": {
+    "group": "A",
+    "num_envs": 2048,
+    "policy_horizon": 32,
+    "policy_microbatch_size": 1024,
+    "steps": 120,
+    "allocator": "native (no expandable segments)",
+    "memory_samples": [
+      {
+        "step": 10,
+        "allocated_bytes.all.current": 8269857280,
+        "reserved_bytes.all.current": 9634316288,
+        "inactive_split_bytes.all.current": 89390592,
+        "active_bytes.all.current": 8269857280,
+        "num_alloc_retries": 0,
+        "num_ooms": 0,
+        "free": 91175387136,
+        "heads": 21143616
+      },
+      {
+        "step": 20,
+        "allocated_bytes.all.current": 8821956608,
+        "reserved_bytes.all.current": 63067652096,
+        "inactive_split_bytes.all.current": 806068224,
+        "active_bytes.all.current": 8821956608,
+        "num_alloc_retries": 0,
+        "num_ooms": 0,
+        "free": 37626707968,
+        "heads": 23315344
+      },
+      {
+        "step": 30,
+        "allocated_bytes.all.current": 8830265856,
+        "reserved_bytes.all.current": 62618861568,
+        "inactive_split_bytes.all.current": 804050432,
+        "active_bytes.all.current": 8830265856,
+        "num_alloc_retries": 0,
+        "num_ooms": 0,
+        "free": 36542480384,
+        "heads": 30445168
+      },
+      {
+        "step": 40,
+        "allocated_bytes.all.current": 8837243904,
+        "reserved_bytes.all.current": 63667437568,
+        "inactive_split_bytes.all.current": 797072384,
+        "active_bytes.all.current": 8837243904,
+        "num_alloc_retries": 0,
+        "num_ooms": 0,
+        "free": 35493904384,
+        "heads": 37503284
+      },
+      {
+        "step": 50,
+        "allocated_bytes.all.current": 8844477952,
+        "reserved_bytes.all.current": 63675826176,
+        "inactive_split_bytes.all.current": 789838336,
+        "active_bytes.all.current": 8844477952,
+        "num_alloc_retries": 0,
+        "num_ooms": 0,
+        "free": 35485515776,
+        "heads": 44417984
+      },
+      {
+        "step": 60,
+        "allocated_bytes.all.current": 8851719168,
+        "reserved_bytes.all.current": 63682117632,
+        "inactive_split_bytes.all.current": 782597120,
+        "active_bytes.all.current": 8851719168,
+        "num_alloc_retries": 0,
+        "num_ooms": 0,
+        "free": 35479224320,
+        "heads": 51465856
+      },
+      {
+        "step": 70,
+        "allocated_bytes.all.current": 8857349120,
+        "reserved_bytes.all.current": 63688409088,
+        "inactive_split_bytes.all.current": 776967168,
+        "active_bytes.all.current": 8857349120,
+        "num_alloc_retries": 0,
+        "num_ooms": 0,
+        "free": 35472932864,
+        "heads": 57151276
+      },
+      {
+        "step": 80,
+        "allocated_bytes.all.current": 8864265728,
+        "reserved_bytes.all.current": 63692603392,
+        "inactive_split_bytes.all.current": 770050560,
+        "active_bytes.all.current": 8864265728,
+        "num_alloc_retries": 0,
+        "num_ooms": 0,
+        "free": 35468738560,
+        "heads": 63400116
+      },
+      {
+        "step": 90,
+        "allocated_bytes.all.current": 8869449216,
+        "reserved_bytes.all.current": 63700992000,
+        "inactive_split_bytes.all.current": 773255680,
+        "active_bytes.all.current": 8869449216,
+        "num_alloc_retries": 0,
+        "num_ooms": 0,
+        "free": 35460349952,
+        "heads": 69300660
+      },
+      {
+        "step": 100,
+        "allocated_bytes.all.current": 8876260864,
+        "reserved_bytes.all.current": 63705186304,
+        "inactive_split_bytes.all.current": 768541184,
+        "active_bytes.all.current": 8876260864,
+        "num_alloc_retries": 0,
+        "num_ooms": 0,
+        "free": 35456155648,
+        "heads": 75385596
+      },
+      {
+        "step": 110,
+        "allocated_bytes.all.current": 8882800640,
+        "reserved_bytes.all.current": 63711477760,
+        "inactive_split_bytes.all.current": 772487168,
+        "active_bytes.all.current": 8882800640,
+        "num_alloc_retries": 0,
+        "num_ooms": 0,
+        "free": 35449864192,
+        "heads": 81736876
+      },
+      {
+        "step": 120,
+        "allocated_bytes.all.current": 8888501760,
+        "reserved_bytes.all.current": 63717769216,
+        "inactive_split_bytes.all.current": 773077504,
+        "active_bytes.all.current": 8888501760,
+        "num_alloc_retries": 0,
+        "num_ooms": 0,
+        "free": 35443572736,
+        "heads": 87811568
+      }
+    ],
+    "last_profile": {
+      "step": 119,
+      "seconds": {
+        "physical_collection_seconds": 1.5441616205498576,
+        "model_normalization_seconds": 0.029618513770401478,
+        "posterior_cache_read_seconds": 0.03874787209928036,
+        "posterior_cache_normalization_seconds": 1.2739768292307856,
+        "world_model_seconds": 0.414646505843848,
+        "mean_rollout_update_seconds": 0.19504092913120985,
+        "residual_extraction_seconds": 0.0834718244150281,
+        "covariance_fit_seconds": 0.12270719418302178,
+        "model_validation_seconds": 0.008613982237875462,
+        "policy_seconds": 3.0301239620894194,
+        "policy_prepare_seconds": 0.2471900600939989,
+        "policy_update_seconds": 2.368699341081083,
+        "policy_check_seconds": 0.002370768692344427,
+        "checkpoint_save_seconds": 0.7822740911506116
+      },
+      "runtime": {
+        "device": "cuda:0",
+        "dtype": "torch.float32",
+        "cpu_threads": 1,
+        "cpu_interop_threads": 90,
+        "torch_version": "2.14.0+cu130",
+        "cuda_synchronized": true,
+        "cuda_peak_allocated_bytes": 60127856128,
+        "cuda_peak_reserved_bytes": 63717769216,
+        "cuda_allocated_bytes": 8888501760,
+        "cuda_reserved_bytes": 63717769216,
+        "cuda_allocator_backend": "native",
+        "cuda_allocator_config": null,
+        "cuda_active_bytes": 8888501760,
+        "cuda_inactive_split_bytes": 773077504,
+        "cuda_allocation_retries": 0,
+        "cuda_ooms": 0,
+        "cuda_free_bytes": 35443572736,
+        "cuda_total_bytes": 101973950464,
+        "device_name": "NVIDIA RPBZZZ6",
+        "policy_cuda_graph": {
+          "requested": true,
+          "scope": "actor_critic",
+          "reason": "enabled",
+          "warmup_calls": 3,
+          "replay_calls": 19,
+          "captures": 1,
+          "warmup_seconds": 41.88269186299294,
+          "capture_seconds": 10.953762101009488
+        },
+        "eit_execution": "inductor",
+        "compile_seconds_total": 42.633435335,
+        "compiled_graphs_total": 20
+      }
+    }
+  },
+  "checks": {
+    "ruff": "passed",
+    "format": "passed",
+    "git_diff_check": "passed"
+  },
+  "limits": "Replay-only benchmark numbers exclude the fixed CUDA Graph workspace. Metadata indexing still scales with retained replay length. Production smoke is 120 steps; ring-overwrite coverage is the 1100-step replay benchmark and regression suite."
+}
