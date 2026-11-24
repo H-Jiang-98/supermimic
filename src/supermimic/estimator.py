@@ -69,8 +69,8 @@ class FilterConfig:
       raise ValueError("jitter_attempts must be a nonnegative integer")
     if self.covariance_atol < 0 or self.covariance_rtol < 0:
       raise ValueError("Covariance validation tolerances must be nonnegative")
-    if self.jacobian_backend not in ("vmap", "eager"):
-      raise ValueError("jacobian_backend must be 'vmap' or 'eager'")
+    if self.jacobian_backend not in ("vmap", "eager", "increment"):
+      raise ValueError("jacobian_backend must be 'vmap', 'eager' or 'increment'")
     for chunk in (self.jacobian_batch_chunk_size, self.jacobian_chunk_size):
       if chunk is not None and (type(chunk) is not int or chunk < 1):
         raise ValueError("Jacobian chunk sizes must be positive integers or None")
@@ -272,6 +272,13 @@ class LieBeliefFilter:
     self.measurement_config = measurement_config
     self.default_joint_pos = default_joint_pos.detach().clone()
     self.config = config or FilterConfig()
+    if self.config.jacobian_backend == "increment" and not all(
+      callable(getattr(dynamics, name, None))
+      for name in ("prediction_lie", "integrate_prediction_lie")
+    ):
+      raise TypeError(
+        "Increment Jacobians require prediction_lie and integrate_prediction_lie"
+      )
     self._compiled_jacobian = None
     self._propagate = _propagate_covariance
     if compile_kernels:
@@ -336,6 +343,8 @@ class LieBeliefFilter:
 
     The vectorized backend differentiates each independent sample then batches
     the result, without materializing cross-batch blocks. Normalization is fixed.
+    The increment backend differentiates the 35 network outputs and composes
+    their derivatives with the integration map to recover the full 70x70 map.
 
     Evaluation may use no_grad(), but inference_mode disables the local AD
     needed even when no outer model/action gradients are requested.
@@ -376,6 +385,8 @@ class LieBeliefFilter:
     batch_shape = mean.position.shape[:-1]
     state_values, nominal_values = flatten(mean), flatten(nominal)
     count = state_values[0].shape[0]
+    if count == 0:
+      return mean.position.new_empty(*batch_shape, TANGENT_DIM, TANGENT_DIM)
     args = (
       zero.expand(count, -1),
       state_values,
@@ -383,7 +394,7 @@ class LieBeliefFilter:
       action.reshape(count, action.shape[-1]),
       context.reshape(count, context.shape[-1]),
     )
-    if self._compiled_jacobian is None or count == 0:
+    if self._compiled_jacobian is None:
       result = self._vector_jacobian(
         *args, chunk_size=self.config.jacobian_batch_chunk_size
       )
@@ -394,12 +405,46 @@ class LieBeliefFilter:
   def _vector_jacobian(
     self, epsilon, state, nominal, action, context, *, chunk_size=None
   ):
+    if self.config.jacobian_backend == "increment":
+      return vmap(self._increment_jacobian, chunk_size=chunk_size)(
+        epsilon, state, nominal, action, context
+      )
     derivatives = jacrev(
       self._local_transition, argnums=0, chunk_size=self.config.jacobian_chunk_size
     )
     return vmap(derivatives, chunk_size=chunk_size)(
       epsilon, state, nominal, action, context
     )
+
+  def _local_prediction(self, epsilon, state_values, action, context):
+    prediction = self.dynamics.prediction_lie(
+      boxplus(LieState(*state_values), epsilon), action, context
+    )
+    # has_aux reuses the forward value without detaching the outer graph.
+    return prediction, prediction
+
+  def _local_integration(self, epsilon, prediction, state_values, nominal_values):
+    return local_error(
+      LieState(*nominal_values),
+      self.dynamics.integrate_prediction_lie(
+        boxplus(LieState(*state_values), epsilon), prediction
+      ),
+    )
+
+  def _increment_jacobian(self, epsilon, state, nominal, action, context):
+    # g(e) is the network's 35-vector and h(e, d) is local_error after the
+    # integrator. F = h_e + h_d @ g_e. Only g_e traverses the world model;
+    # the 70-output derivative below contains geometry and integration only.
+    # Differentiate the actual integrator, including polar correction and the
+    # supplied nominal chart, so outer action/state/model gradients stay exact.
+    chunk = self.config.jacobian_chunk_size
+    increment_jacobian, prediction = jacrev(
+      self._local_prediction, argnums=0, has_aux=True, chunk_size=chunk
+    )(epsilon, state, action, context)
+    direct, through_increment = jacrev(
+      self._local_integration, argnums=(0, 1), chunk_size=chunk
+    )(epsilon, prediction, state, nominal)
+    return direct + through_increment @ increment_jacobian
 
   def _compiled_jacobian_blocks(self, epsilon, state, nominal, action, context):
     # vmap specializes its batch dimension. Real episode resets and short

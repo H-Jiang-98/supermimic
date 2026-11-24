@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch._dynamo.utils import get_compilation_metrics
 
+from supermimic.estimator import FilterConfig
 from supermimic.learners.belief_policy_learner import BeliefPolicyLearnerCfg
 from supermimic.models import ProcessNoiseConfig
 from supermimic.runners.eit_training import EITTraining
@@ -20,7 +21,8 @@ from supermimic.scripts.train_eit import (
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA Inductor regression")
 @pytest.mark.parametrize("group", ["A", "B", "C"])
-def test_fixed_policy_rollout_compiled(group, tmp_path):
+@pytest.mark.parametrize("backend", ["vmap", "increment"])
+def test_fixed_policy_rollout_compiled(group, backend, tmp_path):
   device = "cuda:0"
   torch.manual_seed(2027)
   motion = tmp_path / "stationary.npz"
@@ -35,6 +37,7 @@ def test_fixed_policy_rollout_compiled(group, tmp_path):
     cfg = SuperMimicRunnerCfg.for_estimator_inputs(
       group,
       process_noise=ProcessNoiseConfig(hidden_dims=(8,)),
+      filter_config=FilterConfig(jacobian_backend=backend),
       dynamics_hidden_dims=(16,),
       actor_hidden_dims=(16, 8),
       critic_hidden_dims=(16, 8),

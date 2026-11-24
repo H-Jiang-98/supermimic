@@ -189,10 +189,23 @@ class Dynamics(nn.Module):
     self, state: LieState, action: torch.Tensor, sim_ctx: torch.Tensor
   ) -> LieState:
     """Matrix mean transition; validation belongs outside jacrev/vmap."""
+    return self.integrate_prediction_lie(
+      state, self.prediction_lie(state, action, sim_ctx)
+    )
+
+  def prediction_lie(
+    self, state: LieState, action: torch.Tensor, sim_ctx: torch.Tensor
+  ) -> torch.Tensor:
+    """Velocity increments in the current body frame, before integration."""
+    return self.mlp(self.lie_inputs(state, action, sim_ctx))
+
+  def integrate_prediction_lie(
+    self, state: LieState, prediction: torch.Tensor
+  ) -> LieState:
+    """Integrate an independent increment, retaining its outer AD graph."""
     if self._represent_lie is None or self._apply_prediction_lie is None:
       raise ValueError("Lie dynamics requires GenCoord representation")
-    inputs = self.lie_inputs(state, action, sim_ctx)
-    return self._apply_prediction_lie(state, self.mlp(inputs), self.dt)
+    return self._apply_prediction_lie(state, prediction, self.dt)
 
   def lie_inputs(
     self, state: LieState, action: torch.Tensor, sim_ctx: torch.Tensor

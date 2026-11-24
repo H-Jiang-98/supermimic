@@ -1,0 +1,211 @@
+{
+  "date": "2026-11-24",
+  "baseline_commit": "e527d9daa43c0700ad9fb7b882e5ec631ec6988b",
+  "method": "G = d prediction(35)/d epsilon(70); F = h_epsilon + h_prediction @ G; integration uses local AD.",
+  "benchmark": {
+    "physical_gpu": 2,
+    "dtype": "float32",
+    "seed": 2027,
+    "warmup": 3,
+    "repeats": 10,
+    "timing": "synchronized wall clock median; compilation excluded",
+    "model_parameters": "frozen",
+    "outer_gradients": "action and all six LieState tensor fields",
+    "memory": "peak allocated minus pre-timing live allocation",
+    "scope": "isolated transition_jacobian with optional outer backward; not full training"
+  },
+  "regression": {
+    "matrix_filter_and_increment": 75,
+    "compiled_abc_increment_rollout": 3,
+    "launch_config_training_provider_inference_recovery": 120,
+    "total_passed": 198
+  },
+  "runs": [
+    {
+      "torch": "2.14.0+cu130",
+      "gpu": "NVIDIA RPBZZZ6",
+      "batch": 256,
+      "hidden_dims": [
+        2048,
+        2048,
+        2048
+      ],
+      "compiled": true,
+      "results": [
+        {
+          "backend": "vmap",
+          "outer_backward": false,
+          "median_ms": 7.647444261237979,
+          "samples_ms": [
+            7.814017590135336,
+            7.649073377251625,
+            7.6362090185284615,
+            7.628642953932285,
+            7.655578199774027,
+            7.65491696074605,
+            7.670411840081215,
+            7.645815145224333,
+            7.641016039997339,
+            7.6356083154678345
+          ],
+          "peak_extra_mib": 295.44287109375,
+          "max_abs_jacobian_error": 0.0,
+          "max_abs_outer_gradient_error": 0.0
+        },
+        {
+          "backend": "increment",
+          "outer_backward": false,
+          "median_ms": 5.121842492371798,
+          "samples_ms": [
+            5.2231550216674805,
+            5.168139934539795,
+            5.147360265254974,
+            5.1047829911112785,
+            5.112777929753065,
+            5.118688102811575,
+            5.165063310414553,
+            5.107382778078318,
+            5.12499688193202,
+            5.117581691592932
+          ],
+          "peak_extra_mib": 150.94677734375,
+          "max_abs_jacobian_error": 1.9371509552001953e-06,
+          "max_abs_outer_gradient_error": 0.0
+        },
+        {
+          "backend": "vmap",
+          "outer_backward": true,
+          "median_ms": 17.78017613105476,
+          "samples_ms": [
+            18.29525176435709,
+            18.331692088395357,
+            18.276733811944723,
+            18.19052081555128,
+            17.773625906556845,
+            17.75218080729246,
+            17.78169721364975,
+            17.777591943740845,
+            17.77865504845977,
+            17.776560969650745
+          ],
+          "peak_extra_mib": 908.83984375,
+          "max_abs_jacobian_error": 0.0,
+          "max_abs_outer_gradient_error": 0.0
+        },
+        {
+          "backend": "increment",
+          "outer_backward": true,
+          "median_ms": 11.382602853700519,
+          "samples_ms": [
+            11.543888133019209,
+            11.41741219907999,
+            11.394064873456955,
+            11.42857689410448,
+            11.45463390275836,
+            11.371140833944082,
+            11.273239273577929,
+            11.082278098911047,
+            11.080722324550152,
+            11.077248957008123
+          ],
+          "peak_extra_mib": 448.462890625,
+          "max_abs_jacobian_error": 1.9371509552001953e-06,
+          "max_abs_outer_gradient_error": 5.340576171875e-05
+        }
+      ]
+    },
+    {
+      "torch": "2.14.0+cu130",
+      "gpu": "NVIDIA RPBZZZ6",
+      "batch": 256,
+      "hidden_dims": [
+        2048,
+        2048,
+        2048
+      ],
+      "compiled": false,
+      "results": [
+        {
+          "backend": "vmap",
+          "outer_backward": false,
+          "median_ms": 22.678412962704897,
+          "samples_ms": [
+            22.831179201602936,
+            22.82376680523157,
+            22.668106015771627,
+            22.688719909638166,
+            22.555277682840824,
+            22.70852169021964,
+            22.72170130163431,
+            22.608857601881027,
+            22.61072536930442,
+            22.659325040876865
+          ],
+          "peak_extra_mib": 581.337890625,
+          "max_abs_jacobian_error": 0.0,
+          "max_abs_outer_gradient_error": 0.0
+        },
+        {
+          "backend": "increment",
+          "outer_backward": false,
+          "median_ms": 26.18824294768274,
+          "samples_ms": [
+            26.502735912799835,
+            26.17486799135804,
+            26.11705521121621,
+            26.356664020568132,
+            26.291341055184603,
+            26.49609185755253,
+            26.194302830845118,
+            26.044468861073256,
+            26.18218306452036,
+            26.10883302986622
+          ],
+          "peak_extra_mib": 294.2373046875,
+          "max_abs_jacobian_error": 2.041459083557129e-06,
+          "max_abs_outer_gradient_error": 0.0
+        },
+        {
+          "backend": "vmap",
+          "outer_backward": true,
+          "median_ms": 61.32447859272361,
+          "samples_ms": [
+            61.0138950869441,
+            61.30044115707278,
+            61.65316002443433,
+            61.31925107911229,
+            61.39635993167758,
+            61.329706106334925,
+            61.309604439884424,
+            61.45403999835253,
+            61.43966317176819,
+            61.173907946795225
+          ],
+          "peak_extra_mib": 2440.05810546875,
+          "max_abs_jacobian_error": 0.0,
+          "max_abs_outer_gradient_error": 0.0
+        },
+        {
+          "backend": "increment",
+          "outer_backward": true,
+          "median_ms": 64.56785392947495,
+          "samples_ms": [
+            65.64987264573574,
+            64.7133132442832,
+            64.310098066926,
+            64.3881312571466,
+            64.49060188606381,
+            64.6228538826108,
+            64.43095440044999,
+            66.53035525232553,
+            65.03265909850597,
+            64.5128539763391
+          ],
+          "peak_extra_mib": 1209.59521484375,
+          "max_abs_jacobian_error": 2.041459083557129e-06,
+          "max_abs_outer_gradient_error": 4.7206878662109375e-05
+        }
+      ]
+    }
+  ]
+}

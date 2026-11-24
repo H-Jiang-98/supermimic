@@ -175,6 +175,12 @@ def main():
     "--actor-hidden-dims", type=int, nargs="+", default=[2048, 1024, 512, 256]
   )
   parser.add_argument("--critic-hidden-dims", type=int, nargs="+", default=[256, 128])
+  parser.add_argument(
+    "--jacobian-backend",
+    choices=("increment", "vmap", "eager"),
+    default="increment",
+    help="Local Jacobian implementation for new runs; resume uses saved settings",
+  )
   parser.add_argument("--jacobian-batch-chunk-size", type=int)
   parser.add_argument("--jacobian-chunk-size", type=int)
   parser.add_argument("--wandb-project", help="Common runner W&B project")
@@ -266,6 +272,7 @@ def main():
       critic_hidden_dims=tuple(args.critic_hidden_dims),
       process_noise=ProcessNoiseConfig(),
       filter_config=FilterConfig(
+        jacobian_backend=args.jacobian_backend,
         jacobian_batch_chunk_size=args.jacobian_batch_chunk_size,
         jacobian_chunk_size=args.jacobian_chunk_size,
       ),

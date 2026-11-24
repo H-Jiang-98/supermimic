@@ -8,6 +8,7 @@ checkpoint_root = "/mnt/cpfs/zbl-cpfs-new/CKPT/leojiang/supermimic_ws"
 experiment = "eit_v6_Lafan_compiled_plc_micb_512" # 输出：checkpoint_root/experiment/seed<seed>/<方法>/
 
 [training]
+jacobian_backend = "increment" # 35 维网络增量求导，再通过积分组装 70x70 Jacobian。
 eager = false # CUDA 默认编译训练热点，true 用于 eager 对照。
 num_envs = 2048
 max_iterations = 300_000 # 每个环境的累计物理步数

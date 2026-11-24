@@ -4,6 +4,33 @@
 
 下表记录服务器上的三组短程对照。长期收敛及 replay 填满后的耗时还需单独测量。
 
+新启动的 `train_eit` 默认使用 `--jacobian-backend increment`，也可在 TOML
+的 `[training]` 设置 `jacobian_backend = "increment"`。先计算网络输出
+`[Δv_b(3), Δω_b(3), Δv_j(29)]` 相对 70 维右局部扰动的导数 `G`，再对现有
+积分函数计算直接状态导数 `A` 和增量导数 `B`，以 `F = A + B @ G` 组装
+70×70 Jacobian。积分部分仍通过自动微分计算，包含旋转正交化、新机体坐标系
+角速度和 nominal 局部误差，保留策略训练所需的外层梯度。穿过 world model
+的反向方向从 70 减为 35；整体耗时仍取决于积分、滤波和其他训练步骤。
+`--jacobian-backend vmap` 可切回原完整状态求导，`eager` 为逐行参考后端。
+`--eager` 仅控制编译，与 Jacobian 后端独立。续训保持 checkpoint 保存的
+后端设置；旧 checkpoint 继续使用原后端。
+
+2026-11-24 的固定输入微基准使用服务器 GPU 2（NVIDIA RPBZZZ6）、float32、
+batch/chunk=256、三层 2048 隐藏单元，冻结 world model 参数。每个分支预热
+3 次，再取 10 次同步墙钟计时的中位数，不包含编译时间。外层反传同时覆盖
+动作和状态各字段。结果如下，显存为相对分支常驻张量的临时 allocated 峰值：
+
+| 编译模式 | 完整状态 vmap → increment 耗时 | 临时显存 vmap → increment |
+|---|---:|---:|
+| 仅 Jacobian | 7.65 → 5.12 ms（减少 33.0%） | 295.4 → 150.9 MiB |
+| Jacobian + 外层反传 | 17.78 → 11.38 ms（减少 36.0%） | 908.8 → 448.5 MiB |
+
+这不是整轮训练计时。未编译 eager 下，新增积分求导的调度开销使本次外层
+反传从 61.32 增至 64.57 ms；需要 eager 吞吐时可选回 `vmap`。同一大网络
+float32 对照中，编译后 Jacobian 最大绝对差约 1.94e-6，外层梯度约 5.34e-5。
+float64 有限差分及混合导数、CUDA 编译、A/B/C 策略 rollout、训练与恢复等
+相关回归共 198 项通过。[原始微基准数据](validation/eit_increment_jacobian.json)。
+
 2026-11-23 已在本地 RTX 5090（32 GiB）完成旧版 v5 协议验证：[实测报告](validation/eit_v5_rtx5090.json)。C 组使用下表默认预算及完整网络宽度，Jacobian batch chunk=32、`PYTORCH_JIT=0`；采集 11 步后完成一组 10/18/1/20 更新。世界模型阶段 0.555 s，策略阶段 691.753 s（其中 critic 0.074 s）；PyTorch 峰值 allocated/reserved 为 15.20/17.76 GiB。新进程恢复至累计 14 步，优化器和调度状态一致，两次启动生成五个四文件 artifact，离线记录约 0.90 GiB。A/B/C 小批量 CUDA 下一次更新恢复逐位一致，完整回归 1095 项通过。
 
 该实测只覆盖一个完整默认更新与恢复后的 warmup；1000 帧缓存已分配但尚未填满，未测稳定容量索引成本或收敛，也不能推算为 PRO 6000 性能。阶段计时存在包含关系，不能把父阶段与子阶段相加。
