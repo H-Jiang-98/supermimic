@@ -293,16 +293,26 @@ class BeliefActorCriticPolicyLearner:
   def draw_noises(self, starts):
     parameter = next(self.actor.parameters())
     shape = (self.cfg.horizon, len(starts), self.cfg.num_samples)
-    return tuple(
-      torch.randn(
+    # Keep the fixed tensor interface without consuming the process RNG for K=1.
+    process = (
+      torch.zeros(*shape, 70, dtype=parameter.dtype, device=parameter.device)
+      if self.cfg.num_samples == 1
+      else torch.randn(
         *shape,
-        width,
+        70,
         dtype=parameter.dtype,
         device=parameter.device,
-        generator=self.generators[name],
+        generator=self.generators["process"],
       )
-      for name, width in (("process", 70), ("measurement", 64))
     )
+    measurement = torch.randn(
+      *shape,
+      64,
+      dtype=parameter.dtype,
+      device=parameter.device,
+      generator=self.generators["measurement"],
+    )
+    return process, measurement
 
   def sample_start_keys(self, episode_ids):
     """Draw the logical starts for every actor update, in optimizer-step order."""
@@ -434,12 +444,24 @@ class BeliefActorCriticPolicyLearner:
         if prepared is None:
           obs, reward, done, _ = env.step(
             actions,
-            process_noise=process_noise[t],
+            # Custom analytical environments retain their tensor-noise protocol.
+            process_noise=(
+              torch.zeros_like(process_noise[t])
+              if cfg.num_samples == 1
+              else process_noise[t]
+            ),
             measurement_noise=measurement_noise[t],
           )
         else:
           state, reward, done, failed = imagine_step(
-            env, prepared, state, actions, process_noise[t], measurement_noise[t], t
+            env,
+            prepared,
+            state,
+            actions,
+            # None selects Dynamics.forward directly, bypassing process sampling.
+            None if cfg.num_samples == 1 else process_noise[t],
+            measurement_noise[t],
+            t,
           )
           obs, bad_features = observe(env, prepared, state, t + 1)
           invalid = invalid | failed | bad_features

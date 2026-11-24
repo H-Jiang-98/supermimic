@@ -504,3 +504,31 @@ def test_muon_and_adam_policy_state_restore_and_clipping():
     for name in actual:
       torch.testing.assert_close(actual[name], target[name], rtol=0, atol=0)
   assert learner.actor_steps == 2 and learner.critic_steps == 40
+
+
+@pytest.mark.parametrize("num_samples", [1, 2])
+def test_process_rng_is_only_used_for_multiple_samples(num_samples):
+  learner, starts, _ = setup()
+  learner.cfg = replace(learner.cfg, num_samples=num_samples)
+  process_before = learner.generators["process"].get_state().clone()
+  measurement_before = learner.generators["measurement"].get_state().clone()
+  process, measurement = learner.draw_noises(starts)
+  assert process.shape == (3, 3, num_samples, 70)
+  assert measurement.shape == (3, 3, num_samples, 64)
+  assert torch.equal(process_before, learner.generators["process"].get_state()) == (
+    num_samples == 1
+  )
+  assert bool(process.count_nonzero()) == (num_samples > 1)
+  assert not torch.equal(
+    measurement_before, learner.generators["measurement"].get_state()
+  )
+
+
+def test_single_sample_custom_rollout_ignores_supplied_process_noise():
+  learner, starts, _ = setup()
+  learner.cfg = replace(learner.cfg, num_samples=1)
+  process, measurement = (x.flatten(1, 2) for x in learner.draw_noises(starts))
+  expected = learner._rollout_result(starts, process, measurement, 3)
+  actual = learner._rollout_result(starts, torch.ones_like(process), measurement, 3)
+  torch.testing.assert_close(actual.returns, expected.returns)
+  torch.testing.assert_close(actual.critic_data, expected.critic_data)

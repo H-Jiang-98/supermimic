@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from dataclasses import asdict
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import cast
@@ -94,7 +95,11 @@ def main():
   parser.add_argument(
     "--initialization",
     type=Path,
-    help=f"Shared A/B/C initial weights (default: output parent/{EIT_INITIALIZATION_VERSION}_{CRITIC_INPUT_VERSION}_seed<seed>.pt)",
+    help=(
+      "Shared A/B/C initial weights (default: output parent/"
+      f"{EIT_INITIALIZATION_VERSION}_{CRITIC_INPUT_VERSION}_"
+      "noise<fingerprint>_seed<seed>.pt)"
+    ),
   )
   parser.add_argument("--group", choices=("A", "B", "C"), default="B")
   parser.add_argument(
@@ -210,23 +215,6 @@ def main():
   if not args.prepare_initialization and not args.output:
     parser.error("training requires --output")
   initialization = args.initialization
-  if initialization is None and args.resume is None:
-    initialization = (
-      args.output.parent
-      / f"{EIT_INITIALIZATION_VERSION}_{CRITIC_INPUT_VERSION}_seed{args.seed}.pt"
-    )
-  reference_path = None
-  if args.resume_reference:
-    try:
-      reference_path = _reference_path(
-        args.resume_reference,
-        args.output,
-        Path(args.motion_file),
-        initialization,
-        args.resume,
-      )
-    except ValueError as error:
-      parser.error(str(error))
   if (
     args.initialization
     and not args.prepare_initialization
@@ -306,6 +294,27 @@ def main():
       noise=args.exploration,
     )
     num_envs = args.num_envs
+  if initialization is None and args.resume is None:
+    assert runner_cfg.estimator_inputs is not None
+    noise_fingerprint = initialization_fingerprint(
+      asdict(runner_cfg.estimator_inputs.measurement_noise)
+    )[:12]
+    initialization = args.output.parent / (
+      f"{EIT_INITIALIZATION_VERSION}_{CRITIC_INPUT_VERSION}_"
+      f"noise{noise_fingerprint}_seed{args.seed}.pt"
+    )
+  reference_path = None
+  if args.resume_reference:
+    try:
+      reference_path = _reference_path(
+        args.resume_reference,
+        args.output,
+        Path(args.motion_file),
+        initialization,
+        args.resume,
+      )
+    except ValueError as error:
+      parser.error(str(error))
   runner_cfg.max_iterations = args.max_iterations
   for name in ("wandb_project", "run_name", "save_interval", "log_interval"):
     value = getattr(args, name)

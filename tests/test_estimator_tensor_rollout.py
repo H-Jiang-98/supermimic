@@ -205,3 +205,52 @@ def test_mid_rollout_failure_rejects_whole_update(failure, monkeypatch):
   assert all(
     p.grad is None for p in (*learner.actor.parameters(), *learner.critic.parameters())
   )
+
+
+@pytest.mark.parametrize("group", ["A", "B", "C"])
+def test_single_sample_uses_mean_with_observation_noise_and_actor_gradients(group):
+  learner = real_setup(group)
+  learner.cfg = replace(learner.cfg, num_samples=1)
+  starts, (process, measurement) = inputs_for(learner)
+  env = learner.wm_env
+  env.dynamics.requires_grad_(False)
+  learner.critic.requires_grad_(False)
+  with (
+    patch.object(env.dynamics, "sample", side_effect=AssertionError("process sample")),
+    patch.object(env.dynamics, "forward", wraps=env.dynamics.forward) as mean,
+    patch.object(
+      env.dynamics, "noise_factor", wraps=env.dynamics.noise_factor
+    ) as covariance,
+  ):
+    expected = learner._rollout_result(starts, process, measurement, 2)
+    assert mean.call_count == 2
+    assert covariance.call_count > 0  # The filter still propagates process covariance.
+    actual = learner._rollout_result(starts, torch.ones_like(process), measurement, 2)
+    torch.testing.assert_close(actual.final_state.rep, expected.final_state.rep)
+    torch.testing.assert_close(actual.final_state.aux, expected.final_state.aux)
+    torch.testing.assert_close(actual.returns, expected.returns)
+    parameters = tuple(learner.actor.parameters())
+    expected_grad = torch.autograd.grad(expected.returns.sum(), parameters)
+    actual_grad = torch.autograd.grad(actual.returns.sum(), parameters)
+    torch.testing.assert_close(actual_grad, expected_grad)
+    assert sum(g.square().sum() for g in actual_grad) > 0
+    without_measurement = learner._rollout_result(
+      starts, process, torch.zeros_like(measurement), 2
+    )
+    assert not torch.equal(
+      actual.final_state.history, without_measurement.final_state.history
+    )
+    learner.update_from(starts, *learner.draw_noises(starts))
+
+
+def test_multiple_samples_keep_stochastic_dynamics():
+  learner = real_setup()
+  starts, (process, measurement) = inputs_for(learner)
+  dynamics = learner.wm_env.dynamics
+  with patch.object(dynamics, "sample", wraps=dynamics.sample) as sample:
+    actual = learner._rollout_result(starts, process, measurement, 2)
+    assert sample.call_count == 2
+    noiseless = learner._rollout_result(
+      starts, torch.zeros_like(process), measurement, 2
+    )
+  assert not torch.equal(actual.final_state.rep, noiseless.final_state.rep)

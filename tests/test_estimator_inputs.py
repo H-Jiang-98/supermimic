@@ -2,6 +2,7 @@
 
 import json
 from dataclasses import replace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -467,3 +468,16 @@ def test_zero_covariance_encoding_has_finite_gradients(dtype):
   invalid[0, 0] = -1e-4
   with pytest.raises(ValueError, match="positive semidefinite"):
     encode_covariance(invalid)
+
+
+def test_default_measurement_three_sigma_matches_uniform_bounds():
+  config = GaussianMeasurementConfig()
+  bounds = torch.tensor([0.05] * 3 + [0.2] * 3 + [0.01] * 29 + [0.5] * 29)
+  torch.testing.assert_close(3 * config.standard_deviations(29), bounds)
+  torch.testing.assert_close(config.covariance(29).diag(), (bounds / 3).square())
+  clean = torch.zeros(1, 93)
+  # Explicit standard-normal samples also check that Gaussian tails are not clipped.
+  with patch("torch.randn", return_value=torch.full((1, 64), 4.0)):
+    noisy = sample_proprio(clean, config)
+  torch.testing.assert_close(noisy[:, :64], (bounds * (4 / 3)).unsqueeze(0))
+  torch.testing.assert_close(noisy[:, 64:], clean[:, 64:])

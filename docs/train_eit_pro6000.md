@@ -2,6 +2,8 @@
 
 当前联合训练协议为 `eit_training_v6`。EIT 保留在线 belief、后验 replay、随机世界模型与可微 imagined belief rollout；采集调用公共 `runner.step()`，更新由公共 `Ratio` 调度，优化器、critic fitting、权重文件和 W&B 记录复用 SuperMimic。采用 float32。CUDA 默认使用 TorchInductor 编译训练热点，CPU 使用 eager。单次训练加 `--eager` 或在 TOML 的 `[training]` 设置 `eager = true` 可切换回 eager。显式 learner CUDA Graph 独立于该开关，当前关闭。
 
+观测噪声默认使用未截断高斯分布，标准差为原均匀噪声半宽 / 3，使 ±3σ 对齐原范围。策略训练在 `num_samples = 1` 时直接使用 world model 的 mean prediction，不采样过程噪声；`num_samples > 1` 时保留过程噪声采样。两种模式都保留观测噪声和滤波器过程协方差。checkpoint 中显式保存的观测噪声配置仍按保存值恢复。
+
 下表记录服务器上的三组短程对照。长期收敛及 replay 填满后的耗时还需单独测量。
 
 新启动的 `train_eit` 默认使用 `--jacobian-backend increment`，也可在 TOML
@@ -110,6 +112,8 @@ python3 src/supermimic/scripts/launch_eit.py --config train_eit_config.toml
 每个不同的 seed 用 B 组生成一份公共初始化，保存在 `checkpoint_root/experiment/init/`。各组的权重、`training.pt` 和训练日志分别写入 `checkpoint_root/experiment/seed<seed>/<A|B|C>/`。开启新一批实验时修改 `experiment`；接续已有 checkpoint 使用下文的单次训练 `--resume` 命令。
 
 ## 单次训练与三卡命令示例
+
+未指定 `--initialization` 时，初始化文件默认位于输出目录的父目录，命名为 `eit_initialization_v4_eit_rpv_belief_critic_v3_noise<fingerprint>_seed<seed>.pt`。`fingerprint` 是实际观测噪声配置 SHA-256 的前 12 位，避免不同噪声配置复用旧初始化文件。显式指定的初始化路径仍按原路径加载并校验。
 
 EIT CLI 不读取根目录 `train_config.toml`。`--save-interval`、`--log-interval`、`--run-name`、`--wandb-project` 写入公共 runner 配置；运行目录仍由 `--output` 指定。
 

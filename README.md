@@ -639,8 +639,8 @@ OMP_NUM_THREADS=1 PYTORCH_JIT=0 .venv/bin/python -m supermimic.scripts.check_eit
 
 A/B/C 新版训练使用 `eit_rpv_belief_critic_v3` critic 契约。旧版 v5 策略快照仍可用于评估和播放。
 加载时校验组别、输入维度和 `rpv9_log_std_corr_v1` 编码。A 组也执行同一版本检查。
-新训练默认在输出目录的父目录创建或读取 `eit_initialization_v4_eit_rpv_belief_critic_v3_seed<seed>.pt`。
-同一 seed 的三组使用同一份初始化包，分别写入各自的训练目录。也可用 `--initialization` 指定当前契约的初始化包。
+新训练默认在输出目录的父目录创建或读取 `eit_initialization_v4_eit_rpv_belief_critic_v3_noise<fingerprint>_seed<seed>.pt`。
+其中 `fingerprint` 为观测噪声配置 SHA-256 的前 12 位；噪声配置变化后使用新文件。同一噪声配置、同一 seed 的三组使用同一份初始化包，分别写入各自的训练目录。也可用 `--initialization` 指定当前契约的初始化包。
 各组独立采集与更新。当前默认使用公共 ReturnSampler，保留 `--sampling-mode uniform`。
 
 在服务器仓库根目录运行 `python3 src/supermimic/scripts/launch_eit.py --dry-run` 可预览多卡计划，去掉 `--dry-run` 即开始训练。

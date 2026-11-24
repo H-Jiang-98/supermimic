@@ -36,12 +36,15 @@ UNCERTAINTY_DIM = 45 * NUM_REFERENCE_FRAMES
 
 @dataclass(frozen=True)
 class GaussianMeasurementConfig:
-  """Additive sensor standard deviations; known actions are never corrupted."""
+  """Sensor noise with default +/-3 sigma matching the legacy uniform bounds.
 
-  gravity_std: float = 0.05 / math.sqrt(3.0)
-  angular_velocity_std: float = 0.2 / math.sqrt(3.0)
-  joint_position_std: float = 0.01 / math.sqrt(3.0)
-  joint_velocity_std: float = 0.5 / math.sqrt(3.0)
+  Known actions are never corrupted; Gaussian samples are not clipped.
+  """
+
+  gravity_std: float = 0.05 / 3.0
+  angular_velocity_std: float = 0.2 / 3.0
+  joint_position_std: float = 0.01 / 3.0
+  joint_velocity_std: float = 0.5 / 3.0
 
   def __post_init__(self) -> None:
     for name, value in asdict(self).items():
