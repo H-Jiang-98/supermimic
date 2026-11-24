@@ -18,7 +18,7 @@ replay_ratio = 16
 sampling_mode = "return"
 log_interval = 10
 save_interval = 1000
-posterior_save_stride = 4
+posterior_save_stride = 2
 
 mean_lr = 2e-4
 mean_updates = 10
@@ -32,7 +32,7 @@ cov_validation_pairs = 8192
 policy_lr = 2e-4
 critic_lr = 2e-4
 policy_updates = 1
-policy_batch_size = 4096
+policy_batch_size = 2048
 policy_microbatch_size = 1024
 policy_horizon = 32
 samples = 1
@@ -53,7 +53,7 @@ ls_iterations = 50 # 当前任务默认：20；每次线搜索的迭代上限。
 # 方法可共用 GPU；每张卡同时只跑一个进程。删除整个方法表即可跳过该方法。
 
 [methods.A]
-gpus = [5]
+gpus = [0]
 seeds = [2027]
 #seeds = [2027, 2028, 2029, 2030, 2031]
 

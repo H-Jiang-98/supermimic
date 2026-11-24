@@ -180,7 +180,7 @@ def test_resume_recovers_actual_interval_budget_and_profile_once(
   log, step = loop.runner.logger.log, loop.run_step
 
   def interrupt_log(*args, **kwargs):
-    if kwargs["it"] == 3:
+    if kwargs["loss_dict"]["Counters/collected_steps"] == 4:
       raise RuntimeError("injected interruption")
     return log(*args, **kwargs)
 

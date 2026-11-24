@@ -1,5 +1,6 @@
 """EIT uses common W&B/Logger/artifact entry points, with a fresh offline run."""
 
+import json
 import os
 import subprocess
 import sys
@@ -11,6 +12,7 @@ import torch
 import wandb
 
 from supermimic.runners.eit_resume_reference import equal_tree
+from supermimic.utils.logger import Logger
 from tests.test_estimator_eit_training import training
 
 
@@ -60,7 +62,7 @@ def test_common_init_logging_and_artifacts_are_offline_and_new_on_resume(
     "parent_run": {"id": runs[0].id, "name": runs[0].name, "project": runs[0].project},
   }
   assert public_log.call_count == 3
-  assert [kw["step"] for _, kw in logs] == [0, 2, 3, 5]
+  assert [kw["step"] for _, kw in logs] == [0, 1, 2, 0]
   assert logs[-1][0]["Counters/collected_steps"] == 6
   assert len(artifacts) == 5
   for _, artifact in artifacts:
@@ -84,6 +86,7 @@ def test_offline_sdk_in_bounded_subprocess(tmp_path):
 import json, sys, torch, wandb
 from pathlib import Path
 from tests.test_estimator_eit_training import training
+from supermimic.utils.logger import Logger
 root = Path(sys.argv[1])
 wandb.Api = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("online API"))
 first = training()
@@ -135,3 +138,126 @@ def test_failed_common_init_leaves_resumable_initial_checkpoint(tmp_path, monkey
     equal_tree(torch.load(tmp_path / f"{name}.pt", weights_only=True), saved[name])
   training().run(3, tmp_path, resume=tmp_path / "training.pt")
   assert torch.load(tmp_path / "training.pt", weights_only=True)["collected_steps"] == 3
+
+
+@pytest.mark.parametrize("filtered", [False, True])
+def test_logger_console_selection_preserves_wandb(filtered, monkeypatch, capsys):
+  rows = []
+  monkeypatch.setattr(wandb, "log", lambda row, **kw: rows.append(row))
+  logger = Logger("test", 2, 10, "cpu")
+  logger.rewbuffer.append(3.0)
+  logger.lenbuffer.append(4)
+  logger.ep_extras.append({"EpisodeReward/tracking": 0.5})
+  kwargs = {"console_keys": ("Policy/reward", "missing")} if filtered else {}
+  logger.log(
+    0, 1, 1.0, 0.0, 0.0, {"Policy/reward": 2.0, "Budget/mean_updates": 7}, 2, **kwargs
+  )
+  output = capsys.readouterr().out
+  assert ("Budget/mean_updates:" in output) is not filtered
+  assert "Policy/reward:" in output
+  assert "Mean reward:" in output and "EpisodeReward/tracking:" in output
+  assert rows[0]["Budget/mean_updates"] == 7
+  assert rows[0]["Train/mean_reward"] == 3.0
+
+
+@pytest.mark.parametrize(
+  "target,physical",
+  [
+    (0, []),
+    (1, [0]),
+    (2, [0, 1]),
+    (3, [0, 2]),
+    (4, [0, 2, 3]),
+    (5, [0, 2, 4]),
+  ],
+)
+def test_log_count_includes_final_partial_interval(
+  target, physical, tmp_path, monkeypatch
+):
+  monkeypatch.setenv("WANDB_MODE", "disabled")
+  loop = training()
+  loop.runner.cfg.log_interval = 2
+  calls = []
+  monkeypatch.setattr(loop.runner.logger, "log", lambda **kw: calls.append(kw))
+  history = loop.run(target, tmp_path)
+  assert [r["step"] for r in history] == physical
+  assert [r["it"] for r in calls] == list(range(len(physical)))
+  assert all(r["total_it"] == len(physical) for r in calls)
+
+
+def test_core_aliases_and_resume_preserve_physical_logs(tmp_path, monkeypatch, capsys):
+  monkeypatch.setenv("WANDB_MODE", "disabled")
+  loop = training()
+  loop.runner.cfg.log_interval = 2
+  original_step = loop.run_step
+
+  def step():
+    metrics = original_step()
+    metrics["updates"] = [
+      {
+        "train": {"Loss/state": 0.25, "Loss/process_nll": 0.75},
+        "validation": {"Loss/state": 0.5},
+        "policy": {
+          "Policy/return": 4.0,
+          "Policy/raw_reward": 0.03,
+          "Grad/actor_norm": 2.0,
+          "Policy/critic_loss": 0.125,
+        },
+        "budget": {"mean_updates": 1},
+      }
+    ]
+    return metrics
+
+  monkeypatch.setattr(loop, "run_step", step)
+  rows = []
+
+  def capture_wandb(runner):
+    initialize = runner._init_wandb
+
+    def init(*args, **kwargs):
+      initialize(*args, **kwargs)
+      monkeypatch.setattr(wandb, "log", lambda row, **kw: rows.append((row, kw)))
+
+    monkeypatch.setattr(runner, "_init_wandb", init)
+
+  capture_wandb(loop.runner)
+  history = loop.run(4, tmp_path)
+  output = capsys.readouterr().out
+  assert "Loss/state:" in output and "Policy/reward:" in output
+  for key in (
+    "Model/Loss/state:",
+    "ModelValidation/",
+    "Counters/",
+    "Budget/",
+    "Policy/return:",
+    "Policy/raw_reward:",
+    "Grad/",
+  ):
+    assert key not in output
+  expected_reward = 4.0 / (
+    loop.policy.cfg.horizon * loop.runner.wm_env.representation.dt
+  )
+  disk = [
+    json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text().splitlines()
+  ]
+  assert disk == history
+  for row in [*history, *(r for r, _ in rows)]:
+    assert row["Loss/state"] == row["Model/Loss/state"] == 0.25
+    assert row["Policy/reward"] == pytest.approx(expected_reward)
+    assert row["Policy/grad_norm"] == row["Grad/actor_norm"] == 2.0
+    assert row["Policy/value_function"] == row["Policy/critic_loss"] == 0.125
+    assert row["Policy/raw_reward"] == 0.03
+    assert row["ModelValidation/Loss/state"] == 0.5
+    assert row["Model/Loss/process_nll"] == 0.75
+  assert history[-1]["Counters/collected_frames"] == 8
+  restored = training(81)
+  restored.runner.cfg.log_interval = 2
+  capture_wandb(restored.runner)
+  restored.run(6, tmp_path, resume=tmp_path / "training.pt")
+  assert [kw["step"] for _, kw in rows] == [0, 1, 2, 0, 1]
+  disk = [
+    json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text().splitlines()
+  ]
+  assert [row["step"] for row in disk] == [0, 2, 3, 4, 5]
+  assert disk[-1]["Counters/collected_steps"] == 6
+  assert disk[-1]["Counters/collected_frames"] == 12

@@ -163,7 +163,7 @@ wait
 
 ## 保存、续训与离线记录
 
-`runner.cfg.save_interval` 是唯一周期保存配置，单位为每环境物理步。周期条件为累计零基 `step % save_interval == 0`。例如 interval=1000 时，周期保存的已采步数为 1、1001、2001……；另保存初始和结束状态，同一状态不重复发布。日志同样按累计零基 step 触发，结束时刷出剩余记录。
+`runner.cfg.save_interval` 是唯一周期保存配置，单位为每环境物理步。周期条件为累计零基 `step % save_interval == 0`。例如 interval=1000 时，周期保存的已采步数为 1、1001、2001……；另保存初始和结束状态，同一状态不重复发布。日志同样按累计零基物理 step 触发，结束时刷出剩余记录；终端 iteration 与 W&B 横轴为本次 run 从 0 开始的日志序号，JSONL step 和 Counters 仍保留累计物理进度。
 
 每个保存点写 `world_model.pt`、`actor.pt`、带输入契约的 `critic.pt` 和原子替换的 `training.pt`，共同记录到一个 model artifact。覆盖文件前等待上一份后台归档完成。无 `snapshots/` 目录，也没有按 round 发布历史文件的流程。
 

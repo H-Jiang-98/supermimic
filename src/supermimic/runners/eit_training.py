@@ -810,6 +810,24 @@ class EITTraining(BeliefModelTraining):
       seconds, budget, latest = {}, {}, {}
       training_peaks = {}
       history = []
+      log_count = 0
+      interval = runner.cfg.log_interval
+      total_logs = 0
+      if max_iterations > self.collected_steps:
+        total_logs = (
+          (max_iterations - 1) // interval
+          - (self.collected_steps - 1) // interval
+          + int((max_iterations - 1) % interval != 0)
+        )
+      mean_loss_keys = tuple(
+        f"Loss/{name}" for name in ("state", *self.learner.mean.loss_group_weights)
+      )
+      console_keys = (
+        *mean_loss_keys,
+        "Policy/reward",
+        "Policy/grad_norm",
+        "Policy/value_function",
+      )
 
       def publish():
         nonlocal upload, last_saved
@@ -893,6 +911,21 @@ class EITTraining(BeliefModelTraining):
           **{"Budget/" + k: v for k, v in budget.items()},
           **{"Perf/" + k: v for k, v in seconds.items()},
         }
+        # Keep original EIT diagnostics for reports and checkpoint log recovery.
+        for key in mean_loss_keys:
+          source = "Model/" + key
+          if source in losses:
+            losses[key] = losses[source]
+        for key, source in (
+          ("Policy/grad_norm", "Grad/actor_norm"),
+          ("Policy/value_function", "Policy/critic_loss"),
+        ):
+          if source in losses:
+            losses[key] = losses[source]
+        if "Policy/return" in losses:
+          losses["Policy/reward"] = losses["Policy/return"] / (
+            self.policy.cfg.horizon * runner.wm_env.representation.dt
+          )
         runtime = runtime_metadata(next(self.actor.parameters()))
         runtime["policy_cuda_graph"] = self.policy.graph_status
         runtime["eit_execution"] = "eager"
@@ -917,22 +950,24 @@ class EITTraining(BeliefModelTraining):
         }
 
       def log(step):
-        nonlocal collected
+        nonlocal collected, log_count
         rows = log_rows(step)
         row = rows["metrics.jsonl"]
         runner.logger.log(
-          it=step,
-          total_it=max_iterations,
+          it=log_count,
+          total_it=total_logs,
           collect_time=seconds.get("physical_collection_seconds", 0.0),
           wm_learn_time=seconds.get("world_model_seconds", 0.0),
           policy_learn_time=seconds.get("policy_seconds", 0.0),
           loss_dict={k: v for k, v in row.items() if k != "step"},
           num_collected_steps=collected,
+          console_keys=console_keys,
         )
         for name, record in rows.items():
           with (output / name).open("a") as stream:
             stream.write(json.dumps(record, allow_nan=False) + "\n")
         history.append(row)
+        log_count += 1
         collected = 0
         seconds.clear()
         budget.clear()

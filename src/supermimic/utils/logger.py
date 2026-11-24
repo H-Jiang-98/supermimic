@@ -154,7 +154,10 @@ class Logger:
     num_collected_steps: int,
     width: int = 80,
     pad: int = 40,
+    *,
+    console_keys: tuple[str, ...] | None = None,
   ) -> None:
+    """Log all metrics; optionally select and order console loss fields only."""
     iteration_time = collect_time + wm_learn_time + policy_learn_time
     self.tot_timesteps += num_collected_steps
     self.tot_time += iteration_time
@@ -186,7 +189,11 @@ class Logger:
         collect_time,
         wm_learn_time,
         policy_learn_time,
-        losses,
+        (
+          losses
+          if console_keys is None
+          else {key: losses[key] for key in console_keys if key in losses}
+        ),
         extras,
         iteration_time,
         width,
