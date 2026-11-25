@@ -210,6 +210,95 @@ def test_cache_preparation_has_no_filter_calls_and_keeps_mixed_sources_and_order
   assert (starts.batch["posterior_revision"] < starts.model_version).all()
 
 
+def test_normalization_indexes_only_new_retained_slots_and_reports_all_revisions():
+  loop = training(buffer_size=5)
+  runner = loop.runner
+  replay = runner.replay_buffer
+  replay.enable_posterior_cache(2, 5)
+  loop.refresh_collection()
+  cache = replay.posterior_cache
+  # After eight steps, sequence 2 is still in the posterior ring but has
+  # expired from the five-frame main ring. Only sequences 4 and 6 are eligible.
+  for steps, expected_samples in ((0, 0), (8, 4), (0, 0), (1, 2), (1, 0)):
+    for _ in range(steps):
+      runner.step()
+      runner._dynamics.begin_write()
+      runner._dynamics.finish_write()
+    with patch.object(cache, "locations_at", wraps=cache.locations_at) as index:
+      loop.update_input_normalization()
+    index.assert_called_once()
+    assert index.call_args.args[2].numel() == expected_samples
+    budget = loop._cache_budget
+    assert budget["normalization_samples"] == expected_samples
+    valid = (cache.sequences >= replay.insert_count - replay.num_transitions) & (
+      cache.sequences < replay.insert_count
+    )
+    assert budget["available_policy_starts"] == replay.num_envs * int(valid.sum())
+    assert budget["effective_posterior_count"] == budget["available_policy_starts"]
+    if valid.any():
+      gaps = (
+        runner._dynamics.model_revision - cache.storage["posterior_revision"][:, valid]
+      )
+      assert budget["posterior_revision_gap_min"] == int(gaps.min())
+      assert budget["posterior_revision_gap_max"] == int(gaps.max())
+      assert budget["posterior_revision_gap_mean"] == float(gaps.float().mean())
+  assert int(loop.actor.obs_normalizer.count) == 6
+
+
+@pytest.mark.parametrize("episode_ids", [None, [1]])
+def test_sampled_slots_match_key_lookup_and_rng_after_sparse_wrap(episode_ids):
+  loop = training(buffer_size=5)
+  runner = loop.runner
+  replay = runner.replay_buffer
+  replay.enable_posterior_cache(2, 5)
+  loop.refresh_collection()
+  for _ in range(8):
+    runner.step()
+  env = runner.wm_env
+  generator = torch.Generator().manual_seed(73)
+  reference_rng = generator.clone_state()
+  eligible = [
+    (row, t) for row in ([0, 1] if episode_ids is None else episode_ids) for t in (4, 6)
+  ]
+  draws = torch.cat(
+    [torch.randint(len(eligible), (7,), generator=reference_rng) for _ in range(3)]
+  )
+  keys = torch.tensor(eligible)[draws]
+  expected = env.prepare_policy_starts(*keys.unbind(1))
+  cache = replay.posterior_cache
+  with (
+    patch.object(cache, "lookup", side_effect=AssertionError("key lookup")),
+    patch.object(cache, "locations", wraps=cache.locations) as enumerate_slots,
+  ):
+    actual = env.sample_policy_starts(7, episode_ids, generator, num_batches=3)
+  if episode_ids is None:
+    enumerate_slots.assert_not_called()
+  assert torch.equal(generator.get_state(), reference_rng.get_state())
+  for key, value in expected.batch.items():
+    assert torch.equal(actual.batch[key], value), key
+  assert torch.equal(actual.belief.mean.to_full(), expected.belief.mean.to_full())
+  assert torch.equal(actual.belief.covariance_sqrt, expected.belief.covariance_sqrt)
+
+
+def test_sampled_slots_reject_overwrite_between_draw_and_read():
+  loop = training(buffer_size=3)
+  loop.refresh_collection()
+  for _ in range(3):
+    loop.runner.step()
+  env = loop.runner.wm_env
+  read = env.iter_cached_policy_starts
+
+  def collect_then_read(*args, **kwargs):
+    loop.runner.step()
+    return read(*args, **kwargs)
+
+  with (
+    patch.object(env, "iter_cached_policy_starts", side_effect=collect_then_read),
+    pytest.raises(ValueError, match="replay changed during policy sampling"),
+  ):
+    loop.policy.sample_starts()
+
+
 def test_saved_stride_wins_on_restore_and_v3_remains_readable_but_not_resumable():
   source = training()
   source.cfg = replace(source.cfg, posterior_save_stride=4)

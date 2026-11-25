@@ -582,44 +582,77 @@ class WorldModelEnv(ABC):
       start = BeliefRolloutStart.cat(list(self._iter_policy_starts(keys, len(keys))))
       return start.index(inverse)
 
-  def sample_policy_keys(
-    self, batch_size: int, episode_ids, generator=None, *, num_batches: int = 1
-  ):
-    """Draw consecutive policy batches from the eligible replay locations."""
+  def _draw_policy_indices(self, count, batch_size, generator, num_batches):
     if type(batch_size) is not int or batch_size < 1:
       raise ValueError("Policy start batch size must be positive")
     if type(num_batches) is not int or num_batches < 1:
       raise ValueError("Number of policy start batches must be positive")
+    if not count:
+      raise ValueError("No training frames with available posterior for policy starts")
+    return torch.cat(
+      [
+        torch.randint(count, (batch_size,), device=self.device, generator=generator)
+        for _ in range(num_batches)
+      ]
+    )
 
-    def draw(count):
-      if not count:
-        raise ValueError(
-          "No training frames with available posterior for policy starts"
-        )
-      return torch.cat(
-        [
-          torch.randint(count, (batch_size,), device=self.device, generator=generator)
-          for _ in range(num_batches)
-        ]
+  def _sample_policy_locations(
+    self, cache, batch_size, episode_ids, generator, num_batches
+  ):
+    replay = self.replay_buffer
+    if episode_ids is None:
+      saved = cache.saved_ordinals(replay)
+      indices = self._draw_policy_indices(
+        replay.num_envs * len(saved), batch_size, generator, num_batches
       )
+      return cache.locations_at(replay, saved, indices)
+    locations = cache.locations(replay, episode_ids=episode_ids)
+    indices = self._draw_policy_indices(
+      len(locations[0]), batch_size, generator, num_batches
+    )
+    return tuple(index[indices] for index in locations)
 
+  def sample_policy_keys(
+    self, batch_size: int, episode_ids, generator=None, *, num_batches: int = 1
+  ):
+    """Draw consecutive policy batches from the eligible replay locations."""
     replay = self.replay_buffer
     if replay.posterior_cache is not None:
-      rows, slots, _ = replay.posterior_cache.locations(replay, episode_ids=episode_ids)
-      selected = draw(len(rows))
-      rows, slots = rows[selected], slots[selected]
+      rows, slots, _ = self._sample_policy_locations(
+        replay.posterior_cache, batch_size, episode_ids, generator, num_batches
+      )
       return replay._storage["episode_id"][rows, slots], replay._storage["time_index"][
         rows, slots
       ]
     frames = replay.retained_frames(
       episode_ids=episode_ids, fields=("episode_id", "time_index")
     )
-    selected = draw(len(frames))
+    selected = self._draw_policy_indices(
+      len(frames), batch_size, generator, num_batches
+    )
     return frames["episode_id"][selected], frames["time_index"][selected]
 
-  def sample_policy_starts(self, batch_size: int, episode_ids, generator=None):
+  def sample_policy_starts(
+    self, batch_size: int, episode_ids=None, generator=None, *, num_batches: int = 1
+  ):
+    replay = self.replay_buffer
+    cache = replay.posterior_cache
+    if cache is not None:
+      with torch.inference_mode(False), torch.no_grad():
+        insert_count = replay.insert_count
+        locations = self._sample_policy_locations(
+          cache, batch_size, episode_ids, generator, num_batches
+        )
+        starts = next(
+          self.iter_cached_policy_starts(locations, batch_size=len(locations[0]))
+        )
+        if self.replay_buffer is not replay or replay.insert_count != insert_count:
+          raise ValueError("Stale rollout start: replay changed during policy sampling")
+        return starts
     return self.prepare_policy_starts(
-      *self.sample_policy_keys(batch_size, episode_ids, generator)
+      *self.sample_policy_keys(
+        batch_size, episode_ids, generator, num_batches=num_batches
+      )
     )
 
   def check_policy_start_identity(self, start):

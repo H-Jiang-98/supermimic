@@ -455,9 +455,19 @@ def test_round_policy_samples_singleton_training_episode():
   loop.runner.finish_collection_round()
   loop.refresh_collection()
   loop.policy.generators["sampling"].manual_seed(1)
-  with patch.object(
-    loop.policy, "update_prepared", wraps=loop.policy.update_prepared
-  ) as update:
+  with (
+    patch.object(
+      loop.policy, "update_prepared", wraps=loop.policy.update_prepared
+    ) as update,
+    patch.object(
+      loop.runner.replay_buffer.posterior_cache,
+      "lookup",
+      side_effect=AssertionError("key lookup"),
+    ),
+    patch.object(
+      loop, "policy_episode_ids", side_effect=AssertionError("episode enumeration")
+    ),
+  ):
     advance(loop)
   starts = update.call_args.args[0]
   assert starts.batch["episode_id"].tolist() == [1, 3]

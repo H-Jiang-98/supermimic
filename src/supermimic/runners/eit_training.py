@@ -231,34 +231,43 @@ class EITTraining(BeliefModelTraining):
     if cache is None:
       raise ValueError("EIT normalization requires posterior replay")
     with timer.measure("posterior_cache_read_seconds"):
-      locations = cache.locations(replay)
-      rows, slots, posterior_slots = locations
       if frames is None:
-        first = self._posterior_normalized_until
-        selected = cache.sequences[posterior_slots] >= first
+        fresh_locations = cache.locations(
+          replay, newest_count=replay.insert_count - self._posterior_normalized_until
+        )
       else:
+        locations = cache.locations(replay)
         selected = cache.frame_mask(replay, locations, frames)
-      fresh_locations = tuple(index[selected] for index in locations)
+        fresh_locations = tuple(index[selected] for index in locations)
       starts = (
         env.prepare_policy_starts(*policy_keys.unbind(dim=1))
         if policy_keys is not None and len(policy_keys)
         else None
       )
     count = len(fresh_locations[0])
-    gaps = (
-      self.runner._dynamics.model_revision
-      - cache.storage["posterior_revision"][rows, posterior_slots]
-      if len(rows)
-      else rows
-    )
+    saved = cache.saved_ordinals(replay)
+    available = replay.num_envs * len(saved)
+    # Each collection step writes the same model revision to every environment.
+    min_gap = max_gap = 0
+    mean_gap = 0.0
+    if saved:
+      pslots = (
+        torch.arange(saved.start, saved.stop, device=replay.device) % cache.capacity
+      )
+      gaps = (
+        self.runner._dynamics.model_revision
+        - cache.storage["posterior_revision"][0, pslots]
+      )
+      min_gap, max_gap = (int(value) for value in gaps.aminmax())
+      mean_gap = float(gaps.float().mean())
     self._cache_budget = {
       "posterior_save_stride": cache.stride,
-      "effective_posterior_count": len(rows),
-      "available_policy_starts": len(rows),
+      "effective_posterior_count": available,
+      "available_policy_starts": available,
       "normalization_samples": count,
-      "posterior_revision_gap_min": int(gaps.min()) if len(gaps) else 0,
-      "posterior_revision_gap_max": int(gaps.max()) if len(gaps) else 0,
-      "posterior_revision_gap_mean": float(gaps.float().mean()) if len(gaps) else 0,
+      "posterior_revision_gap_min": min_gap,
+      "posterior_revision_gap_max": max_gap,
+      "posterior_revision_gap_mean": mean_gap,
       **cache.storage_bytes(),
       "episode_head_storage_bytes": replay.episode_head_storage_bytes,
       "main_replay_storage_bytes": sum(
@@ -343,11 +352,8 @@ class EITTraining(BeliefModelTraining):
   def _update_policy(self) -> dict:
     runner = self.runner
     actor_before, critic_before = self.policy.actor_steps, self.policy.critic_steps
-    policy_ids = self.policy_episode_ids()
     with runner._dynamics.readonly(), runner.wm_env.readonly_policy_motion():
-      policy_keys = self.policy.sample_start_keys(policy_ids)
-      starts = runner.wm_env.prepare_policy_starts(*policy_keys.unbind(dim=1))
-      assert starts is not None
+      starts = self.policy.sample_starts()
       policy_logs = self.policy.update_prepared(starts)
     self._policy_profile = self.policy.last_profile.copy()
     self._policy_budget = {

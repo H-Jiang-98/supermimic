@@ -135,21 +135,30 @@ class PosteriorReplay:
       self.sequences[pslot] = seq
     self.frame_sequences[slot] = seq
 
-  def locations(self, replay, episode_ids=None, newest_count=None):
-    valid = (self.sequences >= max(0, replay.insert_count - replay.num_transitions)) & (
-      self.sequences < replay.insert_count
-    )
+  def saved_ordinals(self, replay, *, newest_count=None) -> range:
+    """Retained multiples of stride, in units of saved steps per environment."""
+    end = replay.insert_count
+    count = replay.num_transitions
     if newest_count is not None:
-      valid &= self.sequences >= replay.insert_count - newest_count
-    pslots = valid.nonzero().flatten()
-    pslots = pslots[torch.argsort(self.sequences[pslots])]
-    rows = (
-      torch.arange(replay.num_envs, device=replay.device)[:, None]
-      .expand(-1, len(pslots))
-      .reshape(-1)
+      count = min(count, max(0, newest_count))
+    first = end - count
+    return range(
+      (first + self.stride - 1) // self.stride,
+      (end + self.stride - 1) // self.stride,
     )
-    pslots = pslots.repeat(replay.num_envs)
-    slots = self.sequences[pslots] % replay.buffer_size
+
+  def locations_at(self, replay, saved: range, indices: torch.Tensor):
+    """Map flat row-major draws to both rings, preserving order and duplicates."""
+    if not len(indices):
+      return indices, indices, indices
+    rows = indices // len(saved)
+    ordinals = saved.start + indices % len(saved)
+    return rows, (ordinals * self.stride) % replay.buffer_size, ordinals % self.capacity
+
+  def locations(self, replay, episode_ids=None, newest_count=None):
+    saved = self.saved_ordinals(replay, newest_count=newest_count)
+    indices = torch.arange(replay.num_envs * len(saved), device=replay.device)
+    rows, slots, pslots = self.locations_at(replay, saved, indices)
     if episode_ids is not None:
       mask = torch.isin(
         replay._storage["episode_id"][rows, slots],

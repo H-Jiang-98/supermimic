@@ -33,8 +33,9 @@
 
 控制历史由主 replay 的 `actor_obs` 与最近淘汰的 `history_length−1` 帧边界观测组成。
 真实 episode 开头重复首帧补齐；环形覆盖不能被误当成 episode 开头。
-`sample_policy_starts` 从仍保留且保存过后验的所有帧均匀、有放回抽样，
-单帧片段也可入选；`prepare_policy_starts` 按给定帧标识和顺序读取。
+训练时 `sample_policy_starts` 从仍保留的后验均匀、有放回抽样，单帧片段也可入选。
+每个抽样下标按环境行和保存序号换算成主 replay 和后验缓存的槽位，直接按抽样顺序读取。
+`prepare_policy_starts` 支持按指定的 episode 和时间索引读取。
 
 世界模型使用全部有效真实窗口和相邻转移，不受后验 stride 限制。
 窗口不跨 episode、时间缺口或 terminated/truncated 边界。
@@ -58,8 +59,8 @@
 
 ## 归一化和预算观测
 
-每个新模型训练帧仅计入一次世界模型归一化；actor/critic 归一化读取新采且仍保留的后验帧，
-包含世界模型验证 episode，并将所有选中的帧作为一个 batch 更新输入统计量。
+每个新模型训练帧仅计入一次世界模型归一化。actor/critic 归一化从上次成功更新后的采集序号开始，
+按保存步距直接定位仍保留的新增后验帧，包含世界模型验证 episode，并整批更新输入统计量。
 统计先校验再提交，warmup 也更新；同一步多个训练组不会重复计数。
 本步没有新保存后验时沿用已有统计。
 

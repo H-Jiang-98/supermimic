@@ -329,11 +329,17 @@ class BeliefActorCriticPolicyLearner:
     )
     return torch.stack((episodes, times), dim=1)
 
+  def sample_starts(self, episode_ids=None):
+    return self.wm_env.sample_policy_starts(
+      self.cfg.batch_size,
+      episode_ids,
+      generator=self.generators["sampling"],
+      num_batches=self.cfg.num_batches,
+    )
+
   def update(self, episode_ids):
     with self.wm_env.readonly_policy_motion():
-      keys = self.sample_start_keys(episode_ids)
-      starts = self.wm_env.prepare_policy_starts(*keys.unbind(dim=1))
-      return self.update_prepared(starts)
+      return self.update_prepared(self.sample_starts(episode_ids))
 
   def update_prepared(self, starts):
     """Reuse detached initial conditions while each new actor generates its own rollout."""
