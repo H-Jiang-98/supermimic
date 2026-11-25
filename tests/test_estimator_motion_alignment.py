@@ -26,6 +26,7 @@ def _command() -> MotionCommand:
   command.cfg = SimpleNamespace(
     fixed_reference_alignment=True,
     sampling_mode="start",
+    fixed_start_frames=None,
     pose_range={"x": (0.4, 0.4), "y": (-0.3, -0.3), "yaw": (0.5, 0.5)},
     velocity_range={},
     joint_position_range=(0.0, 0.0),

@@ -154,7 +154,18 @@ class MotionCommand(BaseMotionCommand):
       self.metrics["sampling_top1_prob"][env_ids] = p.max()
       self.metrics["sampling_top1_bin"][env_ids] = p.argmax().float() / self.bin_count
     elif self.cfg.sampling_mode == "start":
-      self.time_steps[env_ids] = 0
+      starts = self.cfg.fixed_start_frames
+      if starts is None:
+        self.time_steps[env_ids] = 0
+      else:
+        if len(starts) != self.num_envs or any(
+          type(frame) is not int or not 0 <= frame < self.motion.time_step_total
+          for frame in starts
+        ):
+          raise ValueError(
+            "fixed_start_frames requires one valid frame per environment"
+          )
+        self.time_steps[env_ids] = torch.as_tensor(starts, device=self.device)[env_ids]
     else:
       super()._sample_time_steps(env_ids)
 
@@ -241,6 +252,7 @@ class MotionCommandCfg(BaseMotionCommandCfg):
   motion_file: str | list[str]
   sampling_mode: Literal["adaptive", "uniform", "start", "external"] = "adaptive"
   fixed_reference_alignment: bool = False
+  fixed_start_frames: list[int] | None = None
 
   def build(self, env: ManagerBasedRlEnv) -> MotionCommand:
     return MotionCommand(self, env)
