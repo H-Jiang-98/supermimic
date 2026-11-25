@@ -1,16 +1,17 @@
+# EIT v6 概览与配置教程：README_eit.md
 # 在仓库根目录预览调度：python3 src/supermimic/scripts/launch_eit.py --dry-run
 # 去掉 --dry-run 即启动。所有方法共用 [training]，同一 seed 共用一份初始化。
 [paths]
 environment_root = "/mnt/cpfs/zbl-cpfs-new/USERS/leojiang/supermimic_ws" # 使用 .venv/bin/python
 dataset_root = "/mnt/cpfs/zbl-cpfs-new/dataset/leojiang/supermimic_ws"
-motion_file = "motions/*.npz" # 相对 dataset_root，也可用 "motions/*.npz"
+motion_file = "motions/*.npz" # 相对 dataset_root；支持单个 NPZ 或 glob。
 checkpoint_root = "/mnt/cpfs/zbl-cpfs-new/CKPT/leojiang/supermimic_ws"
 experiment = "eit_v6_Lafan_compiled_h32_2048envs_stride1" # 输出：checkpoint_root/experiment/seed<seed>/<方法>/
 
 [training]
 jacobian_backend = "increment" # 35 维网络增量求导，再通过积分组装 70x70 Jacobian。
 eager = false # CUDA 默认编译训练热点，true 用于 eager 对照。
-policy_cuda_graphs = true # 显式启用 actor rollout/backward replay；尾批整次回退，eager=true 关闭。
+policy_cuda_graphs = true # 完整 actor–critic 更新单图回放；actor 尾批整次回退，eager=true 关闭。
 num_envs = 2048
 max_iterations = 300_000 # 每个环境的累计物理步数
 buffer_size = 1000

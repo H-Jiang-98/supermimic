@@ -1,4 +1,4 @@
-"""Auditable per-round budgets and post-commit timings retain resume guarantees."""
+"""Auditable training budgets and post-commit timings retain resume guarantees."""
 
 import json
 import math

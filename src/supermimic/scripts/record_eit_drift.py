@@ -27,7 +27,7 @@ from supermimic.scripts.eval_eit import evaluate
 
 
 def generate_supine_motion(path: Path, *, frames=250):
-  """Reproduce docs/eit_diagnostics.md, retaining real reset and failure rules."""
+  """Reproduce docs/eit_operations.md, retaining real reset and failure rules."""
   if type(frames) is not int or frames < 8:
     raise ValueError("Drift fixture requires at least eight frames")
   joint_pose = KNEES_BENT_KEYFRAME.joint_pos
@@ -50,7 +50,7 @@ def generate_supine_motion(path: Path, *, frames=250):
   np.savez(path, **arrays)
   return {
     "kind": "generated_supine_joint_position_reference_v1",
-    "source": "docs/eit_diagnostics.md#固定后验漂移样例",
+    "source": "docs/eit_operations.md#固定后验漂移样例",
     "robot_xml": str(G1_XML),
     "robot_xml_sha256": file_sha256(Path(G1_XML)),
     "joint_pose_source": "mjlab.unitree_g1.KNEES_BENT_KEYFRAME.joint_pos",

@@ -5,8 +5,7 @@
 
 `eit_rpv_v1` 的 A/B/C 组使用本地 `training.pt` 做定量评估、播放和 ONNX actor 导出。评估与播放共用 `EITPolicyAdapter`，支持 PyTorch actor 和对应快照导出的 ONNX actor。
 
-Step 6 的真实 walking 单 seed A/B/C、固定输入恢复、逐快照诊断、预算审计与在线
-batch=1 性能测量见 [pilot 操作说明](docs/eit_pilot.md)。
+EIT v6 的短程 pilot、恢复验证、预算审计与固定轨迹诊断见 [运行与诊断](docs/eit_operations.md)。
 
 ## EIT 定量评估和播放
 
@@ -16,12 +15,12 @@ MPKPE、root-relative MPKPE、关节速度 RMS 和末端位姿误差函数。每
 
 ```bash
 OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.eval_eit \
-  --checkpoint logs/eit-v4/B/training.pt \
+  --checkpoint logs/eit-v6/B/training.pt \
   --motion-file data/motions/walk1_subject1.npz --device cpu \
-  --num-envs 8 --output logs/eit-v4/B/evaluation.json
+  --num-envs 8 --output logs/eit-v6/B/evaluation.json
 
 .venv/bin/python -m supermimic.scripts.play SuperMimic-GenCoord-G1 \
-  --eit-checkpoint logs/eit-v4/B/training.pt \
+  --eit-checkpoint logs/eit-v6/B/training.pt \
   --motion-file data/motions/walk1_subject1.npz --viewer viser
 ```
 
@@ -33,7 +32,7 @@ OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.eval_eit \
 | `eit_training_v5`，`stage=policy` | 评估、播放和 ONNX actor 导出 |
 | `eit_model_training_v4`，`stage=model` | `train_belief` 续训、固定 actor 的评估、播放和 ONNX actor 导出 |
 
-策略快照须声明 full replay 并包含相应的 critic 契约（v6 使用 `eit_rpv_belief_critic_v3`，v5 使用 `eit_rpv_belief_critic_v2`）。推理加载器核对契约与世界模型的 context 宽度及 critic 首层的输入宽度。启动训练、生成共享初始化包及继续训练的命令见[训练说明](README.md#estimator-第四步完整策略与模型交替训练)。
+策略快照须声明 full replay 并包含相应的 critic 契约（v6 使用 `eit_rpv_belief_critic_v3`，v5 使用 `eit_rpv_belief_critic_v2`）。推理加载器核对契约与世界模型的 context 宽度及 critic 首层的输入宽度。启动训练、生成共享初始化包及继续训练的命令见[训练说明](README_eit.md)。
 
 `eval_eit` 允许不同于训练数据的兼容 motion，记录训练和评估两份内容指纹；这不改变
 续训的严格 motion 校验。末端名单由 `--ee-body-names` 指定，默认使用 G1 的左右
@@ -53,7 +52,7 @@ OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.eval_eit \
 排除终止步已被自动 reset 替换的状态；回报和 episode 长度仍包含终止动作。
 `metric_steps=0` 的轨迹误差为 null，并从误差均值排除；`metric_episode_count`
 报告实际纳入的轨迹数。相对身体指标使用评分帧参考与动作后当前根位姿重新对齐，
-与 EIT 奖励一致。后验 RMSE、variance、jitter 和 innovation 在动作前、actor 使用的
+与 EIT 奖励一致。后验 RMSE、variance 和 innovation 在动作前、actor 使用的
 同一后验上计算，只统计首个 episode。
 
 EIT viewer 的蓝紫色半透明模型标为 `online_posterior`，显示当前在线后验均值；
@@ -63,37 +62,19 @@ EIT viewer 的蓝紫色半透明模型标为 `online_posterior`，显示当前�
 
 ## 共同初始化、快照与批量选模
 
-下面的命令在 CPU 上运行 5 个环境、累计 8 步（40 个实采帧）的小网络验收。
-同一初始化用于各组，候选为各输出目录的 `training.pt`。当前 v5 不维护历史快照索引；
-若需要多个历史候选，使用明确保留的 artifact 文件路径。旧 v3/v4 checkpoint 不兼容。
+共享初始化与训练流程见 [EIT 训练教程](README_eit.md)。训练只覆盖本地最新
+`training.pt`；需要比较多个历史候选时，先保留各保存点或从 model artifact 取得文件。
 
-```bash
-PY=.venv/bin/python
-export OMP_NUM_THREADS=1 WANDB_MODE=disabled
-motion=data/motions/walk1_subject1.npz
-shared=logs/step5/shared_364.pt
-args=(--motion-file "$motion" --device cpu --seed 364 --num-envs 5
-      --max-iterations 8 --buffer-size 7 --replay-ratio 1 --sampling-mode uniform
-      --mean-window-frames 3 --mean-updates 1 --mean-batch-size 4 --cov-batch-size 8 --cov-validation-pairs 8
-      --policy-batch-size 1 --samples 1 --policy-horizon 2 --policy-microbatch-size 1
-      --critic-epochs 1 --hidden-dims 24 16 --actor-hidden-dims 16 --critic-hidden-dims 16)
-"$PY" -m supermimic.scripts.train_eit "${args[@]}" --group B \
-  --prepare-initialization --initialization "$shared"
-for group in A B C; do
-  "$PY" -m supermimic.scripts.train_eit "${args[@]}" --group "$group" \
-    --initialization "$shared" --output "logs/step5/$group"
-done
-```
-
-冻结场景清单后，依次运行验证和测试。每组每个训练 seed 使用验证集选出的同一份快照评估所有测试条件。清单示例、重试命令、缺失任务和逐 clip 等权汇总的定义见[批量评估说明](docs/eit_batch.md)。真实时限、原始 episode 和不同长度轨迹的手算期望值分别见[整段协议验收](docs/validation/eit_full_clip.json)和[聚合样例](docs/validation/eit_clip_aggregation.json)。
+冻结场景后先运行验证，再对每组每个 seed 的入选快照运行测试。
+清单、重试与逐 clip 等权汇总见 [批量评估](docs/eit_batch.md)。
 
 ## 独立诊断和 ONNX actor
 
 ```bash
 PY=.venv/bin/python
 motion=data/motions/walk1_subject1.npz
-ckpt=logs/step5/B/training.pt
-out=logs/step5/diagnostics
+ckpt=logs/eit-v6/B/training.pt
+out=logs/eit-v6/diagnostics
 "$PY" -m supermimic.scripts.eval_eit --checkpoint "$ckpt" --motion-file "$motion" \
   --num-envs 1 --seed 4795 --posterior-bin-steps 50 --record "$out/episodes.pt" \
   --export-onnx "$out/actor.onnx" --output "$out/evaluation.json"
@@ -103,9 +84,9 @@ out=logs/step5/diagnostics
   --onnx-actor "$out/actor.onnx" --device cpu --num-envs 1 --seed 4795 --output "$out/onnx.json"
 ```
 
-`--record` 保存每个环境首个 episode 的实测序列、已执行动作、真值、参考目标、上下文、实际初始 prior、奖励和终止原因。用同一份记录跨模型打分时选择 `--mode process` 或 `--mode posterior`。critic 的折扣回报诊断使用本快照控制的独立 episode。A 组另用 `--truth-actor` 采集训练输入条件。可用 `--no-posterior-diagnostics` 关闭在线统计。记录格式、删失处理和固定轨迹漂移验收见[诊断说明](docs/eit_diagnostics.md)。
+`--record` 保存每个环境首个 episode 的实测序列、已执行动作、真值、参考目标、上下文、实际初始 prior、奖励和终止原因。用同一份记录跨模型打分时选择 `--mode process` 或 `--mode posterior`。critic 的折扣回报诊断使用本快照控制的独立 episode。A 组另用 `--truth-actor` 采集训练输入条件。可用 `--no-posterior-diagnostics` 关闭在线统计。记录格式、删失处理和固定轨迹漂移验收见[诊断说明](docs/eit_operations.md#固定轨迹诊断)。
 
-EIT 导出图接受 CPU float32 的 `history[1,5,93]`（最旧帧在前）和 `goal[1,700]`。C 组额外接受 `uncertainty[1,450]`。输出 `actions[1,29]` 是限幅前的归一化动作。图内含归一化、motion encoder、decoder 和 C 的 FiLM。图的 `eit_contract` 元数据包含特征排列、关节顺序、动作仿射映射和快照身份。适配器在图外完成滤波、历史、参考构造及限幅。当前 CPU 执行使用 ONNX ReferenceEvaluator，`onnx_timing` 记录本次图执行的平均耗时。播放时将 `--eit-onnx-actor "$out/actor.onnx" --device cpu` 加到对应快照的 `play` 命令。三组小网络的图、快照摘要、CPU 计时、相同记录上的模型和后验评分，以及各自独立 episode 上的 critic 误差见[本地验收汇总](docs/validation/eit_diagnostics_onnx.json)。
+EIT 导出图接受 CPU float32 的 `history[1,5,93]`（最旧帧在前）和 `goal[1,700]`。C 组额外接受 `uncertainty[1,450]`。输出 `actions[1,29]` 是限幅前的归一化动作。图内含归一化、motion encoder、decoder 和 C 的 FiLM。图的 `eit_contract` 元数据包含特征排列、关节顺序、动作仿射映射和快照身份。适配器在图外完成滤波、历史、参考构造及限幅。当前 CPU 执行使用 ONNX ReferenceEvaluator，`onnx_timing` 记录本次图执行的平均耗时。播放时将 `--eit-onnx-actor "$out/actor.onnx" --device cpu` 加到对应快照的 `play` 命令。
 
 ## 旧 checkpoint 启动播放
 

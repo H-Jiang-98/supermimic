@@ -148,7 +148,6 @@ def test_seeded_gaussian_coverage_and_streaming_bins():
     indices % 100,
     error,
     covariance,
-    torch.zeros(size),
     error.norm(dim=-1),
     error[:, 3:6] * 0.5,
     error[:, 6:9] * 0.5,

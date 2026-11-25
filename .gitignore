@@ -223,6 +223,7 @@ __marimo__/
 /data/
 tests/*
 !tests/test_estimator_*.py
+!tests/fixtures/
 downloads/*
 
 download_training.sh

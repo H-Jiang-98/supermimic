@@ -164,7 +164,6 @@ def fixture(root, monkeypatch):
         "velocity_rmse_m_s": 0.1,
         "mean_innovation_norm": 0.1,
         "null_direction_violations": 0,
-        "jitter_frames": 0,
       }
       value_error = {"samples": 4, "bias": -2.0, "mae": 2.0, "rmse": 2.0}
       write(

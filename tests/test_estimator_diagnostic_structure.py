@@ -37,7 +37,6 @@ def valid_diagnostic_score():
         "mean_innovation_norm": 1.0,
         "coverage_95": 1.0,
         "null_direction_violations": 0,
-        "jitter_frames": 0,
       }
     ],
     "critic": {

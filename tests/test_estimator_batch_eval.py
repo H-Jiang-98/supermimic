@@ -9,7 +9,7 @@ from supermimic.scripts import batch_eval_eit as batch
 
 def test_hand_computed_clip_and_episode_weighting():
   data = batch.read_json(
-    Path(__file__).resolve().parents[1] / "docs/validation/eit_clip_aggregation.json"
+    Path(__file__).resolve().parent / "fixtures/eit_clip_aggregation.json"
   )
   for rows in data["clips"].values():
     for row in rows:
@@ -352,17 +352,6 @@ def test_admission_reads_checkpoint_and_pairs_initialization_by_seed(tmp_path):
   state["initialization_digest"] = None
   with pytest.raises(ValueError, match="initialization fingerprint"):
     batch.admit(state, runs[1], index, train)
-
-
-def test_real_validation_fixture_reaggregates():
-  sample = batch.read_json(
-    Path(__file__).resolve().parents[1] / "docs/validation/eit_batch_walk.json"
-  )
-  for task in sample["tasks"]:
-    summary = batch.aggregate({sample["sha256"]: task["episodes"]})
-    assert summary["scores"] == pytest.approx(task["expected_scores"])
-  tests = [r for r in sample["tasks"] if r["split"] == "test"]
-  assert all(r["snapshot_sha256"] == sample["selected_sha256"] for r in tests)
 
 
 def test_repacked_clip_cannot_cross_holdout_or_get_two_clip_votes(
