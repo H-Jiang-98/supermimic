@@ -181,7 +181,22 @@ def main():
     "--critic-lr", type=float, default=BeliefPolicyLearnerCfg.critic_lr
   )
   parser.add_argument("--exploration", type=float, default=0.1)
-  parser.add_argument("--hidden-dims", type=int, nargs="+", default=[2048, 2048, 2048])
+  parser.add_argument(
+    "--mean-hidden-dims",
+    "--hidden-dims",
+    dest="mean_hidden_dims",
+    type=int,
+    nargs="+",
+    default=[2048, 2048, 2048],
+    help="World model mean hidden widths (--hidden-dims is a legacy alias)",
+  )
+  parser.add_argument(
+    "--cov-hidden-dims",
+    type=int,
+    nargs="+",
+    default=list(ProcessNoiseConfig().hidden_dims),
+    help="World model process covariance hidden widths",
+  )
   parser.add_argument(
     "--actor-hidden-dims", type=int, nargs="+", default=[2048, 1024, 512, 256]
   )
@@ -197,6 +212,9 @@ def main():
   parser.add_argument("--wandb-project", help="Common runner W&B project")
   parser.add_argument("--run-name", help="Common runner run name")
   args = parser.parse_args()
+  for name in ("mean_hidden_dims", "cov_hidden_dims"):
+    if any(width < 1 for width in getattr(args, name)):
+      parser.error(f"--{name.replace('_', '-')} requires positive hidden widths")
   os.environ.setdefault("WANDB_MODE", "offline")
   if os.environ["WANDB_MODE"] not in ("offline", "disabled"):
     parser.error("EIT requires WANDB_MODE=offline or disabled")
@@ -261,10 +279,10 @@ def main():
     mean, cov = model_fit_configs(args)
     runner_cfg = SuperMimicRunnerCfg.for_estimator_inputs(
       args.group,
-      dynamics_hidden_dims=tuple(args.hidden_dims),
+      dynamics_hidden_dims=tuple(args.mean_hidden_dims),
       actor_hidden_dims=tuple(args.actor_hidden_dims),
       critic_hidden_dims=tuple(args.critic_hidden_dims),
-      process_noise=ProcessNoiseConfig(),
+      process_noise=ProcessNoiseConfig(hidden_dims=tuple(args.cov_hidden_dims)),
       filter_config=FilterConfig(
         jacobian_backend=args.jacobian_backend,
         jacobian_batch_chunk_size=args.jacobian_batch_chunk_size,
