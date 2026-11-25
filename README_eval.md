@@ -7,6 +7,8 @@
 
 EIT v6 的短程 pilot、恢复验证、预算审计与固定轨迹诊断见 [运行与诊断](docs/eit_operations.md)。
 
+完整片段评测使用 `eval_eit_validation.toml` 选择策略，每条轨迹同时生成 tracking 和在线 odometry 两套结果。运行命令、图表路径和三层回放见 [联合评测说明](docs/eit_validation.md)。
+
 ## EIT 定量评估和播放
 
 评估沿用 mjlab `tasks/tracking/scripts/evaluate.py` 的首个 episode 循环，直接调用其

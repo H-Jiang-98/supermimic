@@ -1776,6 +1776,7 @@ name = "supermimic"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "matplotlib" },
     { name = "mjlab" },
     { name = "ruff" },
     { name = "viser" },
@@ -1791,6 +1792,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "matplotlib", specifier = ">=3.10" },
     { name = "mjlab", editable = "../mjlab_for_supermimic" },
     { name = "ruff", specifier = ">=0.14.10" },
     { name = "viser", specifier = ">=1.0.24" },

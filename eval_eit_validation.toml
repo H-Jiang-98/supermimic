@@ -1,0 +1,64 @@
+# Paths are relative to this file. CLI flags override TOML values.
+
+[paths]
+checkpoint_root = "logs/eit_v6_Lafan_compiled_h32_2048envs_stride1/checkpoints/iteration_2500/seed2027"
+motion_files = ["data/motions/*.npz"]
+output = "artifacts/eit-validation/joint-v3"
+
+[evaluation]
+# Available: A-posterior, B-posterior, C-posterior, A-truth.
+methods = ["A-truth"]
+
+[scenarios]
+num_domain_contexts = 16
+sobol_seed = 2026
+evaluation_seed = 2718
+max_frames = 0 # 0 scores the full clip.
+
+[simulation]
+iterations = 20
+ls_iterations = 50
+
+[execution]
+device = "cuda:0"
+compile_kernels = true
+num_envs = 640
+jacobian_batch_chunk_size = 640
+transfer_chunk_steps = 1024
+torch_threads = 1
+warmup_steps = 20
+
+[diagnostics]
+debug_checks = false
+host_check_interval_steps = 1024
+progress_interval_s = 30.0
+
+[metrics]
+time_bin_s = 2.0
+rotation_rmse_unit = "deg"
+ee_body_names = ["left_ankle_roll_link", "right_ankle_roll_link", "left_wrist_yaw_link", "right_wrist_yaw_link"]
+
+[plots]
+representative_clips = [
+  "walk1_subject1.npz", "run1_subject2.npz", "dance1_subject1.npz",
+  "jumps1_subject1.npz", "fallAndGetUp1_subject1.npz", "fight1_subject2.npz",
+]
+boxplot_interval_s = 4.0
+plot_dpi = 150
+plot_width = 16.0
+plot_row_height = 3.3
+
+[replay]
+replay_context_selection = "first_middle_last"
+replay_context_ids = [] # Used with replay_context_selection = "explicit".
+
+[viewer]
+viewer_port = 8080
+playback_speed = 1.0
+panel_spacing = 4.0
+reference_rgba = [0.3, 0.8, 0.4, 0.35]
+truth_rgba = [0.65, 0.65, 0.65, 1.0]
+posterior_rgba = [0.45, 0.4, 0.9, 0.45]
+show_reference = true
+show_truth = true
+show_posterior = true

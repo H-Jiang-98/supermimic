@@ -8,7 +8,7 @@
 
 ## 选择方法与续跑
 
-以下是选择 C 方法的配置示例，与当前仓库的 `eval_eit_validation.toml` 一致。每次 `run` 按所用 TOML 的 `methods` 列表调度。
+下例选择 C 方法。每次 `run` 执行的策略由所用 TOML 的 `methods` 列表决定。
 
 ```toml
 [evaluation]
