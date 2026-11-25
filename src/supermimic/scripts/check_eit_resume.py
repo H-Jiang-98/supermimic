@@ -26,7 +26,11 @@ from supermimic.runners.eit_resume_reference import (
   equal_tree,  # noqa: F401 — public import retained for callers and tests.
 )
 from supermimic.runners.eit_snapshots import file_sha256
-from supermimic.runners.eit_training import EITTraining, EITTrainingCfg
+from supermimic.runners.eit_training import (
+  EITTraining,
+  EITTrainingCfg,
+  saved_loop_config,
+)
 from supermimic.runners.run_config import load_runner_cfg
 from supermimic.runners.supermimic_runner import SuperMimicRunner
 from supermimic.scripts.train_utils import create_env
@@ -54,7 +58,7 @@ def _verify(checkpoint: Path, motion_file: Path, device: str, reference: Path):
   for key, expected in expected_identity.items():
     if evidence.get(key) != expected:
       raise ValueError(f"Live update reference {key} does not match checkpoint")
-  loop = EITTrainingCfg(**saved["loop_config"])
+  loop = EITTrainingCfg(**saved_loop_config(saved))
   policy_cfg = BeliefPolicyLearnerCfg(**saved["policy_config"])
   env_cfg = load_env_cfg("SuperMimic-GenCoord-G1")
   env_cfg.seed = saved["training_seed"]

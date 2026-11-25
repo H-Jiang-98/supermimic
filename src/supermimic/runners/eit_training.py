@@ -95,7 +95,6 @@ def _finish_publication(output: Path) -> None:
 class EITTrainingCfg:
   validation_stride: int = 5
   validation_batch_size: int = 4
-  normalization_batch_size: int = 16
   posterior_save_stride: int = 1
 
   def __post_init__(self):
@@ -105,11 +104,13 @@ class EITTrainingCfg:
       raise ValueError("validation_batch_size must be positive")
     if type(self.posterior_save_stride) is not int or self.posterior_save_stride < 1:
       raise ValueError("posterior_save_stride must be positive")
-    if (
-      type(self.normalization_batch_size) is not int
-      or self.normalization_batch_size < 1
-    ):
-      raise ValueError("normalization_batch_size must be positive")
+
+
+def saved_loop_config(checkpoint: dict) -> dict:
+  """Read EIT loop settings from checkpoints written before or after full-batch normalization."""
+  config = checkpoint["loop_config"].copy()
+  config.pop("normalization_batch_size", None)
+  return config
 
 
 def initialization_fingerprint(
@@ -281,22 +282,19 @@ class EITTraining(BeliefModelTraining):
     storage = replay._storage.select(
       "state", "actor_obs", "motion_time", "alignment_rotation", "alignment_translation"
     )
-    batch_size = self.cfg.normalization_batch_size
+    rows, slots, pslots = fresh_locations
     try:
-      for offset in range(0, count, batch_size):
-        selection = slice(offset, offset + batch_size)
-        rows, slots, pslots = (index[selection] for index in fresh_locations)
-        with timer.measure("posterior_cache_read_seconds"):
-          batch = cast(TensorDict, storage[rows, slots])
-          posterior = None
-          if inputs.uses_posterior:
-            mean = unpack_mean(cache.storage["posterior_mean"][rows, pslots]).to(
-              dtype=batch["state"].dtype
-            )
-            posterior = RpvState(mean.rotation, mean.position, mean.velocity)
-        values = self._normalization_inputs(batch, posterior)
-        for module, value in zip(staged, values, strict=True):
-          module.update(value)
+      with timer.measure("posterior_cache_read_seconds"):
+        batch = cast(TensorDict, storage[rows, slots])
+        posterior = None
+        if inputs.uses_posterior:
+          mean = unpack_mean(cache.storage["posterior_mean"][rows, pslots]).to(
+            dtype=batch["state"].dtype
+          )
+          posterior = RpvState(mean.rotation, mean.position, mean.velocity)
+      values = self._normalization_inputs(batch, posterior)
+      for module, value in zip(staged, values, strict=True):
+        module.update(value)
       if not torch.stack(
         [value.isfinite().all() for module in staged for value in module.buffers()]
       ).all():
@@ -460,7 +458,7 @@ class EITTraining(BeliefModelTraining):
     try:
       self.cfg = saved_cfg
       self.runner.posterior_save_stride = saved_cfg.posterior_save_stride
-      super().load_state_dict(state)
+      super().load_state_dict(dict(state, loop_config=saved_loop_config(state)))
     except Exception:
       self.cfg, self.runner.posterior_save_stride = old_cfg, old_stride
       raise

@@ -72,11 +72,7 @@ def training(seed=31, *, buffer_size=8, replay_ratio=1):
   runner.wm_env = env
   return EITTraining(
     runner,
-    EITTrainingCfg(
-      validation_stride=2,
-      validation_batch_size=2,
-      normalization_batch_size=2,
-    ),
+    EITTrainingCfg(validation_stride=2, validation_batch_size=2),
     BeliefPolicyLearnerCfg(
       batch_size=2,
       num_samples=2,
@@ -350,8 +346,7 @@ def test_normalization_late_failure_preserves_all_live_statistics(field):
   frames = frames[frames["episode_id"] == 1]
   actor = deepcopy(loop.actor.state_dict())
   critic = deepcopy(loop.policy.critic.state_dict())
-  # A bad field in the second chunk reaches the validator after the first
-  # two training samples have already reached the private normalizers.
+  # A bad field in the last selected frame must invalidate the entire batch.
   value = loop.runner.replay_buffer._storage[field][1, 3]
   value.flatten()[0] = 2.0 if field == "alignment_rotation" else float("inf")
   with pytest.raises(ValueError, match="Non-finite|Rotation"):
@@ -363,9 +358,10 @@ def test_normalization_late_failure_preserves_all_live_statistics(field):
 
 @pytest.mark.parametrize("group", ["A", "B", "C"])
 def test_replay_normalization_matches_full_reset_statistics_without_rollout(group):
-  loop = training()
+  # Two environments yield 18 fresh frames, exceeding the former 16-frame chunk.
+  loop = training(buffer_size=9)
   loop.refresh_collection()
-  for _ in range(4):
+  for _ in range(9):
     loop.runner.step(record_episode_stats=False)
   loop.runner.finish_collection_round()
   env, replay = loop.runner.wm_env, loop.runner.replay_buffer
@@ -382,7 +378,7 @@ def test_replay_normalization_matches_full_reset_statistics_without_rollout(grou
   expected_actor.train()
   with torch.no_grad(), env.readonly_policy_motion():
     locations = replay.posterior_cache.locations(replay)
-    for chunk in env.iter_cached_policy_starts(locations, batch_size=2):
+    for chunk in env.iter_cached_policy_starts(locations, batch_size=len(locations[0])):
       obs = env.reset_prepared(chunk)
       expected_actor.update_normalization(obs)
       expected_critic.update_normalization(obs["critic"])
@@ -392,8 +388,13 @@ def test_replay_normalization_matches_full_reset_statistics_without_rollout(grou
     patch.object(
       replay.posterior_cache, "read", side_effect=AssertionError("full belief read")
     ),
+    patch.object(
+      loop, "_normalization_inputs", wraps=loop._normalization_inputs
+    ) as inputs,
   ):
     loop.update_input_normalization()
+  inputs.assert_called_once()
+  assert len(inputs.call_args.args[0]) == 18
   assert_tree(loop.actor.state_dict(), expected_actor.state_dict())
   assert_tree(loop.policy.critic.state_dict(), expected_critic.state_dict())
 

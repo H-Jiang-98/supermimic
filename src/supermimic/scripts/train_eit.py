@@ -23,6 +23,7 @@ from supermimic.runners.eit_training import (
   EITTraining,
   EITTrainingCfg,
   initialization_fingerprint,
+  saved_loop_config,
 )
 from supermimic.runners.run_config import EIT_INITIALIZATION_VERSION, load_runner_cfg
 from supermimic.runners.supermimic_runner import SuperMimicRunner, SuperMimicRunnerCfg
@@ -282,7 +283,7 @@ def main():
     saved = torch.load(args.resume, map_location=args.device, weights_only=True)
     EITTraining._check_checkpoint_version(saved)
     runner_cfg = load_runner_cfg({"runner_cfg": saved["runner_config"]})
-    loop_cfg = EITTrainingCfg(**saved["loop_config"])
+    loop_cfg = EITTrainingCfg(**saved_loop_config(saved))
     policy_cfg = BeliefPolicyLearnerCfg(**saved["policy_config"])
     num_envs = saved["num_envs"]
     if saved.get("training_seed") is not None:

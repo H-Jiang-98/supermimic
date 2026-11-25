@@ -20,7 +20,11 @@ from supermimic.learners.belief_policy_learner import BeliefPolicyLearnerCfg
 from supermimic.motion_command import MotionCommandCfg
 from supermimic.posterior_replay import pack_mean, unpack_belief, unpack_mean
 from supermimic.runners.eit_snapshots import file_sha256
-from supermimic.runners.eit_training import EITTraining, EITTrainingCfg
+from supermimic.runners.eit_training import (
+  EITTraining,
+  EITTrainingCfg,
+  saved_loop_config,
+)
 from supermimic.runners.run_config import (
   load_runner_cfg,
   validate_eit_checkpoint_contract,
@@ -267,7 +271,9 @@ def main():
     runner = SuperMimicRunner(env, cfg, task, device="cpu")
     # Retain every collected posterior for this comparison, and select policy
     # probes using the checkpoint's actual train/validation episode split.
-    loop_cfg = replace(EITTrainingCfg(**saved["loop_config"]), posterior_save_stride=1)
+    loop_cfg = replace(
+      EITTrainingCfg(**saved_loop_config(saved)), posterior_save_stride=1
+    )
     training = EITTraining(
       runner, loop_cfg, BeliefPolicyLearnerCfg(**saved["policy_config"])
     )

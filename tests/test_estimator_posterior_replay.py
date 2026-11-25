@@ -217,6 +217,8 @@ def test_saved_stride_wins_on_restore_and_v3_remains_readable_but_not_resumable(
   source.runner.replay_buffer.enable_posterior_cache(4, 5)
   advance(source)
   checkpoint = source.state_dict()
+  assert "normalization_batch_size" not in checkpoint["loop_config"]
+  checkpoint["loop_config"]["normalization_batch_size"] = 16  # Legacy checkpoint.
   target = training()
   target.load_state_dict(checkpoint)
   assert target.cfg.posterior_save_stride == 4
