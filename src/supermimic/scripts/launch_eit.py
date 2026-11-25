@@ -93,19 +93,17 @@ def _mujoco_args(env: dict) -> list[str]:
   return args
 
 
-def plan(config: dict, base: Path):
-  if set(config) - {"env", "wm validation"} != {
-    "paths",
-    "training",
-    "methods",
-  } or not all(isinstance(table, dict) for table in config.values()):
-    raise ValueError("Expected [paths], [training] and [methods] tables")
-  paths = Paths(**config["paths"])
-  if not all(isinstance(v, str) and v.strip() for v in config["paths"].values()):
+def resolve_paths(settings: dict, base: Path):
+  paths = Paths(**settings)
+  if not all(isinstance(v, str) and v.strip() for v in settings.values()):
     raise ValueError("[paths] values must be nonempty strings")
   environment = base / Path(paths.environment_root).expanduser()
   output = _child(base / Path(paths.checkpoint_root).expanduser(), paths.experiment)
   motion = _child(base / Path(paths.dataset_root).expanduser(), paths.motion_file)
+  return environment, motion, output
+
+
+def worker_command(config: dict, environment: Path, motion: Path) -> list[str]:
   validation = config.get("wm validation", {})
   limits = {
     "validation_stride": 2,
@@ -134,6 +132,18 @@ def plan(config: dict, base: Path):
   ]
   if "env" in config:
     common.extend(_mujoco_args(config["env"]))
+  return common
+
+
+def plan(config: dict, base: Path):
+  if set(config) - {"env", "wm validation"} != {
+    "paths",
+    "training",
+    "methods",
+  } or not all(isinstance(table, dict) for table in config.values()):
+    raise ValueError("Expected [paths], [training] and [methods] tables")
+  environment, motion, output = resolve_paths(config["paths"], base)
+  common = worker_command(config, environment, motion)
   methods = config["methods"]
   if not methods or set(methods) - {"A", "B", "C"}:
     raise ValueError("[methods] requires one or more of A, B and C")
@@ -190,14 +200,20 @@ async def run_queue(gpu: int, commands: list[list[str]], environment: Path):
       command = [
         "bash",
         "-c",
-        'source "$1" && shift && '
+        # A sourced env.sh can replace the shell's positional arguments with set --.
+        'readonly eit_launch_gpu="$2" && readonly -a eit_launch_command=("${@:3}") && '
+        'source "$1" && export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="$eit_launch_gpu" && '
         "if [[ ! -v PYTORCH_ALLOC_CONF && ! -v PYTORCH_CUDA_ALLOC_CONF ]]; then "
-        'export PYTORCH_ALLOC_CONF=expandable_segments:True; fi && exec "$@"',
+        'export PYTORCH_ALLOC_CONF=expandable_segments:True; fi && exec "${eit_launch_command[@]}"',
         "eit",
         str(setup),
+        str(gpu),
         *command,
       ]
-    process = await asyncio.create_subprocess_exec(*command, env=env)
+    try:
+      process = await asyncio.create_subprocess_exec(*command, env=env)
+    except OSError as error:
+      raise RuntimeError(f"Cannot start EIT process on GPU {gpu}: {error}") from error
     try:
       status = await process.wait()
     except asyncio.CancelledError:
@@ -209,16 +225,20 @@ async def run_queue(gpu: int, commands: list[list[str]], environment: Path):
       raise RuntimeError(f"EIT process on GPU {gpu} exited with status {status}")
 
 
-async def launch(phases, environment):
+async def launch(phases, environment, *, wait_for_all: bool = False):
   for queues in phases:
-    await asyncio.gather(
-      *(run_queue(gpu, jobs, environment) for gpu, jobs in queues.items())
+    results = await asyncio.gather(
+      *(run_queue(gpu, jobs, environment) for gpu, jobs in queues.items()),
+      return_exceptions=wait_for_all,
     )
+    failures = [str(result) for result in results if isinstance(result, Exception)]
+    if failures:
+      raise RuntimeError("\n".join(failures))
 
 
-def main():
-  parser = argparse.ArgumentParser(description=__doc__)
-  parser.add_argument("--config", type=Path, default=Path("train_eit_config.toml"))
+def run_cli(plan, default_config: str, description: str | None, *, wait_for_all=False):
+  parser = argparse.ArgumentParser(description=description)
+  parser.add_argument("--config", type=Path, default=Path(default_config))
   parser.add_argument(
     "--dry-run", action="store_true", help="Print GPU queues without starting workers"
   )
@@ -238,9 +258,13 @@ def main():
       raise ValueError(f"Missing executable: {environment}/.venv/bin/python")
     if not any(Path(match).is_file() for match in glob.iglob(str(motion))):
       raise ValueError(f"No motion files matched {motion}")
-    asyncio.run(launch(phases, environment))
+    asyncio.run(launch(phases, environment, wait_for_all=wait_for_all))
   except (KeyError, TypeError, ValueError, OSError, RuntimeError) as error:
     parser.exit(1, f"EIT launch failed: {error}\n")
+
+
+def main():
+  run_cli(plan, "train_eit_config.toml", __doc__)
 
 
 if __name__ == "__main__":

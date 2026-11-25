@@ -1,0 +1,60 @@
+# 仓库根目录预览：python3 src/supermimic/scripts/launch_eit_tuning.py --dry-run
+# 去掉 --dry-run 即开始训练。每个物理 GPU 编号对应一组，按填写顺序配对。
+gpu_index = [0, 1, 2]
+seed = 2027
+
+[paths]
+environment_root = "." # 包含 .venv/bin/python 的目录
+dataset_root = "data"
+motion_file = "motions/*.npz"
+checkpoint_root = "artifacts"
+experiment = "eit_C_tuning" # 每批新实验更换名称；结果写入 experiment/trial_001/seed2027/C 等目录
+
+[training]
+# 标量由所有组共用。一维参数列表逐组取值，长度须等于 GPU 数量。
+policy_lr = 2e-4
+mean_lr = [2e-4, 3e-4, 4e-4]
+# 网络结构按层给出宽度。嵌套列表逐组指定结构，平铺的宽度列表由所有组共用。
+hidden_dims = [[512, 512, 512], [1024, 1024, 1024], [2048, 2048, 2048]]
+cov_hidden_dims = [128, 64]
+actor_hidden_dims = [2048, 1024, 512, 256]
+critic_hidden_dims = [256, 128]
+
+num_envs = 2048
+max_iterations = 300_000
+buffer_size = 1000
+replay_ratio = 16
+sampling_mode = "return"
+log_interval = 10
+save_interval = 1000
+posterior_save_stride = 1
+
+mean_updates = 10
+mean_batch_size = 2048
+mean_window_frames = 8
+cov_lr = 2e-4
+cov_batch_size = 8192
+
+critic_lr = 2e-4
+policy_updates = 1
+policy_batch_size = 2048
+policy_microbatch_size = 1024
+policy_horizon = 32
+samples = 1
+critic_epochs = 5
+critic_minibatches = 4
+exploration = 0.0
+
+eager = false
+policy_cuda_graphs = true
+jacobian_backend = "increment"
+jacobian_batch_chunk_size = 512
+
+["wm validation"]
+validation_stride = 5
+validation_batch_size = 4
+cov_validation_pairs = 8192
+
+[env.sim.mujoco]
+iterations = 20
+ls_iterations = 50

@@ -4,7 +4,7 @@ import sys
 
 import pytest
 
-from supermimic.scripts.launch_eit import launch, plan
+from supermimic.scripts.launch_eit import launch, plan, run_queue
 
 
 @pytest.fixture
@@ -23,6 +23,27 @@ def config():
       "C": {"gpus": [1], "seeds": [2, 5]},
     },
   }
+
+
+def test_env_setup_can_replace_positional_arguments(tmp_path):
+  (tmp_path / "env.sh").write_text(
+    "set -- major minor\n"
+    'export EIT_TEST_VERSION="$1.$2" CUDA_VISIBLE_DEVICES=0 CUDA_DEVICE_ORDER=FASTEST_FIRST\n'
+  )
+  output = tmp_path / "worker result.json"
+  arguments = ["--motion-file", "motion clips/*.npz", "", "value with spaces"]
+  worker = (
+    "import json, os, sys\n"
+    "from pathlib import Path\n"
+    "keys = ('EIT_TEST_VERSION', 'CUDA_VISIBLE_DEVICES', 'CUDA_DEVICE_ORDER')\n"
+    "Path(sys.argv[1]).write_text(json.dumps([[os.environ[k] for k in keys], sys.argv[2:]]))"
+  )
+  command = [sys.executable, "-c", worker, str(output), *arguments]
+  asyncio.run(run_queue(3, [command], tmp_path))
+  assert json.loads(output.read_text()) == [
+    ["major.minor", "3", "PCI_BUS_ID"],
+    arguments,
+  ]
 
 
 @pytest.mark.parametrize(
