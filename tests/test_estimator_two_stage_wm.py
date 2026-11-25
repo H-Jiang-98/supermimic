@@ -490,3 +490,41 @@ def test_short_validation_fragment_still_scores_each_available_pair():
   assert validation["cov_pairs"] == 1 and "Loss/process_nll" in validation
   with pytest.raises(ValueError, match="complete 3-frame"):
     fit.fit(replay, [1], [0], frames, 4)
+
+
+def test_validation_samples_only_held_out_windows_and_pairs_with_replacement(
+  monkeypatch,
+):
+  estimator, replay = fixture(episodes=(6, 4, 1))
+  fit = learner_for(
+    estimator.dynamics,
+    cov=CovarianceFitCfg(batch_size=2, pair_budget=3, validation_pairs=7),
+  )
+  gathered = []
+  gather = replay.model_windows
+
+  def record(starts, frames):
+    gathered.append((starts.clone(), frames))
+    return gather(starts, frames)
+
+  monkeypatch.setattr(replay, "model_windows", record)
+  _, validation = fit.fit(replay, [0], [1, 2], replay.retained_frames([0]), 5)
+  # One mean training batch, two covariance training batches, then validation.
+  validation_draws = gathered[3:]
+  assert [(len(starts), frames) for starts, frames in validation_draws] == [
+    (5, 3),
+    (2, 2),
+    (2, 2),
+    (2, 2),
+    (1, 2),
+  ]
+  for starts, frames in validation_draws:
+    allowed = replay.model_window_starts([1, 2], frames)
+    assert (starts[:, None] == allowed[None]).all(-1).any(-1).all()
+  # More draws than eligible starts guarantees repeated windows and pairs.
+  windows = validation_draws[0][0]
+  pairs = torch.cat([starts for starts, _ in validation_draws[1:]])
+  assert len(windows.unique(dim=0)) < len(windows)
+  assert len(pairs.unique(dim=0)) < len(pairs)
+  assert validation["mean_windows"] == 5
+  assert validation["cov_pair_draws"] == 7

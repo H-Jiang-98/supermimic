@@ -93,13 +93,27 @@ seeds = [2027]
 | `buffer_size` / `posterior_save_stride` | 1000 / 1 | 每环境保留帧数 / 后验保存步距 |
 | `sampling_mode` / `replay_ratio` | `return` / 16 | 参考起点采样方式 / 更新频率预算 |
 | `mean_updates` / `mean_batch_size` / `mean_window_frames` | 10 / 2048 / 8 | 每组均值拟合预算 |
-| `cov_batch_size` / `cov_validation_pairs` | 8192 / 8192 | covariance 训练 batch / 验证抽样数 |
+| `cov_batch_size` | 8192 | covariance 训练 batch |
 | `policy_updates` / `policy_batch_size` / `samples` | 1 / 2048 / 1 | 每组 actor 更新 / 起点数 / 每起点轨迹数 |
 | `policy_horizon` / `policy_microbatch_size` | 32 / 1024 | 想象时域 / 每次反传轨迹数 |
 | `critic_epochs` / `critic_minibatches` | 5 / 4 | 每次 actor 更新后的 critic 拟合预算 |
 | `mean_lr` / `cov_lr` / `policy_lr` / `critic_lr` | 均为 0.0002 | 各优化器学习率 |
 | `exploration` | 0.0 | 真实采集动作探索噪声标准差 |
 | `log_interval` / `save_interval` | 10 / 1000 | 物理步日志 / 保存间隔 |
+
+世界模型在线验证使用独立区块（名称含空格，TOML 必须加引号）：
+
+```toml
+["wm validation"]
+validation_stride = 5       # episode_id % 5 == 0 留作模型验证，最小为 2
+validation_batch_size = 4   # 每组验证窗口数，长度沿用 mean_window_frames
+cov_validation_pairs = 8192 # 每组验证相邻转移对数
+```
+
+两类样本与训练一样，从各自有效起点中均匀、有放回抽取。
+验证划分只限制世界模型拟合及其归一化，policy 起点和 actor/critic 归一化使用所有有效后验帧。
+直接运行 `train_eit` 时对应 `--validation-stride`、`--validation-batch-size`、
+`--cov-validation-pairs`；恢复时沿用 checkpoint 中的配置。
 
 未指定 `cov_pair_budget` 时，每组按 `mean_updates × mean_batch_size × (mean_window_frames−1)`
 抽样，当前为 143360 对、18 次 covariance 更新。

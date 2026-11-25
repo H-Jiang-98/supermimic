@@ -26,7 +26,7 @@ def test_step_budget_counts_actual_updates_and_cache_reads(tmp_path, monkeypatch
   assert row["Budget/policy_starts_drawn"] == 4
   assert row["Budget/imagined_steps"] == 16
   assert 0 < row["Budget/survival_weighted_imagined_steps"] <= 16
-  assert row["Budget/normalization_samples"] == 3
+  assert row["Budget/normalization_samples"] == 6
   profiles = [
     json.loads(line) for line in (tmp_path / "profiling.jsonl").read_text().splitlines()
   ]

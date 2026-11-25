@@ -142,6 +142,19 @@ def main():
     help="Save Q[t|t] every S collection steps; resume uses saved stride",
   )
   add_model_fit_args(parser)
+  validation = parser.add_argument_group("world model online validation")
+  validation.add_argument(
+    "--validation-stride",
+    type=int,
+    default=EITTrainingCfg.validation_stride,
+    help="Hold out episode_id %% stride == 0 for model fitting only; at least 2",
+  )
+  validation.add_argument(
+    "--validation-batch-size",
+    type=int,
+    default=EITTrainingCfg.validation_batch_size,
+    help="Validation windows per training group, sampled uniformly with replacement",
+  )
   parser.add_argument(
     "--policy-cuda-graphs",
     action="store_true",
@@ -296,6 +309,8 @@ def main():
     )
     runner_cfg.policy.batch_size = args.policy_microbatch_size
     loop_cfg = EITTrainingCfg(
+      validation_stride=args.validation_stride,
+      validation_batch_size=args.validation_batch_size,
       posterior_save_stride=args.posterior_save_stride,
     )
     policy_cfg = BeliefPolicyLearnerCfg(

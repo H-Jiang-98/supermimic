@@ -179,9 +179,9 @@ def test_three_rounds_keep_live_belief_and_filter_each_new_measurement_once(stri
   assert loop.runner.replay_buffer.insert_count == 12
   assert logs[-1]["budget"]["posterior_save_stride"] == stride
   assert logs[-1]["budget"]["available_training_windows"] == 6
-  assert int(loop.actor.obs_normalizer.count) == len(range(0, 12, stride))
+  assert int(loop.actor.obs_normalizer.count) == 2 * len(range(0, 12, stride))
   assert (
-    logs[1]["budget"]["normalization_samples"] == len(range(4, 8, stride))
+    logs[1]["budget"]["normalization_samples"] == 2 * len(range(4, 8, stride))
     if stride <= 4
     else logs[1]["budget"]["normalization_samples"] == 0
   )

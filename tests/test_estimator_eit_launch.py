@@ -220,3 +220,80 @@ def test_worker_graph_flag_and_eager_override(
   monkeypatch.setattr(train_eit, "EITTraining", inspect_training)
   with pytest.raises(ConfigurationChecked):
     train_eit.main()
+
+
+@pytest.mark.parametrize(
+  "validation",
+  [
+    None,
+    {
+      "validation_stride": 7,
+      "validation_batch_size": 11,
+      "cov_validation_pairs": 13,
+    },
+  ],
+)
+def test_validation_configuration_reaches_worker(
+  config, tmp_path, monkeypatch, validation
+):
+  from types import SimpleNamespace
+
+  from supermimic.scripts import train_eit
+
+  if validation is not None:
+    config["wm validation"] = validation
+  expected = validation or dict(
+    validation_stride=5, validation_batch_size=4, cov_validation_pairs=8192
+  )
+  _, _, phases = plan(config, tmp_path)
+  for phase in phases:
+    for jobs in phase.values():
+      for command in jobs:
+        for name, value in (validation or {}).items():
+          assert f"--{name.replace('_', '-')}={value}" in command
+
+  class ConfigurationChecked(Exception):
+    pass
+
+  def inspect_training(runner, loop_cfg, policy_cfg, **kwargs):
+    assert loop_cfg.validation_stride == expected["validation_stride"]
+    assert loop_cfg.validation_batch_size == expected["validation_batch_size"]
+    assert runner.cfg.cov.validation_pairs == expected["cov_validation_pairs"]
+    raise ConfigurationChecked
+
+  command = next(iter(phases[0].values()))[0]
+  monkeypatch.setattr(sys, "argv", command[2:])
+  monkeypatch.setenv("WANDB_MODE", "disabled")
+  monkeypatch.setattr(
+    train_eit, "create_env", lambda *a: SimpleNamespace(close=lambda: None)
+  )
+  monkeypatch.setattr(
+    train_eit, "SuperMimicRunner", lambda env, cfg, *a, **kw: SimpleNamespace(cfg=cfg)
+  )
+  monkeypatch.setattr(train_eit, "EITTraining", inspect_training)
+  with pytest.raises(ConfigurationChecked):
+    train_eit.main()
+
+
+@pytest.mark.parametrize(
+  "validation",
+  [
+    {"validation_stride": 1},
+    {"validation_stride": True},
+    {"validation_batch_size": 0},
+    {"cov_validation_pairs": -1},
+    {"cov_validation_pairs": 2.5},
+    {"unknown": 3},
+  ],
+)
+def test_invalid_model_validation_config(config, tmp_path, validation):
+  config["wm validation"] = validation
+  with pytest.raises(ValueError, match="wm validation"):
+    plan(config, tmp_path)
+
+
+def test_duplicate_validation_option_rejected(config, tmp_path):
+  config["training"]["cov_validation_pairs"] = 8
+  config["wm validation"] = {"cov_validation_pairs": 16}
+  with pytest.raises(ValueError, match="Duplicate cov_validation_pairs"):
+    plan(config, tmp_path)

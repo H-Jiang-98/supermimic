@@ -33,12 +33,14 @@
 
 控制历史由主 replay 的 `actor_obs` 与最近淘汰的 `history_length−1` 帧边界观测组成。
 真实 episode 开头重复首帧补齐；环形覆盖不能被误当成 episode 开头。
-`sample_policy_starts` 从仍保留且保存过后验的训练帧均匀、有放回抽样，
+`sample_policy_starts` 从仍保留且保存过后验的所有帧均匀、有放回抽样，
 单帧片段也可入选；`prepare_policy_starts` 按给定帧标识和顺序读取。
 
 世界模型使用全部有效真实窗口和相邻转移，不受后验 stride 限制。
 窗口不跨 episode、时间缺口或 terminated/truncated 边界。
-默认 `episode_id % 5 == 0` 是验证集，不参与策略起点抽样或训练归一化。
+`["wm validation"].validation_stride` 控制模型验证划分，默认 `episode_id % 5 == 0`。
+这些 episode 不参与世界模型拟合或其归一化，仅用于世界模型在线验证；
+该划分不限制策略起点抽样及 actor/critic 归一化。
 
 ## 校验与提交
 
@@ -56,11 +58,12 @@
 
 ## 归一化和预算观测
 
-每个新训练帧仅计入一次世界模型归一化；actor/critic 归一化读取新采且仍保留的后验帧。
+每个新模型训练帧仅计入一次世界模型归一化；actor/critic 归一化读取新采且仍保留的后验帧，
+包含世界模型验证 episode。
 统计先校验再提交，warmup 也更新；同一步多个训练组不会重复计数。
 本步没有新保存后验时沿用已有统计。
 
-`Budget/*` 区分有效后验总数、训练起点数、归一化样本数、抽取起点数和实际想象步数。
+`Budget/*` 区分有效后验总数、可用策略起点数、归一化样本数、抽取起点数和实际想象步数。
 `posterior_revision_gap_*` 描述缓存版本落后程度。
 主 replay、后验、边界历史、序号索引和初始先验分别报告字节数。
 

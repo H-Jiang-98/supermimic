@@ -94,9 +94,11 @@ def _mujoco_args(env: dict) -> list[str]:
 
 
 def plan(config: dict, base: Path):
-  if set(config) - {"env"} != {"paths", "training", "methods"} or not all(
-    isinstance(table, dict) for table in config.values()
-  ):
+  if set(config) - {"env", "wm validation"} != {
+    "paths",
+    "training",
+    "methods",
+  } or not all(isinstance(table, dict) for table in config.values()):
     raise ValueError("Expected [paths], [training] and [methods] tables")
   paths = Paths(**config["paths"])
   if not all(isinstance(v, str) and v.strip() for v in config["paths"].values()):
@@ -104,6 +106,21 @@ def plan(config: dict, base: Path):
   environment = base / Path(paths.environment_root).expanduser()
   output = _child(base / Path(paths.checkpoint_root).expanduser(), paths.experiment)
   motion = _child(base / Path(paths.dataset_root).expanduser(), paths.motion_file)
+  validation = config.get("wm validation", {})
+  limits = {
+    "validation_stride": 2,
+    "validation_batch_size": 1,
+    "cov_validation_pairs": 1,
+  }
+  if validation.keys() - limits.keys():
+    raise ValueError(
+      f"Unknown [wm validation] options: {validation.keys() - limits.keys()}"
+    )
+  for name, value in validation.items():
+    if type(value) is not int or value < limits[name]:
+      raise ValueError(f"wm validation.{name} must be an integer >= {limits[name]}")
+    if name in config["training"]:
+      raise ValueError(f"Duplicate {name} in [training] and [wm validation]")
   common = [
     str(environment / ".venv/bin/python"),
     "-m",
@@ -113,6 +130,7 @@ def plan(config: dict, base: Path):
     "--device",
     "cuda:0",
     *_training_args(config["training"]),
+    *_training_args(validation),
   ]
   if "env" in config:
     common.extend(_mujoco_args(config["env"]))

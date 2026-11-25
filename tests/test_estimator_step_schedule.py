@@ -37,7 +37,7 @@ def test_warmup_discards_opportunities_and_multigroup_does_not_recount_normaliza
   assert loop.skipped_update_groups == 3
   assert loop.update_groups == 5
   assert loop.learner.mean_steps == loop.policy.actor_steps == 5
-  assert int(loop.actor.obs_normalizer.count) == 4
+  assert int(loop.actor.obs_normalizer.count) == 8
   assert int(loop.learner.dynamics.state_normalizer.count) == 4
   assert loop.runner.posterior_provider.state.time_index.tolist() == [3, 3]
   assert loop.runner.reset_count == 1
@@ -48,7 +48,7 @@ def test_zero_ratio_collects_and_normalizes_without_training():
   for _ in range(10):
     loop.run_step()
   assert loop.update_groups == loop.learner.cov_steps == 0
-  assert int(loop.actor.obs_normalizer.count) == 10
+  assert int(loop.actor.obs_normalizer.count) == 20
   assert int(loop.learner.dynamics.state_normalizer.count) == 10
 
 

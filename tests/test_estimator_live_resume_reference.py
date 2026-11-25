@@ -79,7 +79,7 @@ def test_live_reference_is_generated_without_any_loader_and_preserves_live_state
   assert len(details["policy_starts"]) == 2
 
 
-def test_sparse_reference_can_use_a_singleton_as_its_only_saved_training_start(
+def test_sparse_reference_uses_training_and_model_validation_singletons(
   tmp_path,
 ):
   loop = training()
@@ -98,7 +98,7 @@ def test_sparse_reference_can_use_a_singleton_as_its_only_saved_training_start(
   advance(loop, checkpoint)
   reference = torch.load(evidence, weights_only=True)
   assert loop.episode_split()[0] == [3]
-  assert reference["inputs"]["policy_keys"].tolist() == [[1, 0], [1, 0]]
+  assert reference["inputs"]["policy_keys"].tolist() == [[0, 0], [1, 0]]
   restored = training()
   restored.load_state_dict(torch.load(checkpoint, weights_only=True))
   compare_reference_update(restored, reference)

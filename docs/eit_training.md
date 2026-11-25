@@ -18,8 +18,13 @@ num_envs × replay_ratio / (mean_updates × mean_batch_size × mean_window_frame
 累计物理步、实际训练组、跳过组与各优化器步数分别记录，不由总步数推算实际更新量。
 
 每组依次执行均值拟合、covariance 拟合、策略更新。
-默认验证划分为 `episode_id % validation_stride == 0`，stride 为 5。
-训练与验证使用独立且可恢复的抽样 RNG。
+世界模型的验证配置放在 TOML 的 `["wm validation"]`：`validation_stride=5`
+表示 `episode_id % validation_stride == 0` 留作模型验证；`validation_batch_size=4`
+控制每组验证窗口数，`cov_validation_pairs=8192` 控制每组验证转移对数。
+验证与训练共用均匀、有放回的有效起点抽样，窗口长度均为 `mean_window_frames`，
+不跨 episode、时间缺口或终止/截断边界；使用独立且可恢复的抽样 RNG。
+验证 episode 不参与世界模型拟合及其归一化，但可参与 policy 起点抽样和 actor/critic 归一化。
+恢复时使用 checkpoint 中保存的验证配置。
 
 ## 随机世界模型
 

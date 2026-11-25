@@ -214,7 +214,7 @@ class EITTraining(BeliefModelTraining):
   def update_input_normalization(
     self, frames=None, policy_keys: torch.Tensor | None = None
   ) -> BeliefRolloutStart | None:
-    """Normalize newly saved training slots or an explicit frame selection."""
+    """Normalize newly saved policy slots, independent of the model validation split."""
     timer = StreamTimer(self.runner.device)
     with timer.measure("posterior_cache_normalization_seconds"):
       starts = self._normalize_saved_posteriors(frames, policy_keys, timer)
@@ -232,15 +232,11 @@ class EITTraining(BeliefModelTraining):
     with timer.measure("posterior_cache_read_seconds"):
       locations = cache.locations(replay)
       rows, slots, posterior_slots = locations
-      training = (
-        replay._storage["episode_id"][rows, slots] % self.cfg.validation_stride != 0
-      )
       if frames is None:
         first = self._posterior_normalized_until
         selected = cache.sequences[posterior_slots] >= first
       else:
         selected = cache.frame_mask(replay, locations, frames)
-      selected &= training
       fresh_locations = tuple(index[selected] for index in locations)
       starts = (
         env.prepare_policy_starts(*policy_keys.unbind(dim=1))
@@ -257,7 +253,7 @@ class EITTraining(BeliefModelTraining):
     self._cache_budget = {
       "posterior_save_stride": cache.stride,
       "effective_posterior_count": len(rows),
-      "available_policy_starts": int(training.sum()),
+      "available_policy_starts": len(rows),
       "normalization_samples": count,
       "posterior_revision_gap_min": int(gaps.min()) if len(gaps) else 0,
       "posterior_revision_gap_max": int(gaps.max()) if len(gaps) else 0,
@@ -343,12 +339,8 @@ class EITTraining(BeliefModelTraining):
     return sensor, actor_goal, critic_state, critic_goal, sensor
 
   def policy_episode_ids(self) -> list[int]:
-    """Include every retained training episode, even a single-frame fragment."""
-    return [
-      episode
-      for episode in self.runner.replay_buffer.training_episode_lengths()
-      if episode % self.cfg.validation_stride
-    ]
+    """Include all retained episodes, including model validation and singletons."""
+    return list(self.runner.replay_buffer.training_episode_lengths())
 
   def _update_policy(self) -> dict:
     runner = self.runner

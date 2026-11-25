@@ -304,15 +304,17 @@ def test_policy_training_requires_full_replay_before_collection():
   assert runner.replay_buffer.num_transitions == 0
 
 
-def test_no_fresh_training_frames_preserves_actor_normalizers():
+def test_model_validation_frames_update_policy_but_not_model_normalizers():
   loop = training()
   loop.cfg = replace(loop.cfg, validation_stride=5)
   advance(loop)
   loop.refresh_collection()
   loop.runner._episode_id = torch.tensor([10, 5])
   count = loop.actor.obs_normalizer.count.clone()
+  model_count = loop.learner.dynamics.state_normalizer.count.clone()
   advance(loop)
-  assert torch.equal(loop.actor.obs_normalizer.count, count)
+  assert int(loop.actor.obs_normalizer.count - count) == 8
+  assert torch.equal(loop.learner.dynamics.state_normalizer.count, model_count)
 
 
 @pytest.mark.parametrize(
@@ -379,7 +381,7 @@ def test_replay_normalization_matches_full_reset_statistics_without_rollout(grou
   expected_actor, expected_critic = deepcopy(loop.actor), deepcopy(loop.policy.critic)
   expected_actor.train()
   with torch.no_grad(), env.readonly_policy_motion():
-    locations = replay.posterior_cache.locations(replay, episode_ids=[1])
+    locations = replay.posterior_cache.locations(replay)
     for chunk in env.iter_cached_policy_starts(locations, batch_size=2):
       obs = env.reset_prepared(chunk)
       expected_actor.update_normalization(obs)
@@ -421,15 +423,16 @@ def test_normalization_reads_fresh_slots_without_copying_frame_keys_to_python():
   assert torch.equal(episodes, torch.ones_like(times))
   assert torch.equal(times, expected_times)
   assert torch.equal(generator.get_state(), reference_rng.get_state())
-  assert loop._cache_budget["normalization_samples"] == 4
-  assert int(loop.actor.obs_normalizer.count) == 4
+  assert loop._cache_budget["normalization_samples"] == 8
+  assert loop._cache_budget["available_policy_starts"] == 8
+  assert int(loop.actor.obs_normalizer.count) == 8
   assert torch.equal(starts.batch["time_index"], policy_keys[:, 1])
-  # An explicit, possibly duplicated selection still ignores validation and
-  # unsaved rows, and can include earlier frames.
+  # An explicit selection includes model validation, deduplicates frames,
+  # ignores unsaved rows, and can include earlier frames.
   frames = replay.retained_frames(fields=("episode_id", "time_index"))
   loop.update_input_normalization(frames[[0, 8, 8, 9, 10]])
-  assert loop._cache_budget["normalization_samples"] == 2
-  assert int(loop.actor.obs_normalizer.count) == 6
+  assert loop._cache_budget["normalization_samples"] == 3
+  assert int(loop.actor.obs_normalizer.count) == 11
 
 
 def test_common_initialization_rejects_prefit_critic():
@@ -458,3 +461,26 @@ def test_round_policy_samples_singleton_training_episode():
   starts = update.call_args.args[0]
   assert starts.batch["episode_id"].tolist() == [1, 3]
   assert starts.batch["time_index"][0].item() == 0
+
+
+def test_policy_sampling_includes_model_validation_and_ignores_split():
+  loop = training()
+  loop.refresh_collection()
+  for _ in range(4):
+    loop.runner.step(record_episode_stats=False)
+  loop.update_input_normalization()
+  replay = loop.runner.replay_buffer
+  assert loop.policy_episode_ids() == [0, 1]
+  assert loop._cache_budget["available_policy_starts"] == 8
+  keys = []
+  for stride in (2, 5, 7):
+    loop.cfg = replace(loop.cfg, validation_stride=stride)
+    episodes, times = loop.runner.wm_env.sample_policy_keys(
+      128, loop.policy_episode_ids(), torch.Generator().manual_seed(42)
+    )
+    keys.append(torch.stack((episodes, times), -1))
+    assert set(episodes.tolist()) == {0, 1}
+    starts = loop.runner.wm_env.prepare_policy_starts(episodes, times)
+    assert len(starts) == 128
+  assert all(torch.equal(keys[0], sample) for sample in keys[1:])
+  assert replay.model_window_starts([0], 3).shape[0] == 2
