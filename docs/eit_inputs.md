@@ -40,7 +40,7 @@ A 在训练时用真值构造 R/p/v 目标，B/C 用后验均值；三组部署�
 C 在 decoder 首层 LayerNorm 后用 FiLM 调制；A/B 完全旁路此分支。
 
 actor checkpoint 保存输入契约、噪声、结构和归一化状态。
-历史 A/B/C 实验在不同组之间复制共有参数。当前 v7 的共享初始化使用形状相同的 mean 和 belief 网络。[v7 训练说明](../README_eit.md)
+历史 A/B/C 实验在不同组之间复制共有参数。当前 v7 四种方法共享相同形状的 actor，baseline critic 复制公共输入列和后续层。[v7 训练说明](../README_eit.md)
 
 ## Critic
 

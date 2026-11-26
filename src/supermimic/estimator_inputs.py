@@ -15,8 +15,10 @@ from typing import Any, Literal, Protocol
 
 import torch
 
+from supermimic.eit_methods import BASELINES, LOCAL_METHODS, EstimatorGroup
 from supermimic.local_control import (
   GOAL_DIM,
+  VECH_DIM,
   LocalReference,
   local_covariance_features,
   local_state,
@@ -126,7 +128,7 @@ def _measurement_tensors(
 
 @dataclass(frozen=True)
 class EITInputConfig:
-  group: Literal["A", "B", "C", "mean", "belief"] = "A"
+  group: EstimatorGroup = "A"
   mode: Literal["train", "eval"] = "train"
   history_length: int = 5
   residual_actor: bool = False
@@ -139,7 +141,7 @@ class EITInputConfig:
   )
 
   def __post_init__(self) -> None:
-    if self.group not in ("A", "B", "C", "mean", "belief"):
+    if self.group not in ("A", "B", "C", *LOCAL_METHODS):
       raise ValueError(f"Unknown ablation group: {self.group}")
     if type(self.residual_actor) is not bool or (
       self.residual_actor and not self.local_control
@@ -169,7 +171,11 @@ class EITInputConfig:
 
   @property
   def local_control(self) -> bool:
-    return self.group in ("mean", "belief")
+    return self.group in LOCAL_METHODS
+
+  @property
+  def unfiltered_policy(self) -> bool:
+    return self.group in BASELINES
 
   @property
   def goal_dim(self) -> int:
@@ -177,7 +183,7 @@ class EITInputConfig:
 
   @property
   def uses_posterior(self) -> bool:
-    return self.group != "A" or self.mode == "eval"
+    return not self.unfiltered_policy and (self.group != "A" or self.mode == "eval")
 
   @property
   def uses_uncertainty(self) -> bool:
@@ -186,7 +192,7 @@ class EITInputConfig:
   @property
   def critic_uses_belief(self) -> bool:
     """The critic uses RPV belief for B/C, regardless of actor FiLM."""
-    return self.group != "A"
+    return self.group not in ("A", *BASELINES)
 
   def to_dict(self) -> dict[str, Any]:
     return asdict(self)
@@ -597,13 +603,15 @@ def velocity_rotation_block(posterior, velocity_error):
 
 def build_actor_features(
   config: EITInputConfig,
-  truth: RpvState | None,
+  truth: RpvState | LieState | None,
   posterior: PosteriorInput | None,
   reference: ReferenceWindow,
   context: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
   if config.local_control:
-    goal, condition = local_actor_features(posterior, reference, context)
+    if config.group == "gt" and not isinstance(truth, LieState):
+      raise ValueError("GT modulation requires the full local ground-truth state")
+    goal, condition = local_actor_features(config, truth, posterior, reference, context)
     if not torch.isfinite(goal).all() or not torch.isfinite(condition).all():
       raise ValueError("Non-finite local actor input")
     return goal, condition
@@ -630,7 +638,7 @@ def build_actor_features(
 
 def build_actor_critic_goals(
   config: EITInputConfig,
-  truth: RpvState,
+  truth: RpvState | LieState,
   posterior: PosteriorInput | None,
   reference: ReferenceWindow,
   context: torch.Tensor | None = None,
@@ -658,7 +666,7 @@ def build_actor_critic_goals_kernel(
 ):
   """Tensor-only goals and numerical status for a fixed training configuration."""
   if config.local_control:
-    goal, condition = local_actor_features(posterior, reference, context)
+    goal, condition = local_actor_features(config, truth, posterior, reference, context)
     invalid = ~torch.isfinite(condition).all(-1) | ~torch.isfinite(goal).all(-1)
     return goal, condition, privileged_goal(truth, reference), invalid
   state = posterior.mean if config.uses_posterior else truth
@@ -683,14 +691,21 @@ def build_actor_critic_goals_kernel(
   return actor, uncertainty, critic, invalid
 
 
-def local_actor_features(posterior, reference, context):
-  if posterior is None or posterior.state is None or posterior.factor is None:
-    raise ValueError("Local policy requires a full posterior mean and square root")
+def local_actor_features(config, truth, posterior, reference, context):
   if reference.local is None or context is None:
     raise ValueError("Local policy requires the current reference and physical context")
-  y = local_state(posterior.state)
-  covariance = local_covariance_features(posterior.state, posterior.factor)
-  condition = torch.cat(
-    (y, y - reference.local.y, context, covariance, reference.local.next_joint), -1
-  )
-  return reference.local.goal, condition
+  local = reference.local
+  if config.unfiltered_policy:
+    covariance = context.new_zeros((*context.shape[:-1], VECH_DIM))
+    if config.group == "gt":
+      y = local_state(truth)
+      error = y - local.y
+    else:
+      y = error = torch.zeros_like(local.y)
+  else:
+    if posterior is None or posterior.state is None or posterior.factor is None:
+      raise ValueError("Local policy requires a full posterior mean and square root")
+    y = local_state(posterior.state)
+    error = y - local.y
+    covariance = local_covariance_features(posterior.state, posterior.factor)
+  return local.goal, torch.cat((y, error, context, covariance, local.next_joint), -1)

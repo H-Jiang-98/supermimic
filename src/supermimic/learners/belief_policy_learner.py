@@ -188,7 +188,8 @@ class BeliefActorCriticPolicyLearner:
         env._action_upper,
       )
     )
-    state.append(env.posterior_provider.estimator.default_joint_pos)
+    if not env.unfiltered_policy:
+      state.append(env.posterior_provider.estimator.default_joint_pos)
     for module in (self.actor, self.critic):
       state.extend(p.grad for p in module.parameters() if p.grad is not None)
     for optimizer in (*self.actor_optimizers, *self.critic_optimizers):
@@ -217,9 +218,13 @@ class BeliefActorCriticPolicyLearner:
       reason = "cpu"
     elif not self._uses_tensor_rollout:
       reason = "custom_environment"
-    elif env.posterior_provider.estimator.config.jacobian_backend not in (
-      "increment",
-      "vmap",
+    elif (
+      not env.unfiltered_policy
+      and env.posterior_provider.estimator.config.jacobian_backend
+      not in (
+        "increment",
+        "vmap",
+      )
     ):
       reason = "jacobian_backend"
     elif count % cfg.microbatch_size:
@@ -233,7 +238,8 @@ class BeliefActorCriticPolicyLearner:
       self.clear_policy_graph()
       return None
 
-    estimator, rep = env.posterior_provider.estimator, env.representation
+    estimator = None if env.unfiltered_policy else env.posterior_provider.estimator
+    rep = env.representation
     signature = (
       count,
       asdict(cfg),
@@ -248,7 +254,7 @@ class BeliefActorCriticPolicyLearner:
       ),
       asdict(env.estimator_input_config),
       asdict(env._eit_critic_config()),
-      asdict(estimator.config),
+      asdict(estimator.config) if estimator is not None else None,
       env.dynamics.process_noise_config,
       self._v_max,
       env._anchor_index,
@@ -387,7 +393,9 @@ class BeliefActorCriticPolicyLearner:
 
   @property
   def _uses_tensor_rollout(self):
-    return isinstance(getattr(self.wm_env, "posterior_provider", None), BeliefProvider)
+    return getattr(self.wm_env, "unfiltered_policy", False) or isinstance(
+      getattr(self.wm_env, "posterior_provider", None), BeliefProvider
+    )
 
   def _clear_rollout(self):
     # Production rollouts own only local tensors, never the provider's state.

@@ -2,12 +2,14 @@
 
 from copy import deepcopy
 from dataclasses import replace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
 from supermimic.estimator import FilterConfig
+from supermimic.estimator_inputs import EITInputConfig
+from supermimic.imagined_rollout import imagine_step, observe, prepare_rollout
 from supermimic.learners.belief_policy_learner import (
   BeliefActorCriticPolicyLearner,
   BeliefPolicyLearnerCfg,
@@ -36,6 +38,8 @@ def graph_policy(tmp_path):
     compiled=False,
     return_training=False,
     integrated=False,
+    residual_actor=False,
+    samples=2,
   ):
     torch.manual_seed(2027)
     motion = tmp_path / "stationary.npz"
@@ -49,6 +53,7 @@ def graph_policy(tmp_path):
     environments.append(env)
     cfg = SuperMimicRunnerCfg.for_estimator_inputs(
       group,
+      estimator_inputs=EITInputConfig(group=group, residual_actor=residual_actor),
       process_noise=ProcessNoiseConfig(hidden_dims=(8,)),
       filter_config=FilterConfig(jacobian_backend=backend),
       dynamics_hidden_dims=(16,),
@@ -71,7 +76,7 @@ def graph_policy(tmp_path):
       ),
       policy_cfg=BeliefPolicyLearnerCfg(
         batch_size=2,
-        num_samples=2,
+        num_samples=samples,
         microbatch_size=2,
         horizon=2,
         critic_epochs=1,
@@ -421,3 +426,103 @@ def test_online_model_policy_graph_save_and_resume(graph_policy, tmp_path):
     training.run_step()
   assert policy.actor_steps >= before + 4
   assert policy._policy_graph.captures == 1
+
+
+@pytest.mark.parametrize("group", ["prop_kp", "gt"])
+def test_baseline_replay_posterior_independence(graph_policy, group):
+  policy, starts = graph_policy(group)
+  env = policy.wm_env
+  # Disallow access to the entire imagined filter, including graph eligibility
+  # and capture-state checks. Real collection already ran with its own filter.
+  env.posterior_provider = None
+  policy.cuda_graphs = False
+  noises = policy.draw_noises(starts)
+
+  def trace():
+    batch = env.prepare_policy_starts(
+      starts.batch["episode_id"], starts.batch["time_index"]
+    )
+    assert batch.belief is None
+    actions = []
+    decode = policy._decode
+
+    def record(*args):
+      outputs = decode(*args)
+      actions.append(outputs[0].detach())
+      return outputs
+
+    with patch.object(policy, "_decode", record):
+      result = policy._rollout_result(
+        batch.repeat_interleave(policy.cfg.num_samples),
+        *(noise.flatten(1, 2) for noise in noises),
+        policy.cfg.horizon,
+      )
+    assert not result.invalid.any()
+    gradients = torch.autograd.grad(
+      result.returns.sum(), tuple(policy.actor.parameters())
+    )
+    assert any(value.any() for value in gradients)
+    return actions, result.returns.detach(), gradients
+
+  ref = trace()
+  cache = env.replay_buffer.posterior_cache.storage
+  cache["posterior_mean"].fill_(float("nan"))
+  cache["posterior_sqrt_tril"].fill_(float("nan"))
+  actual = trace()
+  torch.testing.assert_close(actual, ref, rtol=0, atol=0)
+  policy.update_from(starts, *noises)
+  assert policy.actor_steps == 1
+
+
+@pytest.mark.parametrize("group", ["prop_kp", "gt"])
+def test_baseline_prepared_reset_and_step_match_tensor_rollout(graph_policy, group):
+  policy, starts = graph_policy(group)
+  env = policy.wm_env
+  process, measurement = (n[:, :, 0] for n in policy.draw_noises(starts))
+  prepared = prepare_rollout(env, starts, 2, process, measurement)
+  provider = env.posterior_provider
+  generation = provider.generation
+  for attached in (True, False):
+    env.posterior_provider = provider if attached else None
+    obs = env.reset_prepared(starts)
+    state = prepared.state
+    for t in range(3):
+      expected, _ = observe(env, prepared, state, t)
+      for key in expected.keys():
+        torch.testing.assert_close(obs[key], expected[key])
+      if t < 2:
+        action = policy.actor(obs)
+        noise = None if t == 0 else process[t]
+        state, reward, done, _ = imagine_step(
+          env, prepared, state, action, noise, measurement[t], t
+        )
+        with torch.profiler.profile(
+          activities=[torch.profiler.ProfilerActivity.CPU]
+        ) as prof:
+          obs, actual_reward, actual_done, _ = env.step(
+            action, process_noise=noise, measurement_noise=measurement[t]
+          )
+        ops = {event.key for event in prof.key_averages()}
+        assert not {"aten::item", "aten::_local_scalar_dense", "aten::equal"} & ops
+        torch.testing.assert_close(actual_reward, reward)
+        torch.testing.assert_close(actual_done, done)
+    assert provider.generation == generation
+
+
+@pytest.mark.parametrize("group", ["prop_kp", "gt"])
+@pytest.mark.parametrize("residual,samples", [(True, 1), (False, 2)])
+def test_compiled_baseline_graph_matches_eager(graph_policy, group, residual, samples):
+  policy, starts = graph_policy(
+    group, compiled=True, residual_actor=residual, samples=samples
+  )
+  policy.wm_env.posterior_provider = None
+  reference = reference_for(policy)
+  for _ in range(5):
+    noises = policy.draw_noises(starts)
+    reference.draw_noises(starts)
+    actual = policy.update_from(starts, *noises)
+    expected = reference.update_from(starts, *noises)
+    torch.testing.assert_close(actual, expected, atol=2e-5, rtol=1e-3, equal_nan=True)
+    assert_policy_close(policy, reference)
+  assert policy.graph_status["captures"] == 1
+  assert policy.graph_status["replay_calls"] == 2

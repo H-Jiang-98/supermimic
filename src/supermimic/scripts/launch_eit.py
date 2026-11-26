@@ -12,6 +12,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
+from supermimic.eit_methods import BASELINES, LOCAL_METHODS
+
 
 @dataclass(frozen=True)
 class Paths:
@@ -148,22 +150,27 @@ def plan(config: dict, base: Path):
   environment, motion, output = resolve_paths(config["paths"], base)
   common = worker_command(config, environment, motion)
   methods = config["methods"]
-  if not methods or set(methods) - {"mean", "belief"}:
+  if not methods or set(methods) - set(LOCAL_METHODS):
     raise ValueError("Unknown or empty EIT method selection")
   prepare = defaultdict(list)
   train = defaultdict(list)
-  prepared_seeds = set()
+  seed_jobs = {}
+  baseline_for_seed = {}
   for group, method in methods.items():
     if not isinstance(method, dict):
       raise ValueError(f"Expected table for methods.{group}")
-    residuals = method.get("residual_actor", [False])
+    residuals = method.get("residual_actor", True)
+    if type(residuals) is bool:
+      residuals = [residuals]
     if (
       not isinstance(residuals, list)
       or not residuals
       or any(type(r) is not bool for r in residuals)
       or len(set(residuals)) != len(residuals)
     ):
-      raise ValueError("residual_actor must be a list of distinct booleans")
+      raise ValueError(
+        "residual_actor must be a boolean or a list of distinct booleans"
+      )
     if set(method) - {"residual_actor"} != {"gpus", "seeds"}:
       raise ValueError(f"[methods.{group}] requires gpus and seeds")
     gpus = _indices(method["gpus"], f"methods.{group}.gpus")
@@ -172,9 +179,9 @@ def plan(config: dict, base: Path):
       gpu = gpus[i % len(gpus)]
       init = output / "init" / f"seed{seed}.pt"
       args = [*common, "--seed", str(seed), "--initialization", str(init)]
-      if seed not in prepared_seeds:
-        prepare[gpu].append([*args, "--group", "mean", "--prepare-initialization"])
-        prepared_seeds.add(seed)
+      seed_jobs.setdefault(seed, (gpu, args))
+      if group in BASELINES:
+        baseline_for_seed.setdefault(seed, group)
       for residual in residuals:
         variant = f"{group}-{'residual' if residual else 'direct'}"
         train[gpu].append(
@@ -189,6 +196,10 @@ def plan(config: dict, base: Path):
             str(output / f"seed{seed}" / variant),
           ]
         )
+  for seed, (gpu, args) in seed_jobs.items():
+    # A seed shared with any baseline requires all four methods in its bundle.
+    group = baseline_for_seed.get(seed, "mean")
+    prepare[gpu].append([*args, "--group", group, "--prepare-initialization"])
   return environment, motion, (prepare, train)
 
 

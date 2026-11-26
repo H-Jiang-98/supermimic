@@ -64,6 +64,13 @@ JSONL 追加 4、5，新 run 日志序号为 0、1。
 
 ## 短程训练与恢复验证
 
+四方法小批验证使用静止参考片段和 4 个真实环境，各方法训练 5 步并从磁盘 checkpoint 恢复至 10 步。以下命令在选定的空闲 GPU 上运行，输出目录须为新目录。FiLM 检查在加载共享初始化之前扰动输出权重，以便观察各输入通道的响应。两个 baseline 的状态式 replay 恢复和后续推进与函数式 rollout 逐项对照。CUDA graph 对照覆盖正式配置的 residual 单样本和 direct 双样本。
+
+```bash
+WANDB_MODE=offline OMP_NUM_THREADS=1 python -m supermimic.scripts.check_eit_four_methods --output ./four-method-smoke
+python -m pytest -q tests/test_estimator_eit_graph.py -k baseline
+```
+
 `check_eit_training` 用小规模 MuJoCo 环境训练 mean 和 belief 两组，核对固定输入下模型与策略的下一次更新，并在独立进程中评估保存的 checkpoint。
 
 ```bash

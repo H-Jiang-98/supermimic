@@ -1,0 +1,229 @@
+{
+  "status": "passed",
+  "branch": "dev_observable",
+  "base_commit": "45a80eeb32ac201c7398ace031ca673a3acd0874",
+  "remote_workspace": "/tmp/eit-v7-four-methods.aLONzkEs",
+  "gpu": 7,
+  "torch": "2.14.0+cu130",
+  "training": {
+    "seed": 2027,
+    "residual_actor": true,
+    "num_envs": 4,
+    "motion": "stationary, 64 frames",
+    "policy_horizon": 2,
+    "policy_batch_size": 2,
+    "policy_microbatch_size": 2,
+    "policy_samples": 1,
+    "mode": "eager"
+  },
+  "initialization_sha256": "d43cf206cd5863f594a712bf61379aeda5becc99728a2ee1deb9e0279d5d45da",
+  "initialization_checks": "Exact shared world model and actor weights, exact critic common columns and subsequent layers; v5 mean/belief bundle reused by launcher preparation and rejected for baselines",
+  "methods": {
+    "prop_kp": {
+      "checkpoint_and_resume": [
+        {
+          "collected_steps": 5,
+          "collected_frames": 20,
+          "mean_updates": 2,
+          "covariance_updates": 2,
+          "actor_updates": 2,
+          "critic_updates": 2
+        },
+        {
+          "collected_steps": 10,
+          "collected_frames": 40,
+          "mean_updates": 4,
+          "covariance_updates": 4,
+          "actor_updates": 4,
+          "critic_updates": 4
+        }
+      ],
+      "final_policy_return": 0.11867882311344147,
+      "final_critic_loss": 0.008857705630362034,
+      "film_channel_permissions": "passed",
+      "finite_checkpoint_tensors": true,
+      "replay_posterior_perturbation": "bitwise-identical raw actions, returns and actor gradients with poisoned replay mean and factor; eager update completed with no imagined provider",
+      "compiled_vs_eager": {
+        "full_updates": 5,
+        "captures": 1,
+        "graph_replays": 2,
+        "atol": 2e-05,
+        "rtol": 0.001
+      }
+    },
+    "gt": {
+      "checkpoint_and_resume": [
+        {
+          "collected_steps": 5,
+          "collected_frames": 20,
+          "mean_updates": 2,
+          "covariance_updates": 2,
+          "actor_updates": 2,
+          "critic_updates": 2
+        },
+        {
+          "collected_steps": 10,
+          "collected_frames": 40,
+          "mean_updates": 4,
+          "covariance_updates": 4,
+          "actor_updates": 4,
+          "critic_updates": 4
+        }
+      ],
+      "final_policy_return": 0.11862896382808685,
+      "final_critic_loss": 0.00885047111660242,
+      "film_channel_permissions": "passed",
+      "finite_checkpoint_tensors": true,
+      "replay_posterior_perturbation": "bitwise-identical raw actions, returns and actor gradients with poisoned replay mean and factor; eager update completed with no imagined provider",
+      "compiled_vs_eager": {
+        "full_updates": 5,
+        "captures": 1,
+        "graph_replays": 2,
+        "atol": 2e-05,
+        "rtol": 0.001
+      }
+    },
+    "mean": {
+      "checkpoint_and_resume": [
+        {
+          "collected_steps": 5,
+          "collected_frames": 20,
+          "mean_updates": 2,
+          "covariance_updates": 2,
+          "actor_updates": 2,
+          "critic_updates": 2
+        },
+        {
+          "collected_steps": 10,
+          "collected_frames": 40,
+          "mean_updates": 4,
+          "covariance_updates": 4,
+          "actor_updates": 4,
+          "critic_updates": 4
+        }
+      ],
+      "final_policy_return": 0.11884906888008118,
+      "final_critic_loss": 0.008889945223927498,
+      "film_channel_permissions": "passed",
+      "finite_checkpoint_tensors": true
+    },
+    "belief": {
+      "checkpoint_and_resume": [
+        {
+          "collected_steps": 5,
+          "collected_frames": 20,
+          "mean_updates": 2,
+          "covariance_updates": 2,
+          "actor_updates": 2,
+          "critic_updates": 2
+        },
+        {
+          "collected_steps": 10,
+          "collected_frames": 40,
+          "mean_updates": 4,
+          "covariance_updates": 4,
+          "actor_updates": 4,
+          "critic_updates": 4
+        }
+      ],
+      "final_policy_return": 0.11884278059005737,
+      "final_critic_loss": 0.008889098651707172,
+      "film_channel_permissions": "passed",
+      "finite_checkpoint_tensors": true
+    }
+  },
+  "pytest": {
+    "isolation": "2 passed, 22 deselected, 1 warning in 5.06s",
+    "graphs": "2 passed, 22 deselected, 1 warning in 21.41s",
+    "regression": "74 passed, 7 warnings in 11.25s",
+    "compat": "181 passed, 1 warning in 15.46s"
+  },
+  "first_compatibility_run": "180 passed; one assertion compared converted single-row and batched float32 states bitwise. The final regression compares all native mean coordinates and the covariance factor exactly.",
+  "verification_seconds_cumulative": 377,
+  "time_limit_seconds": 465,
+  "kill_grace_seconds": 5,
+  "release": {
+    "observed_at": "2026-11-27T00:03:29+08:00",
+    "gpu_index_name_uuid_memory_used_mib_utilization": "7, NVIDIA RPBZZZ6, GPU-a9fc5610-4ad5-25b8-8e55-2df4a4aadd38, 6, 0",
+    "gpu_compute_processes": [],
+    "processes_with_cwd_in_verification_tree": []
+  },
+  "remote_commands": [
+    "bash verify.sh smoke isolation regression graphs",
+    "bash verify.sh smoke isolation graphs regression",
+    "bash verify-compat.sh compat (before and after native-coordinate assertion correction)"
+  ],
+  "log_archive": "eit_v7_four_methods_logs.tar.gz",
+  "log_archive_sha256": "04debc7c44331543895285b5113abedaab1a254c32279f8b5bfaaa91bf63a3ba",
+  "verified_source_sha256": {
+    "src/supermimic/critic_inputs.py": "6d4098d9971015ee4ca74b8071d9afe84be86774d40fa5ac75347338ff4fedd9",
+    "src/supermimic/eit_methods.py": "803720831ee48760da47ce7e8ea768993492acf56a424f81d02571ab000a7983",
+    "src/supermimic/estimator_inputs.py": "79ec1cd06630f96f5096be15f29f83973a4fb46de308bdf769ce04632da01f41",
+    "src/supermimic/imagined_rollout.py": "fe5f105beaea2fb0ab330cfa591964123266989140281bb2d6b669382b354c33",
+    "src/supermimic/models.py": "1e8da6de16887848b345c2b662d1a55efc32a09cd2f6a944841a73536e2d19c6",
+    "src/supermimic/posterior_replay.py": "a7e7195f9d04ced8f4eb9a2e58a8d9bfe261a057a17c3de5eebe3fec3e504331",
+    "src/supermimic/envs/world_model_env.py": "3c3c51d9003e51b12f5bc8a51e02cfc988f740a0f17a25bfa42ecb03e7b8018c",
+    "src/supermimic/learners/belief_policy_learner.py": "f54d973cf66b72cbfc2e56f457b7a0801ee597a82c53bd9efd7aa5876a2bca58",
+    "src/supermimic/runners/eit_resume_reference.py": "cadc39f06ad1a9228c574984517edf212785cb27d87e97182c41e5685812f933",
+    "src/supermimic/runners/eit_training.py": "f534b556b22aeac7921a6433c36329938b62ddf01d81985ab0a3cb9b9ea5f8f7",
+    "src/supermimic/runners/run_config.py": "cf4ecba85bdf6d750f7349589d4f929e934b575ece2d221d39c313cd30a0e75d",
+    "src/supermimic/runners/supermimic_runner.py": "0ffb8b64fe2b2363dbfb14e164db45365521fc7a11c8908258cda10ede194ae3",
+    "src/supermimic/scripts/check_eit_four_methods.py": "418759d8c3bf5a86fd53760bdec9f301feca2915cf10ab356654fcb86ee6d533",
+    "src/supermimic/scripts/launch_eit.py": "5c0a46f8c0da6febb300e178d44d75cb549e2847ad6a1a36c0083f465543a256",
+    "src/supermimic/scripts/train_eit.py": "bab50c575b7f35c6789ed81a4c0d97865e8a2cc6fbef4993eb7c4ddc35ccba7e",
+    "tests/test_estimator_eit_graph.py": "cd1f65308f3aaae027a2c6adfd211db95bc7e787c9dcf9f6840b4a863c461919",
+    "tests/test_estimator_eit_launch.py": "53c68b1f8d672dfb2ef4cd4d66adf89c0fa408df0653c3e6c098e31746326e49",
+    "tests/test_estimator_eit_training.py": "5d8fbbfbd99aa9d4eb3b04df8fb33df26b94b48af5b5e8f6b5dd5706039b3f40",
+    "tests/test_estimator_posterior_replay.py": "d4303703d716bc6735888b0f2a7f57b722b200c558250046d44db57a3f3da947",
+    "train_eit_v7.toml": "d388811e79799db35571fb8d5ebc8cedcf04260c1d0191e4e56e4a1c0827262f"
+  },
+  "review_fixes": {
+    "remote_workspace": "/tmp/eit-v7-fixes.1f8xx3gZ",
+    "commands": [
+      "bash verify-fixes.sh",
+      "bash verify-frame-checks.sh"
+    ],
+    "pytest": "97 passed, 7 warnings in 51.70s",
+    "profiler_and_posterior_isolation": "4 passed, 24 deselected, 2 warnings in 8.94s",
+    "prepared_rollouts": "Compared observations, rewards and termination across two transitions with explicit measurement noise and deterministic or sampled process dynamics, with and without an attached provider. The provider generation stayed unchanged.",
+    "per_step_profiler": "Neither baseline stateful step emitted aten::item, aten::_local_scalar_dense or aten::equal.",
+    "baseline_graph_configurations": [
+      {
+        "residual_actor": true,
+        "samples": 1
+      },
+      {
+        "residual_actor": false,
+        "samples": 2
+      }
+    ],
+    "graph_checks_per_configuration_and_baseline": {
+      "updates": 5,
+      "captures": 1,
+      "graph_replays": 2,
+      "atol": 2e-05,
+      "rtol": 0.001
+    },
+    "common_initialization_sha256": "f13d13f59706a50dccffb780ebeba3e27d1ee1a3641d4c89805ac3dfa89e850d",
+    "initialization_checks": "Prepared v6 with gt and reused it from mean. A legacy v5 file passed mean preparation and failed baseline preparation. Mixed-seed launcher coverage checked the method selected for each seed.",
+    "four_method_smoke": "All four residual runs trained 5 physical steps and resumed to 10, increasing actor and critic updates from 2 to 4 with finite checkpoint tensors.",
+    "review_seconds_before_fixes": 80,
+    "additional_seconds_authorized": 120,
+    "fix_verification_seconds": 98,
+    "verification_seconds_cumulative": 555,
+    "release": {
+      "observed_at": "2026-11-27T00:21:41+08:00",
+      "gpu_index_name_uuid_memory_used_mib_utilization": "7, NVIDIA RPBZZZ6, GPU-a9fc5610-4ad5-25b8-8e55-2df4a4aadd38, 6, 0",
+      "gpu_compute_processes": []
+    },
+    "logs_in_archive": "review-fixes/",
+    "original_validation_source_sha256_for_changed_files": {
+      "src/supermimic/envs/world_model_env.py": "24734a6e1d2329c7fa96f96f73bdcc00573ec9abcf7068b698e563ac98851c88",
+      "src/supermimic/scripts/check_eit_four_methods.py": "0ed949766d3f32eb68e7c24c6db1765c706f33e687b27c2e71aeec470159d63f",
+      "src/supermimic/scripts/launch_eit.py": "5f0d4aa8ad03baae2c38d7e0f280a0a0174b487926eda7257c4433d8f328f67b",
+      "src/supermimic/scripts/train_eit.py": "99fee04123939bbb991de236a8745bef10032e3e4d8141bd3c4d0b5452da790d",
+      "tests/test_estimator_eit_graph.py": "f881a796d6b2210e4b3bcb02230960126fe57b2eacdd8d13292a52a504ee4be8",
+      "tests/test_estimator_eit_launch.py": "852bb82b502faf7fc57f45a40c360f058435a11c86dec971c617dfaef58b7d3c"
+    }
+  }
+}

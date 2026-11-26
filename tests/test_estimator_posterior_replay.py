@@ -9,7 +9,7 @@ import torch
 from tensordict import TensorDict
 
 from supermimic.belief import BeliefState
-from supermimic.posterior_replay import pack_belief, unpack_belief
+from supermimic.posterior_replay import pack_belief, pack_mean, unpack_belief
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
 from supermimic.runners.eit_training import EITTraining
 from supermimic.runners.run_config import validate_eit_checkpoint_contract
@@ -409,8 +409,10 @@ def test_physical_heads_remain_diagnostic_even_when_unsaved_and_expire_with_raw_
     for row, episode in enumerate(episodes.tolist()):
       recorded, frames = replay.episode_prefix(episode, 0)
       assert frames["time_index"].tolist() == [0]
-      assert torch.equal(recorded.mean.to_full(), priors.mean.to_full()[row])
-      assert torch.equal(recorded.covariance, priors.covariance[row])
+      # Compare exactly the stored native coordinates. to_full() computes a
+      # world velocity with different single-row and batched matmul kernels.
+      assert torch.equal(pack_mean(recorded.mean), pack_mean(priors.mean)[row])
+      assert torch.equal(recorded.covariance_sqrt, priors.covariance_sqrt[row])
       recorded.mean.position.zero_()
       assert torch.equal(
         replay.episode_prefix(episode, 0)[0].mean.position, priors.mean.position[row]

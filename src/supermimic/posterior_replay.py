@@ -228,11 +228,13 @@ class PosteriorReplay:
       return index
     return index[matches]
 
-  def read(self, replay, keys=None, *, locations=None):
+  def read(self, replay, keys=None, *, locations=None, include_belief=True):
     rows, slots, pslots = self.lookup(replay, keys) if locations is None else locations
     batch = replay._storage[rows, slots].detach().clone()
     batch["sensor_window"] = self.history(replay, rows, slots)
     batch["segment_time"] = batch["time_index"].clone()
+    if not include_belief:
+      return batch, None
     batch["posterior_revision"] = self.storage["posterior_revision"][
       rows, pslots
     ].clone()

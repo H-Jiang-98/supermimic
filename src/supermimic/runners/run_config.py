@@ -18,7 +18,8 @@ from supermimic.runners.supermimic_runner import SuperMimicRunnerCfg
 EIT_TRAINING_VERSION = "eit_model_training_v5"
 EIT_POLICY_TRAINING_VERSION = "eit_training_v7"
 _LEGACY_POLICY_VERSION = "eit_training_v5"
-EIT_INITIALIZATION_VERSION = "eit_initialization_v5"
+LEGACY_INITIALIZATION_VERSION = "eit_initialization_v5"
+EIT_INITIALIZATION_VERSION = "eit_initialization_v6"
 
 
 def validate_eit_checkpoint_contract(

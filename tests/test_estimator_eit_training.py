@@ -24,8 +24,8 @@ from tests.test_estimator_belief_training import _RoundRunner, assert_tree
 from tests.test_estimator_world_model_env import _env
 
 
-def training(seed=31, *, buffer_size=8, replay_ratio=1):
-  runner = _RoundRunner(seed, group="mean")
+def training(seed=31, *, group="mean", buffer_size=8, replay_ratio=1):
+  runner = _RoundRunner(seed, group=group)
   runner.cfg.critic_hidden_dims = (12,)
   runner.cfg.buffer_size = buffer_size
   runner.cfg.replay_ratio = replay_ratio
@@ -56,7 +56,7 @@ def training(seed=31, *, buffer_size=8, replay_ratio=1):
   runner.replay_buffer = ReplayBuffer(
     runner._schema, buffer_size, 2, initial_prior=runner._wm.initial_prior
   )
-  env = _env("mean")
+  env = _env(group)
   # All simulated measurements/replay/prefix/model interfaces stay real; only
   # physics and reward use the deterministic stream and analytic test function.
   runner._representation.compute_wm_reward_from_reference = (
@@ -247,6 +247,22 @@ def test_initialization_copies_exact_weights_and_rejects_after_training():
   advance(source)
   with pytest.raises(ValueError, match="active training"):
     source.load_initialization(bundle)
+
+
+def test_two_method_initialization_and_cross_method_checkpoint():
+  source = training(group="gt")
+  bundle = source.initialization_bundle()
+  legacy = dict(bundle, version="eit_initialization_v5")
+  for section in ("actors", "critics"):
+    legacy[section] = {group: bundle[section][group] for group in ("mean", "belief")}
+  for group in ("mean", "belief"):
+    training(group=group).load_initialization(legacy)
+  for group in ("gt", "prop_kp"):
+    with pytest.raises(ValueError, match="four-method"):
+      training(group=group).load_initialization(legacy)
+  target = training(group="prop_kp")
+  with pytest.raises(ValueError):
+    target.load_state_dict(source.state_dict())
 
 
 def test_shared_initialization_matches_legacy_v3_weight_identity(tmp_path):

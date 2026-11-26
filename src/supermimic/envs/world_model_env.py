@@ -35,8 +35,10 @@ from supermimic.estimator_inputs import (
   PosteriorInput,
   PosteriorProvider,
   build_actor_critic_goals,
+  local_actor_features,
   sample_proprio,
 )
+from supermimic.local_control import privileged_goal
 from supermimic.motion_loader import (
   MotionLoader,
   motion_content_digest,
@@ -84,7 +86,7 @@ class BeliefRolloutStart:
   """Detached starts with mixed source beliefs, pinned to one rollout identity."""
 
   batch: TensorDict
-  belief: BeliefState
+  belief: BeliefState | None
   model_version: str | int
   replay_buffer: ReplayBuffer
   insert_count: int
@@ -104,7 +106,7 @@ class BeliefRolloutStart:
     return replace(
       self,
       batch=self.batch[selection].clone(),
-      belief=self.belief.index(selection).clone(),
+      belief=self.belief.index(selection).clone() if self.belief is not None else None,
     )
 
   @staticmethod
@@ -116,6 +118,7 @@ class BeliefRolloutStart:
       if (
         start.replay_buffer is not first.replay_buffer
         or start.insert_count != first.insert_count
+        or (start.belief is None) != (first.belief is None)
         or start.model_version != first.model_version
         or start.model_write_generation != first.model_write_generation
         or start.motion_digest != first.motion_digest
@@ -124,7 +127,9 @@ class BeliefRolloutStart:
     return replace(
       first,
       batch=torch.cat([start.batch for start in starts]),
-      belief=_cat_beliefs([start.belief for start in starts]),
+      belief=_cat_beliefs([start.belief for start in starts])
+      if first.belief is not None
+      else None,
     )
 
   def repeat_interleave(self, repeats: int):
@@ -285,6 +290,10 @@ class WorldModelEnv(ABC):
     process_noise: torch.Tensor | None = None,
     measurement_noise: torch.Tensor | None = None,
   ) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict[str, object]]:
+    if self.unfiltered_policy and self._belief_frame is None:
+      return self._step_estimator_inputs(
+        actions, None, process_noise=process_noise, measurement_noise=measurement_noise
+      )
     self._check_belief_frame()
     if isinstance(self.posterior_provider, BeliefProvider):
       if posterior is not None:
@@ -344,6 +353,8 @@ class WorldModelEnv(ABC):
 
   def _check_belief_frame(self) -> None:
     """Cached goals and policy actions must still refer to the committed posterior."""
+    if self.unfiltered_policy and self._belief_frame is None:
+      return
     if self._readonly_motion is not None:
       self._policy_motion_digest()
     provider, frame = self.posterior_provider, self._belief_frame
@@ -493,10 +504,31 @@ class WorldModelEnv(ABC):
       raise ValueError("Reference motion changed during read-only policy training")
     return digest
 
-  def _policy_keys(self, episode_id, time_index):
+  @property
+  def unfiltered_policy(self):
+    return (
+      self.estimator_input_config is not None
+      and self.estimator_input_config.unfiltered_policy
+    )
+
+  def _check_policy_source(self):
+    if self.unfiltered_policy:
+      if self.replay_buffer.posterior_cache is None:
+        raise ValueError("Unfiltered EIT policy starts require saved replay frames")
+      return
     self._check_posterior_source(None)
     if not isinstance(self.posterior_provider, BeliefProvider):
       raise ValueError("Policy starts require a full belief provider")
+
+  def _policy_model_version(self):
+    return (
+      self.dynamics.model_revision
+      if self.unfiltered_policy
+      else self.posterior_provider.model_version
+    )
+
+  def _policy_keys(self, episode_id, time_index):
+    self._check_policy_source()
     episodes = torch.as_tensor(episode_id, device=self.device)
     times = torch.as_tensor(time_index, device=self.device)
     if (
@@ -515,21 +547,21 @@ class WorldModelEnv(ABC):
     """Stream already selected replay slots without gathering their keys again."""
     if type(batch_size) is not int or batch_size < 1:
       raise ValueError("Policy start batch size must be positive")
-    self._check_posterior_source(None)
-    if not isinstance(self.posterior_provider, BeliefProvider):
-      raise ValueError("Policy starts require a full belief provider")
+    self._check_policy_source()
     replay = self.replay_buffer
     cache = replay.posterior_cache
     if cache is None:
       raise ValueError("Cached policy starts require posterior replay")
     replay.finish_collection_round()
-    version = self.posterior_provider.model_version
+    version = self._policy_model_version()
     write_generation = self.dynamics.write_generation
     insert_count = replay.insert_count
     digest = self._policy_motion_digest()
     for offset in range(0, len(locations[0]), batch_size):
       selected = tuple(t[offset : offset + batch_size] for t in locations)
-      batch, belief = cache.read(replay, locations=selected)
+      batch, belief = cache.read(
+        replay, locations=selected, include_belief=not self.unfiltered_policy
+      )
       yield BeliefRolloutStart(
         batch,
         belief,
@@ -667,7 +699,7 @@ class WorldModelEnv(ABC):
       start.replay_buffer is not self.replay_buffer
       or start.insert_count != self.replay_buffer.insert_count
       or start.motion_digest != self._policy_motion_digest()
-      or start.model_version != self.posterior_provider.model_version
+      or start.model_version != self._policy_model_version()
       or (
         start.model_write_generation is not None
         and start.model_write_generation != self.dynamics.write_generation
@@ -677,7 +709,7 @@ class WorldModelEnv(ABC):
 
   def validate_policy_start(self, start):
     """Validate/copy complete initial conditions without touching provider state."""
-    self._check_posterior_source(None)
+    self._check_policy_source()
     if not isinstance(start, BeliefRolloutStart) or not len(start):
       raise ValueError("A nonempty BeliefRolloutStart is required")
     self.check_policy_start_identity(start)
@@ -716,6 +748,11 @@ class WorldModelEnv(ABC):
     if (batch["motion_time"] >= self.motion.motion_ends[-1]).any():
       raise ValueError("Prepared reference frame exceeds motion bounds")
     validate_rotation(batch["alignment_rotation"])
+    LieState.from_full(batch["state"]).validate()
+    if not torch.equal(batch["sensor_window"][:, -1, -29:], batch["prev_action"]):
+      raise ValueError("Stored measurement actions must equal replay prev_action")
+    if self.unfiltered_policy:
+      return batch, None
     if not isinstance(start.belief, BeliefState):
       raise TypeError("Training requires a complete BeliefState")
     belief = start.belief.detach().clone()
@@ -726,21 +763,20 @@ class WorldModelEnv(ABC):
       or belief.covariance_sqrt.device != reference.device
     ):
       raise ValueError("Prepared belief must match batch, dtype and device")
-    LieState.from_full(batch["state"]).validate()
-    if not torch.equal(batch["sensor_window"][:, -1, -29:], batch["prev_action"]):
-      raise ValueError("Stored measurement actions must equal replay prev_action")
     return batch, belief
 
   def reset_prepared(self, start: BeliefRolloutStart) -> TensorDict:
-    """Restore a copied Q0 without sampling or fusing the first measurement again."""
+    """Restore the replay frame and the method's initial policy inputs."""
     batch, belief = self.validate_policy_start(start)
-    candidate = self.posterior_provider.prepare_restore(
-      belief,
-      batch["sim_ctx"],
-      model_version=start.model_version,
-      episode_id=batch["episode_id"],
-      time_index=batch["segment_time"],
-    )
+    candidate = None
+    if belief is not None:
+      candidate = self.posterior_provider.prepare_restore(
+        belief,
+        batch["sim_ctx"],
+        model_version=start.model_version,
+        episode_id=batch["episode_id"],
+        time_index=batch["segment_time"],
+      )
     previous_size = self.num_envs
     try:
       self.num_envs = len(start)
@@ -776,7 +812,9 @@ class WorldModelEnv(ABC):
 
   def snapshot(self) -> dict:
     """Save the last committed imagined frame as a detached rollout starting point."""
-    if not isinstance(self.posterior_provider, BeliefProvider):
+    if not isinstance(self.posterior_provider, BeliefProvider) or (
+      self.unfiltered_policy and self._belief_frame is None
+    ):
       raise ValueError("An imagined snapshot requires a full belief provider")
     self._check_belief_frame()
     frame = {
@@ -910,14 +948,14 @@ class WorldModelEnv(ABC):
     sensor = history[:, -1]
     if candidate is not None:
       posterior = candidate.to_actor_input()
-    else:
+    elif not self.unfiltered_policy:
       posterior = self._resolve_posterior(posterior, sensor, actions, reset=True)
     goals = self._prepare_estimator_goals(
       aux, rep, batch["motion_time"], alignment, posterior, batch["sim_ctx"]
     )
     critic = None
     if self.eit_critic:
-      if candidate is None:
+      if candidate is None and not self.unfiltered_policy:
         raise ValueError("Full critic reset requires a complete keyed belief")
       critic = self._build_eit_critic(
         aux,
@@ -925,7 +963,7 @@ class WorldModelEnv(ABC):
         goals.critic,
         history,
         batch["sim_ctx"],
-        candidate.state.belief,
+        candidate.state.belief if candidate is not None else None,
       )
     # Commit only after posterior and all actor/critic reference inputs are valid.
     if candidate is not None:
@@ -1080,17 +1118,32 @@ class WorldModelEnv(ABC):
     return obs, pending["rewards"], pending["term_prob"], {}
 
   def _step_estimator_inputs(
-    self, actions: torch.Tensor, posterior: PosteriorInput | None
+    self,
+    actions: torch.Tensor,
+    posterior: PosteriorInput | None,
+    *,
+    process_noise=None,
+    measurement_noise=None,
   ) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict[str, object]]:
     """Stage the next frame; failed posterior validation leaves env state intact."""
-    self._check_posterior_source(posterior)
+    if not self.unfiltered_policy:
+      self._check_posterior_source(posterior)
     actions = self.limit_actions(actions)
     aux, rep, joints, term_prob, rewards = self._wm_step(
-      self.rep_state, self.aux_state, actions, self.last_actions, self.sim_ctx
+      self.rep_state,
+      self.aux_state,
+      actions,
+      self.last_actions,
+      self.sim_ctx,
+      process_noise=process_noise,
     )
     times = self._next_motion_times()
     sensor = None
-    if posterior is None and self.posterior_provider is not None:
+    if (
+      not self.unfiltered_policy
+      and posterior is None
+      and self.posterior_provider is not None
+    ):
       sensor = self._sensor_from_state(rep, aux, joints, actions, self.sim_ctx)
       posterior = self._resolve_posterior(posterior, sensor, actions, reset=False)
     goals = self._prepare_estimator_goals(
@@ -1098,7 +1151,9 @@ class WorldModelEnv(ABC):
     )
     # A direct injection can be validated before drawing any new measurement.
     if sensor is None:
-      sensor = self._sensor_from_state(rep, aux, joints, actions, self.sim_ctx)
+      sensor = self._sensor_from_state(
+        rep, aux, joints, actions, self.sim_ctx, measurement_noise=measurement_noise
+      )
     if self.history_length > 1:
       past = torch.cat(
         [self._past_sensors[:, 1:], self._latest_sensor.unsqueeze(1)], dim=1
@@ -1144,7 +1199,7 @@ class WorldModelEnv(ABC):
     )
     if self.estimator_input_config is not None:
       if measurement_noise is not None:
-        if (
+        if not self.unfiltered_policy and (
           measurement_noise.shape != sensor[..., :64].shape
           or not torch.isfinite(measurement_noise).all()
         ):
@@ -1192,6 +1247,18 @@ class WorldModelEnv(ABC):
   def _critic_obs(self, history: torch.Tensor | None = None) -> torch.Tensor:
     """The privileged critic input — full WM state, not the actor's sensor obs."""
     if self.eit_critic:
+      if self.unfiltered_policy:
+        from supermimic.critic_inputs import build_critic_features_kernel
+
+        return build_critic_features_kernel(
+          LieState.from_rep(self.aux_state, self.rep_state),
+          self._wm_goal_obs,
+          self._sensor_history() if history is None else history,
+          self.sim_ctx,
+          None,
+          group=self.estimator_input_config.group,
+          constants=None,
+        )
       return self._build_eit_critic(
         self.aux_state,
         self.rep_state,
@@ -1361,10 +1428,20 @@ class WorldModelEnv(ABC):
   ) -> _EstimatorGoals:
     assert self.estimator_input_config is not None
     reference = self.representation.reference_window(self.motion, times, alignment)
-    truth = self.representation.true_rpv(aux, rep)
-    actor, uncertainty, critic = build_actor_critic_goals(
-      self.estimator_input_config, truth, posterior, reference, context
+    truth = (
+      LieState.from_rep(aux, rep)
+      if self.estimator_input_config.local_control
+      else self.representation.true_rpv(aux, rep)
     )
+    if self.unfiltered_policy:
+      actor, uncertainty = local_actor_features(
+        self.estimator_input_config, truth, None, reference, context
+      )
+      critic = privileged_goal(truth, reference)
+    else:
+      actor, uncertainty, critic = build_actor_critic_goals(
+        self.estimator_input_config, truth, posterior, reference, context
+      )
     bodies = self._aligned_reference_bodies(self.motion.body_state(times), alignment)
     return _EstimatorGoals(bodies, actor, critic, uncertainty)
 

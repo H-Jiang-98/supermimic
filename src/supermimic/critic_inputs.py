@@ -5,12 +5,12 @@ from __future__ import annotations
 import copy
 import math
 from dataclasses import asdict, dataclass
-from typing import Literal
 
 import torch
 from torch import nn
 
 from supermimic.belief import BeliefState
+from supermimic.eit_methods import BASELINES, LOCAL_METHODS, EstimatorGroup
 from supermimic.estimator_inputs import covariance_encoding_constants
 from supermimic.local_control import (
   GOAL_DIM,
@@ -31,7 +31,7 @@ COVARIANCE_DIM = 45
 
 @dataclass(frozen=True)
 class CriticInputConfig:
-  group: Literal["A", "B", "C", "mean", "belief"] = "B"
+  group: EstimatorGroup = "B"
   version: str = CRITIC_INPUT_VERSION
   tangent_version: str = TANGENT_VERSION
   covariance_encoding: str | None = None
@@ -40,8 +40,8 @@ class CriticInputConfig:
   epsilon_std: float = 1e-6
 
   def __post_init__(self):
-    if self.group not in ("A", "B", "C", "mean", "belief"):
-      raise ValueError("Critic group must be A, B or C")
+    if self.group not in ("A", "B", "C", *LOCAL_METHODS):
+      raise ValueError(f"Unknown critic group: {self.group}")
     encoding = "local68_raw_vech_v1" if self.local_control else "rpv9_log_std_corr_v1"
     if self.covariance_encoding is None:
       object.__setattr__(self, "covariance_encoding", encoding)
@@ -60,13 +60,14 @@ class CriticInputConfig:
 
   @property
   def local_control(self):
-    return self.group in ("mean", "belief")
+    return self.group in LOCAL_METHODS
 
   def input_dim(self, context_dim: int) -> int:
     if type(context_dim) is not int or context_dim < 0:
       raise ValueError("context_dim must be a nonnegative integer")
     if self.local_control:
-      return 68 + GOAL_DIM + 3 + 465 + context_dim + LOCAL_DIM + VECH_DIM
+      common = 68 + GOAL_DIM + 3 + 465 + context_dim
+      return common if self.group in BASELINES else common + LOCAL_DIM + VECH_DIM
     return (
       COMMON_DIM + context_dim + (0 if self.group == "A" else MEAN_DIM + COVARIANCE_DIM)
     )
@@ -174,7 +175,7 @@ def build_critic_features(
       or not torch.isfinite(value).all()
     ):
       raise ValueError(f"Invalid critic {name} shape, dtype, device or values")
-  if cfg.group != "A":
+  if cfg.group not in ("A", *BASELINES):
     if not isinstance(belief, BeliefState):
       raise ValueError("B/C critic requires a complete BeliefState")
     belief.validate_structure()
@@ -197,7 +198,9 @@ def build_critic_features(
     sim_ctx,
     belief,
     group=cfg.group,
-    constants=critic_feature_constants(history, cfg) if cfg.group != "A" else None,
+    constants=critic_feature_constants(history, cfg)
+    if cfg.group in ("B", "C")
+    else None,
   )
   if not torch.isfinite(features).all():
     raise ValueError("Critic encoding produced non-finite features")
@@ -221,7 +224,7 @@ def build_critic_features_kernel(
       pieces.extend(
         (actor_condition[..., :LOCAL_DIM], actor_condition[..., -(VECH_DIM + 29) : -29])
       )
-  elif group != "A":
+  elif group in ("B", "C"):
     mean = belief.mean
     inverse = truth.rotation.mT
     rotation = inverse @ mean.rotation

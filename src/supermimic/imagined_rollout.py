@@ -30,7 +30,7 @@ from supermimic.utils.validation import rotation_valid
 
 @dataclass(frozen=True)
 class ImaginedState:
-  belief: BeliefState
+  belief: BeliefState | None
   aux: torch.Tensor
   rep: torch.Tensor
   history: torch.Tensor
@@ -41,7 +41,7 @@ class ImaginedState:
 @dataclass(frozen=True)
 class PreparedRollout:
   state: ImaginedState
-  estimator: LieBeliefFilter
+  estimator: LieBeliefFilter | None
   context: torch.Tensor
   reference: ReferenceWindow  # Flattened time-major reference batch.
   bodies: tuple[torch.Tensor, ...]  # One (H+1, B, ...) tensor per body channel.
@@ -90,8 +90,8 @@ def prepare_rollout(env, start, horizon, process_noise, measurement_noise):
   ):
     if (
       noise.shape != (horizon, len(start), width)
-      or noise.device != belief.covariance_sqrt.device
-      or noise.dtype != belief.covariance_sqrt.dtype
+      or noise.device != batch["state"].device
+      or noise.dtype != batch["state"].dtype
       or not torch.isfinite(noise).all()
     ):
       raise ValueError(f"Invalid rollout {name} noise")
@@ -131,7 +131,7 @@ def prepare_rollout(env, start, horizon, process_noise, measurement_noise):
     ImaginedState(
       belief, aux, rep, batch["sensor_window"], batch["prev_action"], times
     ),
-    env.posterior_provider.estimator,
+    None if config.unfiltered_policy else env.posterior_provider.estimator,
     batch["sim_ctx"],
     windows,
     tuple(value.unflatten(0, grid.shape) for value in body),
@@ -158,17 +158,22 @@ def rows_invalid(*values):
 
 
 def observe(env, prepared, state, step):
-  truth = env.representation.true_rpv(state.aux, state.rep)
+  full = LieState.from_rep(state.aux, state.rep)
+  truth = (
+    full
+    if env.estimator_input_config.local_control
+    else env.representation.true_rpv(state.aux, state.rep)
+  )
   actor, uncertainty, goal, invalid = build_actor_critic_goals_kernel(
     env.estimator_input_config,
     truth,
-    state.belief.to_actor_input(),
+    state.belief.to_actor_input() if state.belief is not None else None,
     prepared.reference_at(step),
     prepared.actor_encoding,
     prepared.context,
   )
   critic = build_critic_features_kernel(
-    LieState.from_rep(state.aux, state.rep),
+    full,
     goal,
     state.history,
     prepared.context,
@@ -208,22 +213,26 @@ def imagine_step(env, prepared, state, actions, process_noise, measurement_noise
     (sensor[..., :64] + measurement_noise * prepared.measurement_std, sensor[..., 64:]),
     -1,
   )
-  mean, lower, invalid = prepared.estimator.predict_correct_kernel(
-    state.belief.mean,
-    state.belief.covariance_sqrt,
-    executed,
-    prepared.context,
-    sensor[..., :64],
-    measurement_std=prepared.measurement_std,
-  )
+  invalid = rows_invalid(actions, aux, rep, joints, done, reward, sensor)
+  belief = None
+  if not env.estimator_input_config.unfiltered_policy:
+    mean, lower, filter_invalid = prepared.estimator.predict_correct_kernel(
+      state.belief.mean,
+      state.belief.covariance_sqrt,
+      executed,
+      prepared.context,
+      sensor[..., :64],
+      measurement_std=prepared.measurement_std,
+    )
+    belief = BeliefState(mean, covariance_sqrt=lower)
+    invalid = invalid | filter_invalid
   history = torch.cat((state.history[:, 1:], sensor.unsqueeze(1)), dim=1)
   next_state = ImaginedState(
-    BeliefState(mean, covariance_sqrt=lower),
+    belief,
     aux,
     rep,
     history,
     executed,
     prepared.motion_times[step + 1],
   )
-  invalid = invalid | rows_invalid(actions, aux, rep, joints, done, reward, sensor)
   return next_state, reward, done, invalid

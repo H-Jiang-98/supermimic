@@ -3,7 +3,7 @@ environment_root = "/mnt/cpfs/zbl-cpfs-new/USERS/leojiang/supermimic_ws" # 使�
 dataset_root = "/mnt/cpfs/zbl-cpfs-new/dataset/leojiang/supermimic_ws"
 motion_file = "motions/*.npz" # 相对 dataset_root；支持单个 NPZ 或 glob。
 checkpoint_root = "/mnt/cpfs/zbl-cpfs-new/CKPT/leojiang/supermimic_ws"
-experiment = "eit_v7_local_Lafan_compiled_h32_2048envs_stride1" # 输出：checkpoint_root/experiment/seed<seed>/<方法>/
+experiment = "eit_v7_four_methods_residual_Lafan_h32_2048envs_stride1" # 输出：checkpoint_root/experiment/seed<seed>/<方法>/
 
 [training]
 jacobian_backend = "increment" # 35 维网络增量求导，再通过积分组装 70x70 Jacobian。
@@ -65,12 +65,22 @@ angular_velocity = 0.12
 joint_position = 0.006
 joint_velocity = 0.30
 
+[methods.prop_kp]
+gpus = [0]
+seeds = [2027]
+residual_actor = true
+
+[methods.gt]
+gpus = [1]
+seeds = [2027]
+residual_actor = true
+
 [methods.mean]
 gpus = [0]
 seeds = [2027]
-residual_actor = [false, true]
+residual_actor = true
 
 [methods.belief]
 gpus = [1]
 seeds = [2027]
-residual_actor = [false, true]
+residual_actor = true

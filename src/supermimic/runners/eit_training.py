@@ -22,7 +22,12 @@ import wandb
 from filelock import FileLock
 from tensordict import TensorDict
 
-from supermimic.critic_inputs import BeliefCritic, critic_state_features
+from supermimic.critic_inputs import (
+  BeliefCritic,
+  CriticInputConfig,
+  critic_state_features,
+)
+from supermimic.eit_methods import BASELINES, LOCAL_METHODS
 from supermimic.envs.world_model_env import BeliefRolloutStart
 from supermimic.estimator_inputs import (
   EpisodeAlignment,
@@ -47,6 +52,7 @@ from supermimic.runners.eit_snapshots import file_sha256
 from supermimic.runners.run_config import (
   EIT_INITIALIZATION_VERSION,
   EIT_POLICY_TRAINING_VERSION,
+  LEGACY_INITIALIZATION_VERSION,
   validate_eit_checkpoint_contract,
 )
 from supermimic.runners.supermimic_runner import (
@@ -163,7 +169,7 @@ class EITTraining(BeliefModelTraining):
       runner.cfg.estimator_inputs is None
       or not runner.cfg.estimator_inputs.local_control
     ):
-      raise ValueError("EIT v7 training requires the mean or belief group")
+      raise ValueError("EIT v7 training requires prop_kp, gt, mean or belief")
     if (
       runner.cfg.replay_ratio != 0
       and runner.replay_buffer.buffer_size < runner.cfg.mean.window_frames
@@ -184,9 +190,27 @@ class EITTraining(BeliefModelTraining):
     inputs = runner.cfg.estimator_inputs
     assert inputs is not None
     parameter = next(actor.parameters())
+    context_dim = runner._sim_context.output_dim
     critic = BeliefCritic(
-      inputs.group, runner._sim_context.output_dim, runner.cfg.critic_hidden_dims
-    ).to(device=parameter.device, dtype=parameter.dtype)
+      inputs.group if not inputs.unfiltered_policy else "mean",
+      context_dim,
+      runner.cfg.critic_hidden_dims,
+    )
+    self._initial_critic_tail = None
+    if inputs.unfiltered_policy:
+      # Draw the same full critic for every method. Keep only the excluded
+      # columns on CPU to allow a baseline to generate the shared bundle.
+      with torch.random.fork_rng(devices=[]):
+        baseline = BeliefCritic(
+          inputs.group, context_dim, runner.cfg.critic_hidden_dims
+        )
+      weights = critic.state_dict()
+      first = weights["mlp.0.weight"]
+      self._initial_critic_tail = first[:, baseline.input_dim :].clone()
+      weights["mlp.0.weight"] = first[:, : baseline.input_dim]
+      baseline.load_state_dict(weights)
+      critic = baseline
+    critic = critic.to(device=parameter.device, dtype=parameter.dtype)
     runner.wm_env.eit_critic = True
     runner.policy_learner = BeliefActorCriticPolicyLearner(
       actor,
@@ -304,11 +328,15 @@ class EITTraining(BeliefModelTraining):
     try:
       with timer.measure("posterior_cache_read_seconds"):
         batch = cast(TensorDict, storage[rows, slots])
-        posterior = unpack_belief(
-          cache.storage["posterior_mean"][rows, pslots],
-          cache.storage["posterior_sqrt_tril"][rows, pslots],
-          dtype=batch["state"].dtype,
-        ).to_actor_input()
+        posterior = (
+          None
+          if env.unfiltered_policy
+          else unpack_belief(
+            cache.storage["posterior_mean"][rows, pslots],
+            cache.storage["posterior_sqrt_tril"][rows, pslots],
+            dtype=batch["state"].dtype,
+          ).to_actor_input()
+        )
       values = self._normalization_inputs(batch, posterior)
       for module, value in zip(staged, values, strict=True):
         module.update(value)
@@ -417,8 +445,8 @@ class EITTraining(BeliefModelTraining):
   @staticmethod
   def _check_checkpoint_version(state: dict) -> None:
     validate_eit_checkpoint_contract(state, stage="policy")
-    if state["runner_config"]["estimator_inputs"]["group"] not in ("mean", "belief"):
-      raise ValueError("EIT v7 training requires the mean or belief group")
+    if state["runner_config"]["estimator_inputs"]["group"] not in LOCAL_METHODS:
+      raise ValueError("EIT v7 training requires prop_kp, gt, mean or belief")
 
   def load_state_dict(self, state: dict) -> None:
     self._check_checkpoint_version(state)
@@ -1036,7 +1064,7 @@ class EITTraining(BeliefModelTraining):
       return history
 
   def initialization_bundle(self) -> dict:
-    """Export explicit, independently allocated common mean/belief initial weights."""
+    """Export all method contracts from the common actor and full critic draw."""
     if (
       self.update_groups
       or self.learner.mean_steps
@@ -1047,14 +1075,20 @@ class EITTraining(BeliefModelTraining):
       raise ValueError("Common initialization can only be exported before training")
     runner = self.runner
     actors, critics = {}, {}
-    for group in ("mean", "belief"):
-      # The two local controllers differ only in how they use these weights.
+    full = self.policy.critic.checkpoint()
+    first = full["state_dict"]["mlp.0.weight"]
+    if self._initial_critic_tail is not None:
+      first = torch.cat((first, self._initial_critic_tail.to(first)), dim=1)
+    for group in LOCAL_METHODS:
       inputs = replace(runner.cfg.estimator_inputs, group=group, residual_actor=False)
       actors[group] = deepcopy(
         actor_checkpoint(self.actor, replace(runner.cfg, estimator_inputs=inputs))
       )
-      critic = self.policy.critic.checkpoint()
-      critic["contract"]["config"]["group"] = group
+      critic = deepcopy(full)
+      config = CriticInputConfig(group=group)
+      width = config.input_dim(runner._sim_context.output_dim)
+      critic["contract"].update(config=asdict(config), input_dim=width)
+      critic["state_dict"]["mlp.0.weight"] = first[:, :width].contiguous().clone()
       critics[group] = critic
     world_model = deepcopy(runner._wm.bundle())
     world_model["dynamics"].pop("model_revision", None)
@@ -1076,7 +1110,16 @@ class EITTraining(BeliefModelTraining):
       or self.policy.critic_steps
     ):
       raise ValueError("Initialization cannot replace an active training run")
-    if bundle.get("version") != EIT_INITIALIZATION_VERSION:
+    version = bundle.get("version")
+    if version == EIT_INITIALIZATION_VERSION:
+      groups = LOCAL_METHODS
+    elif version == LEGACY_INITIALIZATION_VERSION:
+      groups = ("mean", "belief")
+      if self.runner.cfg.estimator_inputs.group in BASELINES:
+        raise ValueError(
+          "Baseline training requires a four-method initialization bundle"
+        )
+    else:
       raise ValueError("Unsupported EIT initialization")
     if bundle.get("generation_seed") not in (None, self.training_seed):
       raise ValueError("Initialization seed differs from the training seed")
@@ -1093,7 +1136,6 @@ class EITTraining(BeliefModelTraining):
       raise ValueError(
         "Initialization estimator settings disagree with runner configuration"
       )
-    groups = ("mean", "belief")
     if set(bundle.get("actors", {})) != set(groups) or set(
       bundle.get("critics", {})
     ) != set(groups):
@@ -1131,6 +1173,13 @@ class EITTraining(BeliefModelTraining):
     )
     load_actor_checkpoint(self.actor, init_config, bundle["actors"][group])
     self.policy.critic.load_checkpoint(bundle["critics"][group])
+    if group in BASELINES:
+      full_weight = bundle["critics"]["mean"]["state_dict"]["mlp.0.weight"]
+      self._initial_critic_tail = (
+        full_weight[:, self.policy.critic.input_dim :]
+        .detach()
+        .to(device="cpu", copy=True)
+      )
     self.initialization_digest = identity
     runner.wm_env.clear_rollout()
     self._ready = False

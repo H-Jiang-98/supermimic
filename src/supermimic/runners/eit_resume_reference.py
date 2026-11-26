@@ -211,7 +211,9 @@ def _policy_start(payload, replay, device):
         **{key: value.to(device) for key, value in payload["belief_mean"].items()}
       ),
       payload["belief_covariance"].to(device),
-    ),
+    )
+    if payload.get("belief_mean") is not None
+    else None,
     payload["model_revision"],
     replay,
     replay.insert_count,
@@ -307,8 +309,12 @@ def build_live_reference(training, checkpoint: Path, state: dict):
           "belief_mean": {
             field.name: getattr(starts.belief.mean, field.name)
             for field in fields(starts.belief.mean)
-          },
-          "belief_covariance": starts.belief.covariance,
+          }
+          if starts.belief is not None
+          else None,
+          "belief_covariance": starts.belief.covariance
+          if starts.belief is not None
+          else None,
           "model_revision": starts.model_version,
           "model_version": env.dynamics.model_version,
           "motion_digest": starts.motion_digest,

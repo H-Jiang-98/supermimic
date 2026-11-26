@@ -16,6 +16,7 @@ from mjlab.tasks.registry import load_env_cfg
 import supermimic.tasks  # noqa: F401
 from supermimic.belief import GaussianStatePrior
 from supermimic.critic_inputs import CRITIC_INPUT_VERSION
+from supermimic.eit_methods import BASELINES, LOCAL_METHODS
 from supermimic.estimator import FilterConfig
 from supermimic.estimator_inputs import EITInputConfig
 from supermimic.learners.belief_policy_learner import BeliefPolicyLearnerCfg
@@ -27,7 +28,11 @@ from supermimic.runners.eit_training import (
   initialization_fingerprint,
   saved_loop_config,
 )
-from supermimic.runners.run_config import EIT_INITIALIZATION_VERSION, load_runner_cfg
+from supermimic.runners.run_config import (
+  EIT_INITIALIZATION_VERSION,
+  LEGACY_INITIALIZATION_VERSION,
+  load_runner_cfg,
+)
 from supermimic.runners.supermimic_runner import SuperMimicRunner, SuperMimicRunnerCfg
 from supermimic.scripts.train_utils import (
   add_model_fit_args,
@@ -35,6 +40,13 @@ from supermimic.scripts.train_utils import (
   model_fit_configs,
 )
 from supermimic.tasks.env_cfgs import configure_estimator_env_cfg
+
+
+def _preparation_fingerprint(bundle: dict) -> str:
+  # Keep the published artifact digest intact for checkpoints. Only the
+  # compatibility check ignores the method that produced the common weights.
+  content = {key: value for key, value in bundle.items() if key != "generation_group"}
+  return initialization_fingerprint(content, include_model_revision=False)
 
 
 def _reference_path(reference: Path, output: Path, *inputs: Path | None) -> Path:
@@ -99,12 +111,12 @@ def main():
     "--initialization",
     type=Path,
     help=(
-      "Shared mean/belief initial weights (default: output parent/"
+      "Shared four-method initial weights (default: output parent/"
       f"{EIT_INITIALIZATION_VERSION}_{CRITIC_INPUT_VERSION}_"
       "noise<fingerprint>_seed<seed>.pt)"
     ),
   )
-  parser.add_argument("--group", choices=("mean", "belief"), default="mean")
+  parser.add_argument("--group", choices=LOCAL_METHODS)
   parser.add_argument("--residual-actor", action="store_true")
   parser.add_argument("--stepwise-motion-encoder", action="store_true")
   for name, std in zip(GaussianStatePrior.names, GaussianStatePrior().std, strict=True):
@@ -289,6 +301,8 @@ def main():
     saved = torch.load(args.resume, map_location=args.device, weights_only=True)
     EITTraining._check_checkpoint_version(saved)
     runner_cfg = load_runner_cfg({"runner_cfg": saved["runner_config"]})
+    if args.group is not None and args.group != runner_cfg.estimator_inputs.group:
+      parser.error("--group differs from the resume checkpoint method")
     loop_cfg = EITTrainingCfg(**saved_loop_config(saved))
     policy_cfg = BeliefPolicyLearnerCfg(**saved["policy_config"])
     num_envs = saved["num_envs"]
@@ -296,6 +310,7 @@ def main():
       env_cfg.seed = saved["training_seed"]
     del saved
   else:
+    args.group = args.group or "mean"
     mean, cov = model_fit_configs(args)
     runner_cfg = SuperMimicRunnerCfg.for_estimator_inputs(
       args.group,
@@ -391,22 +406,31 @@ def main():
       training.before_checkpoint_commit = capture_live_reference
     if not args.resume:
       assert initialization is not None
-      expected = None
+      expected = {}
       if args.prepare_initialization or not initialization.exists():
         initial = training.initialization_bundle()
-        expected = (
-          initialization_fingerprint(initial) if args.prepare_initialization else None
-        )
-        initialization.parent.mkdir(parents=True, exist_ok=True)
-        with NamedTemporaryFile(
-          dir=initialization.parent, delete_on_close=False
-        ) as stream:
-          torch.save(initial, stream)
-          stream.close()
-          try:
-            os.link(stream.name, initialization)
-          except FileExistsError:
-            pass
+        if args.prepare_initialization:
+          expected[EIT_INITIALIZATION_VERSION] = _preparation_fingerprint(initial)
+          if args.group not in BASELINES:
+            # A two-method launcher may be reusing its previously published seed.
+            legacy = dict(initial, version=LEGACY_INITIALIZATION_VERSION)
+            for key in ("actors", "critics"):
+              legacy[key] = {
+                method: initial[key][method] for method in ("mean", "belief")
+              }
+            expected[LEGACY_INITIALIZATION_VERSION] = _preparation_fingerprint(legacy)
+            del legacy
+        if not initialization.exists():
+          initialization.parent.mkdir(parents=True, exist_ok=True)
+          with NamedTemporaryFile(
+            dir=initialization.parent, delete_on_close=False
+          ) as stream:
+            torch.save(initial, stream)
+            stream.close()
+            try:
+              os.link(stream.name, initialization)
+            except FileExistsError:
+              pass
         del initial
       if initialization.is_file():
         initial = torch.load(
@@ -416,13 +440,10 @@ def main():
         raise ValueError(f"Initialization path is not a file: {initialization}")
       training.load_initialization(initial)
       if args.prepare_initialization:
-        if (
-          training.initialization_digest != expected
-          and initialization_fingerprint(initial, include_model_revision=False)
-          != expected
-        ):
+        expected_digest = expected.get(initial["version"])
+        if _preparation_fingerprint(initial) != expected_digest:
           raise ValueError(
-            "Existing initialization differs from the requested seed/group/configuration"
+            "Existing initialization differs from the requested seed or configuration"
           )
         print(f"EIT_INITIALIZATION {training.initialization_digest} {initialization}")
         return

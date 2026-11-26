@@ -629,6 +629,8 @@ class LocalMotionActor(MultiEncoderAE):
     condition_dim = 2 * LOCAL_DIM + context_dim + VECH_DIM
     super().__init__(uncertainty_dim=kwargs["latent_dim"] + condition_dim, **kwargs)
     self.condition_normalizer = _CudaGraphNormalization(condition_dim)
+    self.state_width = 2 * LOCAL_DIM
+    self.uses_local_state = inputs.group != "prop_kp"
     self.uses_covariance = inputs.uses_uncertainty
     self.residual_actor = inputs.residual_actor
     self.covariance_start = condition_dim - VECH_DIM
@@ -645,15 +647,19 @@ class LocalMotionActor(MultiEncoderAE):
       (self.condition_normalizer._mean.shape[-1], 29), -1
     )
     normalized = self.condition_normalizer(raw)
-    if not self.uses_covariance:
-      normalized = torch.cat(
-        (
-          normalized[..., : self.covariance_start],
-          torch.zeros_like(normalized[..., self.covariance_start :]),
-        ),
-        -1,
-      )
-    gamma, beta = self.film(torch.cat((latent, normalized), -1)).chunk(2, -1)
+    state = normalized[..., : self.state_width]
+    context = normalized[..., self.state_width : self.covariance_start]
+    covariance = normalized[..., self.covariance_start :]
+    film_input = torch.cat(
+      (
+        latent,
+        state if self.uses_local_state else torch.zeros_like(state),
+        context,
+        covariance if self.uses_covariance else torch.zeros_like(covariance),
+      ),
+      -1,
+    )
+    gamma, beta = self.film(film_input).chunk(2, -1)
     main = torch.cat((latent, self.obs_normalizer(history).flatten(-2)), -1)
     hidden = self.decoder[1](self.decoder[0](main)) * (1 + gamma) + beta
     for layer in self.decoder[2:]:

@@ -21,6 +21,7 @@ from tensordict import TensorDict
 
 from supermimic.belief import GaussianStatePrior
 from supermimic.belief_provider import BeliefProvider
+from supermimic.eit_methods import EstimatorGroup
 from supermimic.envs.motion_tracking_env import MotionTrackingEnv
 from supermimic.envs.multi_task_world_model_env import MultiTaskWorldModelEnv
 from supermimic.estimator import FilterConfig, LieBeliefFilter
@@ -130,9 +131,7 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   return_sampler: ReturnSamplerCfg = field(default_factory=ReturnSamplerCfg)
 
   @classmethod
-  def for_estimator_inputs(
-    cls, group: Literal["A", "B", "C", "mean", "belief"] = "A", **kwargs
-  ):
+  def for_estimator_inputs(cls, group: EstimatorGroup = "A", **kwargs):
     inputs = kwargs.pop("estimator_inputs", EITInputConfig(group=group))
     return cls(
       estimator_inputs=inputs,
@@ -1172,7 +1171,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
             ),
           )
           current = candidate.state.belief
-        posterior = current.to_actor_input()
+        posterior = None if inputs.unfiltered_policy else current.to_actor_input()
       else:
         # Only legacy injection lacks a keyed provider; consume it once per frame.
         if not self._posterior_ready:
@@ -1192,7 +1191,9 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       )
       goal, uncertainty = build_actor_features(
         inputs,
-        self._representation.true_rpv(aux_state, rep_state),
+        LieState.from_rep(aux_state, rep_state)
+        if inputs.group == "gt"
+        else self._representation.true_rpv(aux_state, rep_state),
         posterior,
         reference,
         sim_ctx,

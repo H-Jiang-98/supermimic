@@ -105,7 +105,7 @@ with busy.open("x"):
     group, seed = value("--group"), value("--seed")
     assert init.is_file() and init.stem == f"seed{seed}"
     output = Path(value("--output"))
-    assert output == root / "ckpt/walk" / f"seed{seed}" / f"{group}-direct"
+    assert output == root / "ckpt/walk" / f"seed{seed}" / f"{group}-residual"
     with (root / f"jobs-{gpu}").open("a") as log:
       print(json.dumps([group, int(seed)]), file=log)
   time.sleep(.02)
@@ -177,16 +177,45 @@ def test_checked_in_v7_config_has_four_variants_per_seed():
   assert by_seed and all(
     sorted(variants)
     == [
-      ("belief", "direct"),
       ("belief", "residual"),
-      ("mean", "direct"),
+      ("gt", "residual"),
       ("mean", "residual"),
+      ("prop_kp", "residual"),
     ]
     for variants in by_seed.values()
   )
   assert sorted(cmd[cmd.index("--seed") + 1] for cmd in commands(prepare)) == sorted(
     by_seed
   )
+
+
+def test_preparation_requires_four_methods_only_for_seeds_with_baselines(
+  config, tmp_path
+):
+  config["methods"]["gt"] = {"gpus": [7], "seeds": [4]}
+  config["methods"]["prop_kp"] = {"gpus": [7], "seeds": [2, 4]}
+  _, _, (prepare, _) = plan(config, tmp_path)
+  jobs = [
+    (int(cmd[cmd.index("--seed") + 1]), cmd[cmd.index("--group") + 1], gpu)
+    for gpu, commands in prepare.items()
+    for cmd in commands
+  ]
+  assert sorted(jobs) == [
+    (2, "prop_kp", 1),
+    (4, "gt", 3),
+    (5, "mean", 1),
+    (9, "mean", 3),
+  ]
+
+
+@pytest.mark.parametrize(
+  "setting,expected",
+  [(False, ["direct"]), (True, ["residual"]), ([False, True], ["direct", "residual"])],
+)
+def test_explicit_action_modes(config, tmp_path, setting, expected):
+  config["methods"] = {"gt": {"gpus": [1], "seeds": [2027], "residual_actor": setting}}
+  _, _, (_, train) = plan(config, tmp_path)
+  assert [Path(cmd[-1]).name for cmd in train[1]] == [f"gt-{mode}" for mode in expected]
 
 
 def test_output_cannot_be_overridden_by_training_options(config, tmp_path):
