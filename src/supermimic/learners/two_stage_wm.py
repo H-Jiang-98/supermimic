@@ -15,7 +15,7 @@ from supermimic.models import Dynamics
 from supermimic.replay_buffer import ReplayBuffer
 from supermimic.representations import StateRepresentation
 from supermimic.utils.lie_state import LieState, local_error
-from supermimic.utils.profiling import PhaseTimer
+from supermimic.utils.profiling import StreamTimer
 
 
 @dataclass(frozen=True)
@@ -210,14 +210,14 @@ class TwoStageWorldModelLearner:
     validation_batch_size: int,
     *,
     staged_normalizers=None,
+    fit_starts=None,
   ) -> tuple[dict, dict]:
     cfg, cov = self.mean_cfg, self.cov_cfg
-    timer = PhaseTimer(next(self.dynamics.parameters()).device)
-    self.last_profile = timer.seconds
+    timer = StreamTimer(next(self.dynamics.parameters()).device)
     mean_before, cov_before = self.mean_steps, self.cov_steps
-    windows, valid_windows, pairs, held_out = replay.model_fit_starts(
-      train_ids, valid_ids, cfg.window_frames
-    )
+    if fit_starts is None:
+      fit_starts = replay.model_fit_starts(train_ids, valid_ids, cfg.window_frames)
+    windows, valid_windows, pairs, held_out = fit_starts
     if not len(windows):
       raise ValueError(
         f"No complete {cfg.window_frames}-frame training window in replay"
@@ -303,6 +303,7 @@ class TwoStageWorldModelLearner:
         for key, value in metrics.items():
           if not math.isfinite(value):
             raise FloatingPointError(f"Non-finite {phase} metric {key}")
+      self.last_profile = timer.seconds()
       return train, validation
     finally:
       self.dynamics.zero_grad(set_to_none=True)

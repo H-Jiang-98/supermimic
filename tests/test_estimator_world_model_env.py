@@ -86,8 +86,9 @@ def _env(group="C", provider=None, *, mode="train"):
   dynamics = Dynamics(rep, 29, 1, torch.ones(29), torch.zeros(29), (16,))
   for normalizer in dynamics.normalizers():
     normalizer.eval()
-  spec = TaskSpec("motion", 700, lambda *args: None)
   config = EITInputConfig(group=group, mode=mode)
+  rep.local_control = config.local_control
+  spec = TaskSpec("motion", config.goal_dim, lambda *args: None)
   env = MultiTaskWorldModelEnv(
     dynamics,
     rep,

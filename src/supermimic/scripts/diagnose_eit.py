@@ -62,7 +62,13 @@ def _validate_record(record, saved):
       "sensor": (n, 93),
       "action": (n, 29),
       "sim_ctx": (n, context["scale"].numel()),
-      "true_goal": (n, 700),
+      "true_goal": (
+        n,
+        733
+        if saved.get("runner_config", {}).get("estimator_inputs", {}).get("group")
+        in ("mean", "belief")
+        else 700,
+      ),
       "reward": (n,),
       "prior_mean": (71,),
       "prior_covariance": (70, 70),
@@ -311,7 +317,7 @@ def score_frames(estimator, record, device, bins, critic_info):
           belief.covariance[:, :9, :9],
           diagnostic.innovation.norm(dim=-1),
           truth.position - belief.mean.position,
-          truth.velocity - belief.mean.velocity,
+          truth.world_velocity - belief.mean.world_velocity,
         )
       if critic is not None:
         # Reset pads with five copies of the first measured frame.

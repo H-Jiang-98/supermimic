@@ -22,7 +22,7 @@ from supermimic.scripts.train_eit import (
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA Inductor regression")
-@pytest.mark.parametrize("group", ["A", "B", "C"])
+@pytest.mark.parametrize("group", ["mean", "belief"])
 @pytest.mark.parametrize("backend", ["vmap", "increment"])
 def test_fixed_policy_rollout_compiled(group, backend, tmp_path):
   device = "cuda:0"
@@ -111,7 +111,7 @@ def test_fixed_policy_rollout_compiled(group, backend, tmp_path):
         )
 
       _capture_and_compare(run, prepared, noises)
-      if group == "C" and backend == "increment":
+      if group == "belief" and backend == "increment":
         with torch.compiler.set_stance("force_eager"):
           _capture_and_compare(run, prepared, noises)
 
@@ -137,8 +137,9 @@ def test_fixed_policy_rollout_compiled(group, backend, tmp_path):
       for metric in get_compilation_metrics()
       if metric.co_filename and metric.graph_op_count
     }
+    actor_kernels = {"encode_goal", "decode_goal"}
+    assert {("models.py", name) for name in actor_kernels} <= graphs
     assert {
-      ("models.py", "forward_with_aux"),
       ("estimator.py", "_vector_jacobian"),
       ("estimator.py", "_propagate_sqrt"),
     } <= graphs

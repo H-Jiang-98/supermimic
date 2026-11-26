@@ -1,4 +1,4 @@
-"""Launch the EIT methods and seeds in train_eit_config.toml."""
+"""Launch the configured EIT methods, action modes and seeds."""
 
 from __future__ import annotations
 
@@ -34,6 +34,7 @@ def _training_args(settings: dict) -> list[str]:
   # argparse parser validates the training options, including network widths.
   reserved = {
     "group",
+    "residual_actor",
     "seed",
     "device",
     "motion_file",
@@ -50,7 +51,7 @@ def _training_args(settings: dict) -> list[str]:
     if not name.isidentifier() or name in reserved:
       raise ValueError(f"Invalid [training] option: {name}")
     flag = "--" + name.replace("_", "-")
-    if name in ("eager", "policy_cuda_graphs"):
+    if name in ("eager", "policy_cuda_graphs", "stepwise_motion_encoder"):
       if type(value) is not bool:
         raise ValueError(f"training.{name} must be a boolean")
       if value:
@@ -130,13 +131,15 @@ def worker_command(config: dict, environment: Path, motion: Path) -> list[str]:
     *_training_args(config["training"]),
     *_training_args(validation),
   ]
+  for name, value in config.get("initial_belief", {}).items():
+    common.extend(_training_args({"prior_" + name: value}))
   if "env" in config:
     common.extend(_mujoco_args(config["env"]))
   return common
 
 
 def plan(config: dict, base: Path):
-  if set(config) - {"env", "wm validation"} != {
+  if set(config) - {"env", "wm validation", "initial_belief"} != {
     "paths",
     "training",
     "methods",
@@ -145,14 +148,23 @@ def plan(config: dict, base: Path):
   environment, motion, output = resolve_paths(config["paths"], base)
   common = worker_command(config, environment, motion)
   methods = config["methods"]
-  if not methods or set(methods) - {"A", "B", "C"}:
-    raise ValueError("[methods] requires one or more of A, B and C")
-
+  if not methods or set(methods) - {"mean", "belief"}:
+    raise ValueError("Unknown or empty EIT method selection")
   prepare = defaultdict(list)
   train = defaultdict(list)
   prepared_seeds = set()
   for group, method in methods.items():
-    if not isinstance(method, dict) or set(method) != {"gpus", "seeds"}:
+    if not isinstance(method, dict):
+      raise ValueError(f"Expected table for methods.{group}")
+    residuals = method.get("residual_actor", [False])
+    if (
+      not isinstance(residuals, list)
+      or not residuals
+      or any(type(r) is not bool for r in residuals)
+      or len(set(residuals)) != len(residuals)
+    ):
+      raise ValueError("residual_actor must be a list of distinct booleans")
+    if set(method) - {"residual_actor"} != {"gpus", "seeds"}:
       raise ValueError(f"[methods.{group}] requires gpus and seeds")
     gpus = _indices(method["gpus"], f"methods.{group}.gpus")
     seeds = _indices(method["seeds"], f"methods.{group}.seeds")
@@ -161,19 +173,22 @@ def plan(config: dict, base: Path):
       init = output / "init" / f"seed{seed}.pt"
       args = [*common, "--seed", str(seed), "--initialization", str(init)]
       if seed not in prepared_seeds:
-        prepare[gpu].append([*args, "--group", "B", "--prepare-initialization"])
+        prepare[gpu].append([*args, "--group", "mean", "--prepare-initialization"])
         prepared_seeds.add(seed)
-      train[gpu].append(
-        [
-          *args,
-          "--group",
-          group,
-          "--run-name",
-          f"eit-{group}-seed{seed}",
-          "--output",
-          str(output / f"seed{seed}" / group),
-        ]
-      )
+      for residual in residuals:
+        variant = f"{group}-{'residual' if residual else 'direct'}"
+        train[gpu].append(
+          [
+            *args,
+            "--group",
+            group,
+            *(["--residual-actor"] if residual else []),
+            "--run-name",
+            f"eit-{variant}-seed{seed}",
+            "--output",
+            str(output / f"seed{seed}" / variant),
+          ]
+        )
   return environment, motion, (prepare, train)
 
 
@@ -225,20 +240,16 @@ async def run_queue(gpu: int, commands: list[list[str]], environment: Path):
       raise RuntimeError(f"EIT process on GPU {gpu} exited with status {status}")
 
 
-async def launch(phases, environment, *, wait_for_all: bool = False):
+async def launch(phases, environment):
   for queues in phases:
-    results = await asyncio.gather(
-      *(run_queue(gpu, jobs, environment) for gpu, jobs in queues.items()),
-      return_exceptions=wait_for_all,
+    await asyncio.gather(
+      *(run_queue(gpu, jobs, environment) for gpu, jobs in queues.items())
     )
-    failures = [str(result) for result in results if isinstance(result, Exception)]
-    if failures:
-      raise RuntimeError("\n".join(failures))
 
 
-def run_cli(plan, default_config: str, description: str | None, *, wait_for_all=False):
-  parser = argparse.ArgumentParser(description=description)
-  parser.add_argument("--config", type=Path, default=Path(default_config))
+def main():
+  parser = argparse.ArgumentParser(description=__doc__)
+  parser.add_argument("--config", type=Path, default=Path("train_eit_v7.toml"))
   parser.add_argument(
     "--dry-run", action="store_true", help="Print GPU queues without starting workers"
   )
@@ -258,13 +269,9 @@ def run_cli(plan, default_config: str, description: str | None, *, wait_for_all=
       raise ValueError(f"Missing executable: {environment}/.venv/bin/python")
     if not any(Path(match).is_file() for match in glob.iglob(str(motion))):
       raise ValueError(f"No motion files matched {motion}")
-    asyncio.run(launch(phases, environment, wait_for_all=wait_for_all))
+    asyncio.run(launch(phases, environment))
   except (KeyError, TypeError, ValueError, OSError, RuntimeError) as error:
     parser.exit(1, f"EIT launch failed: {error}\n")
-
-
-def main():
-  run_cli(plan, "train_eit_config.toml", __doc__)
 
 
 if __name__ == "__main__":

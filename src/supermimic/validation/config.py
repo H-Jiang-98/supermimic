@@ -12,6 +12,14 @@ import tomllib
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+LOCAL_STUDY_VERSION = "eit_joint_local_v7"
+LOCAL_VARIANTS = ("mean-direct", "mean-residual", "belief-direct", "belief-residual")
+PRE_FAILURE_VERSIONS = {
+  LOCAL_STUDY_VERSION,
+  "eit_joint_multiclip_v4",
+  "eit_joint_multiclip_v5",
+}
+
 VARIANTS = ("A-posterior", "B-posterior", "C-posterior", "A-truth")
 
 
@@ -69,7 +77,7 @@ class StudyConfig:
     if (
       not isinstance(self.methods, list)
       or not self.methods
-      or any(method not in VARIANTS for method in self.methods)
+      or any(method not in (*VARIANTS, *LOCAL_VARIANTS) for method in self.methods)
       or len(set(self.methods)) != len(self.methods)
     ):
       raise ValueError(

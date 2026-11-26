@@ -21,6 +21,25 @@ def incremental(reference, **kwargs):
   )
 
 
+@pytest.mark.parametrize(("count", "widths"), [(2047, [512] * 4), (513, [512, 16])])
+def test_compiled_tail_dispatch_preserves_rows_and_gradients(count, widths):
+  _, _, estimator, *_ = fixture(config=FilterConfig(jacobian_batch_chunk_size=512))
+  seen = []
+
+  def kernel(epsilon, state, nominal, action, context):
+    seen.append(len(action))
+    return action.square()
+
+  estimator._compiled_jacobian = kernel
+  action = torch.randn(count, 2, requires_grad=True)
+  actual = estimator._compiled_jacobian_blocks(
+    action, (action,), (action,), action, action
+  )
+  assert seen == widths
+  torch.testing.assert_close(actual, action.square())
+  torch.testing.assert_close(torch.autograd.grad(actual.sum(), action)[0], 2 * action)
+
+
 @pytest.mark.parametrize("chunks", [(None, None), (1, 7), (2, 1)])
 @pytest.mark.parametrize("offset_nominal", [False, True])
 def test_increment_matches_full_jacobian_and_all_outer_gradients(
@@ -148,7 +167,7 @@ def test_train_eit_selects_increment_by_default_and_accepts_reference_backends(
   argv = [
     "train_eit",
     "--group",
-    "B",
+    "mean",
     "--device",
     "cpu",
     "--motion-file",

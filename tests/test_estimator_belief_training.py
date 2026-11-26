@@ -34,7 +34,7 @@ from tests.test_estimator_two_stage_wm import fixture
 class _RoundRunner(SuperMimicRunner):
   """Deterministic physical stream; production providers/actor/replay are real."""
 
-  def __init__(self, seed=31, replay_mode="full"):
+  def __init__(self, seed=31, replay_mode="full", group="B"):
     estimator, source = fixture(episodes=(4,), seed=seed)
     self.template = source.retained_frames([0])
     self.replay_mode = replay_mode
@@ -48,7 +48,7 @@ class _RoundRunner(SuperMimicRunner):
     self._representation.actor_obs_mode = "proprio"
     self._representation.configure_estimator_measurement(estimator.measurement_config)
     self.cfg = SuperMimicRunnerCfg.for_estimator_inputs(
-      "B",
+      group,
       process_noise=self._dynamics.process_noise_config,
       dynamics_hidden_dims=(12, 12),
       actor_hidden_dims=(12,),
@@ -56,13 +56,18 @@ class _RoundRunner(SuperMimicRunner):
       mean=MeanFitCfg(batch_size=2, num_batches=1, window_frames=3),
       cov=CovarianceFitCfg(batch_size=2, validation_pairs=4),
     )
+    self._representation.local_control = self.cfg.estimator_inputs.local_control
     self.device = "cpu"
     self.env = SimpleNamespace(num_envs=2)
     self.motion = make_mock_motion()
     self.motion.joint_pos.zero_()
     self.motion.joint_vel.zero_()
     self._wm = WorldModel(
-      self._representation, self._dynamics, torch.nn.Identity(), 700, 29
+      self._representation,
+      self._dynamics,
+      torch.nn.Identity(),
+      self.cfg.estimator_inputs.goal_dim,
+      29,
     )
     self.world_model_learner = TwoStageWorldModelLearner(
       self._dynamics, self._representation, self.cfg.mean, self.cfg.cov, self.device
@@ -115,11 +120,16 @@ class _RoundRunner(SuperMimicRunner):
     obs = TensorDict(
       {
         "history": sensor[:, None].expand(2, 5, 93),
-        "goal_motion": sensor.new_zeros(2, 700),
+        "goal_motion": sensor.new_zeros(2, self.cfg.estimator_inputs.goal_dim),
       },
       [2],
     )
-    action = self.policy_learner.actor(obs)
+    actor = self.policy_learner.actor
+    if self.cfg.estimator_inputs.local_control:
+      obs["task_uncertainty"] = sensor.new_zeros(
+        2, actor.condition_normalizer._mean.shape[-1] + 29
+      )
+    action = actor(obs)
     frame["actor_obs"], frame["action"], frame["prev_action"] = (
       sensor,
       action,

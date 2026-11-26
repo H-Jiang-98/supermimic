@@ -42,9 +42,9 @@ def test_resume_rejects_prior_replay_contract_without_changing_rng(make_loop):
   loop = make_loop()
   checkpoint = loop.state_dict()
   assert checkpoint["version"] == (
-    "eit_training_v6" if checkpoint["stage"] == "policy" else "eit_model_training_v4"
+    "eit_training_v7" if checkpoint["stage"] == "policy" else "eit_model_training_v5"
   )
-  checkpoint["version"] = "eit_training_v2"
+  checkpoint["version"] = "eit_training_v6"
   rng = torch.random.get_rng_state()
   with pytest.raises(ValueError, match=EIT_TRAINING_VERSION):
     loop.load_state_dict(checkpoint)
@@ -54,8 +54,8 @@ def test_resume_rejects_prior_replay_contract_without_changing_rng(make_loop):
 def test_shared_initialization_rejects_prior_replay_contract_without_changing_rng():
   loop = training()
   bundle = loop.initialization_bundle()
-  assert bundle["version"] == "eit_initialization_v4"
-  bundle["version"] = "eit_initialization_v2"
+  assert bundle["version"] == "eit_initialization_v5"
+  bundle["version"] = "eit_initialization_v4"
   rng = torch.random.get_rng_state()
   with pytest.raises(ValueError, match="initialization"):
     loop.load_initialization(bundle)
@@ -69,7 +69,7 @@ def test_eval_seed_pairs_first_reset_and_measurement_across_actor_architectures(
   stationary_motion(motion)
   results = []
   with torch.compiler.set_stance("force_eager"):
-    for group in ("B", "C"):
+    for group in ("mean", "belief"):
       env_cfg = configure_estimator_env_cfg(gencoord_env_cfg())
       env_cfg.seed = 2026
       env_cfg.commands["motion"].motion_file = str(motion)

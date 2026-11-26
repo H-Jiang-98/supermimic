@@ -45,10 +45,29 @@ def test_correlated_square_root_nll_nees_and_degree_rmse():
     posterior_values(belief, target)
 
 
+def test_posterior_world_axis_rmse_wraps_roll_and_yaw():
+  from scipy.spatial.transform import Rotation
+
+  def pose(angles, xyz):
+    rotation = Rotation.from_euler("xyz", angles, degrees=True).as_matrix()
+    return replace(
+      state(),
+      rotation=torch.tensor(rotation[None], dtype=torch.float32),
+      position=torch.tensor([xyz], dtype=torch.float32),
+    )
+
+  truth = pose([179, 32, -178], [1, -2, 3])
+  mean = pose([-178, 27, 178], [-2, 0, 7])
+  belief = BeliefState(mean, covariance_sqrt=torch.eye(70)[None])
+  metrics = posterior_values(belief, truth)[0]
+  assert metrics[5:].sqrt().tolist() == pytest.approx([3, 2, 4, 3, 5, 4], abs=1e-5)
+  torch.testing.assert_close(metrics[5:8].sum(), metrics[1])
+
+
 def test_rmse_after_time_mean_and_partial_last_bin():
   bins = BinnedMetrics(ODOMETRY, 1, 2, "cpu")
   for error in [0, 4, 9]:
-    bins.update(torch.tensor([[error, error, error, 2.0, 9.0]]))
+    bins.update(torch.tensor([[error, error, error, 2.0, 9.0] + [error] * 6]))
   result = bins.result()
   assert result["bin_counts"].tolist() == [2, 1]
   assert result["full"][0, 0] == pytest.approx(np.sqrt(13 / 3))
@@ -94,7 +113,13 @@ def test_context_then_clip_weighting_and_no_partial_context_means():
   for name, frames, values in [("short", 1, [1.0, 3.0]), ("long", 100, [5.0, 7.0])]:
     loaded.append(
       (
-        dict(status="complete", clip=name, variant="C-posterior"),
+        dict(
+          status="complete",
+          clip=name,
+          variant="C-posterior",
+          clip_frames=frames,
+          control_dt=0.02,
+        ),
         dict(
           context_ids=np.array([0, 1]),
           full=np.array(values)[:, None],
@@ -109,6 +134,40 @@ def test_context_then_clip_weighting_and_no_partial_context_means():
   loaded[0][1]["context_ids"] = np.array([0])
   _, clips, excluded, _ = aggregate(manifest, loaded)
   assert excluded == ["short"] and set(clips) == {"long"}
+
+
+def test_average_excludes_only_bins_without_pre_failure_frames():
+  manifest = dict(
+    kind="odometry",
+    version="eit_joint_multiclip_v4",
+    config=dict(num_domain_contexts=2),
+    motions=[dict(name="clip")],
+  )
+  meta = dict(
+    status="complete",
+    variant="C-posterior",
+    clip="clip",
+    clip_frames=6,
+    control_dt=0.02,
+  )
+  arrays = dict(
+    context_ids=np.arange(2),
+    first_failure_s=np.array([0.02, 0.08]),
+    valid_frame_counts=np.array([1, 4]),
+    bin_counts=np.array([2, 2, 2]),
+    full=np.array([[2.0], [6.0]]),
+    bins=np.array([[[2.0], [4.0]], [[np.nan], [8.0]], [[np.nan], [np.nan]]]),
+  )
+  _, clips, _, _ = aggregate(manifest, [(meta, arrays)])
+  stats = clips["clip"]["C-posterior"]
+  np.testing.assert_allclose(stats["mean_bins"][:, 0], [3.0, 8.0, np.nan])
+  assert stats["mean"][0] == 4
+  assert stats["no_failure_rate"] == 0
+  assert stats["median_first_failure_s"] == pytest.approx(0.05)
+  assert stats["clip_duration_s"] == pytest.approx(0.10)
+  arrays["bins"][1, 0] = 0
+  with pytest.raises(ValueError, match="pre-failure"):
+    aggregate(manifest, [(meta, arrays)])
 
 
 def test_config_unknown_keys_units_and_defaults(tmp_path):
@@ -191,7 +250,7 @@ def test_joint_method_selection_partial_reports_and_stale_figures(tmp_path):
       key,
       dict(
         context_ids=ids,
-        first_failure_s=[np.nan],
+        first_failure_s=[0.24] if motion["name"] == "a" else [np.nan],
         full=np.ones((1, len(TRACKING))),
         bins=np.ones((2, 1, len(TRACKING))),
         odometry_full=np.full((1, 5), 7),
@@ -199,6 +258,8 @@ def test_joint_method_selection_partial_reports_and_stale_figures(tmp_path):
       ),
       dict(
         identity="identity",
+        clip_frames=200,
+        control_dt=0.02,
         clip=motion["name"],
         status="complete",
         odometry_status="complete",
@@ -221,9 +282,22 @@ def test_joint_method_selection_partial_reports_and_stale_figures(tmp_path):
     expected_figures = (
       ["summary_A-posterior_time.svg"]
       if kind == "odometry"
-      else ["A-posterior-mpkpe-by-clip.svg", "A-posterior-tracking-time.svg"]
+      else [
+        "A-posterior-mpkpe-by-clip.svg",
+        "A-posterior-tracking-time.svg",
+        "tracking-success-by-clip.svg",
+      ]
     )
     assert summary["figures"] == expected_figures
+    failed = summary["clips"]["a"]["A-posterior"]
+    assert (
+      failed["successful_contexts"] == 0 and failed["median_first_failure_s"] == 0.24
+    )
+    assert failed["clip_duration_s"] == pytest.approx(3.98)
+    success = summary["clips"]["b"]["A-posterior"]
+    assert (
+      success["successful_contexts"] == 1 and success["median_first_failure_s"] is None
+    )
     assert (
       sorted(p.name for p in (tmp_path / kind / "figures").iterdir())
       == expected_figures

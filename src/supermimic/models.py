@@ -506,36 +506,6 @@ class MultiEncoderAE(nn.Module):
 
     self.set_slot_mix(slot_mix)
 
-  @torch.jit.unused
-  def copy_common_initialization_from(self, source: MultiEncoderAE) -> None:
-    """Copy base parameters and normalization buffers, without sharing storage.
-
-    Call before creating each group's optimizer. FiLM remains independently
-    initialized, so copying a B base into C preserves C's identity modulation.
-    Input-version checks prevent equal-width but differently ordered layouts
-    from being treated as compatible. The runner persists the full input config.
-    """
-    signature = (
-      "obs_dim",
-      "history_length",
-      "latent_dim",
-      "input_version",
-      "_task_names",
-    )
-    if any(getattr(self, key) != getattr(source, key) for key in signature):
-      raise ValueError(
-        "Cannot copy common initialization across different actor inputs"
-      )
-    for name in ("obs_normalizer", "goal_normalizers", "encoders", "decoder"):
-      dst_state = getattr(self, name).state_dict()
-      src_state = getattr(source, name).state_dict()
-      if dst_state.keys() != src_state.keys() or any(
-        dst_state[key].shape != src_state[key].shape for key in dst_state
-      ):
-        raise ValueError(f"Cannot copy common initialization: incompatible {name}")
-    for name in ("obs_normalizer", "goal_normalizers", "encoders", "decoder"):
-      getattr(self, name).load_state_dict(getattr(source, name).state_dict())
-
   def set_slot_mix(self, slot_mix: dict[str, float]) -> None:
     """Set fractional slot allocation per task. Missing entries default to 0."""
     unknown = set(slot_mix) - set(self._task_names)
@@ -648,3 +618,54 @@ class MultiEncoderAE(nn.Module):
       if lo == hi:
         continue
       self.goal_normalizers[name].update(obs_td[f"goal_{name}"][lo:hi])
+
+
+class LocalMotionActor(MultiEncoderAE):
+  """Single motion encoder and a posterior-conditioned decoder shared by v7 methods."""
+
+  def __init__(self, *, inputs, context_dim, action_scale, action_offset, **kwargs):
+    from supermimic.local_control import LOCAL_DIM, VECH_DIM
+
+    condition_dim = 2 * LOCAL_DIM + context_dim + VECH_DIM
+    super().__init__(uncertainty_dim=kwargs["latent_dim"] + condition_dim, **kwargs)
+    self.condition_normalizer = _CudaGraphNormalization(condition_dim)
+    self.uses_covariance = inputs.uses_uncertainty
+    self.residual_actor = inputs.residual_actor
+    self.covariance_start = condition_dim - VECH_DIM
+    if (action_scale == 0).any() or not torch.isfinite(action_scale).all():
+      raise ValueError("Local action scale must be finite and nonzero")
+    self.register_buffer("action_scale", action_scale.detach().clone())
+    self.register_buffer("action_offset", action_offset.detach().clone())
+
+  def encode_goal(self, goal):
+    return torch.tanh(self.encoders["motion"](self.goal_normalizers["motion"](goal)))
+
+  def decode_goal(self, latent, history, condition):
+    raw, next_joint = condition.split(
+      (self.condition_normalizer._mean.shape[-1], 29), -1
+    )
+    normalized = self.condition_normalizer(raw)
+    if not self.uses_covariance:
+      normalized = torch.cat(
+        (
+          normalized[..., : self.covariance_start],
+          torch.zeros_like(normalized[..., self.covariance_start :]),
+        ),
+        -1,
+      )
+    gamma, beta = self.film(torch.cat((latent, normalized), -1)).chunk(2, -1)
+    main = torch.cat((latent, self.obs_normalizer(history).flatten(-2)), -1)
+    hidden = self.decoder[1](self.decoder[0](main)) * (1 + gamma) + beta
+    for layer in self.decoder[2:]:
+      hidden = layer(hidden)
+    if self.residual_actor:
+      hidden = hidden + (next_joint - self.action_offset) / self.action_scale
+    return hidden, gamma, beta
+
+  def forward_with_aux(self, obs_td):
+    action, _, _ = self.decode_goal(
+      self.encode_goal(obs_td["goal_motion"]),
+      obs_td["history"],
+      obs_td["task_uncertainty"],
+    )
+    return action, action.new_zeros(action.shape[0])

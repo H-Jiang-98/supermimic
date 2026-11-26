@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import fields, replace
 from time import monotonic
 
@@ -25,8 +26,16 @@ from supermimic.utils.helpers import normalized_action_limits
 from supermimic.utils.lie_state import LieState
 from supermimic.validation.config import scenario_seed
 from supermimic.validation.domains import apply_domains
-from supermimic.validation.metrics import ODOMETRY, TRACKING, posterior_values_kernel
+from supermimic.validation.metrics import (
+  LOCAL_METRICS,
+  ODOMETRY,
+  TRACKING,
+  local_posterior_values,
+  posterior_values_kernel,
+  relative_pose_squared,
+)
 from supermimic.validation.runtime import (
+  full_clip_step,
   load_split_models,
   make_env_config,
   paired_prior,
@@ -138,7 +147,7 @@ class ChunkMetrics:
     values = np.where(valid[..., None], values, 0)
 
     def mean(v, ok):
-      out = v.sum(0) / np.maximum(ok.sum(0)[:, None], 1)
+      out = v.sum(0) / np.where(ok.any(0), ok.sum(0), np.nan)[:, None]
       for i, name in enumerate(self.names):
         if "rmse" in name:
           out[:, i] = np.sqrt(np.maximum(out[:, i], 0))
@@ -157,44 +166,6 @@ class ChunkMetrics:
       frames=np.array(length),
       valid_frame_counts=valid.sum(0),
     )
-
-
-def full_clip_step(raw, command, actions, active, parked_qpos):
-  """Same physics/forward/sense/observation order as ManagerBasedRlEnv.step.
-
-  Only valid for the frozen study: no live terminations, interval/step events,
-  recorders or resampling. Training/play continue to use the normal step method.
-  """
-  raw.action_manager.process_action(actions)
-  raw.sim.data.qpos.copy_(torch.where(active[:, None], raw.sim.data.qpos, parked_qpos))
-  raw.sim.data.qvel.copy_(torch.where(active[:, None], raw.sim.data.qvel, 0))
-  raw.sim.data.qacc_warmstart.copy_(
-    torch.where(active[:, None], raw.sim.data.qacc_warmstart, 0)
-  )
-  for _ in range(raw.cfg.decimation):
-    raw._sim_step_counter += 1
-    raw.action_manager.apply_action()
-    raw.scene.write_data_to_sim()
-    raw.sim.step()
-    raw.scene.update(dt=raw.physics_dt)
-  raw.episode_length_buf += 1
-  raw.common_step_counter += 1
-  # Keep ended, padded and numerically failed slots finite, including velocities
-  # and the integrator's warm start. No host-side nonzero()/index extraction.
-  raw.sim.data.qpos.copy_(torch.where(active[:, None], raw.sim.data.qpos, parked_qpos))
-  raw.sim.data.qvel.copy_(torch.where(active[:, None], raw.sim.data.qvel, 0))
-  raw.sim.data.qacc_warmstart.copy_(
-    torch.where(active[:, None], raw.sim.data.qacc_warmstart, 0)
-  )
-  raw.sim.forward()
-  command._update_command()
-  raw.sim.sense()
-  raw.obs_buf = {
-    name: raw.observation_manager.compute_group(name, update_history=True)
-    for name in ("actor", "full_state")
-  }
-  raw.observation_manager._obs_buffer = raw.obs_buf
-  return raw.obs_buf
 
 
 class CapturedFilter:
@@ -279,8 +250,10 @@ class TrackingRuntime:
     if variant in self.bundles:
       return self.bundles[variant]
     cfg = self.cfg
+    local = variant.startswith(("mean-", "belief-"))
+    estimator_key, actor_key = (variant, variant) if local else ("C", variant[0])
     wm, actor, ecfg, acfg = load_split_models(
-      self.env, self.saved["C"], self.saved[variant[0]], cfg.device
+      self.env, self.saved[estimator_key], self.saved[actor_key], cfg.device
     )
     filter_cfg = replace(
       wm.filter_config,
@@ -305,13 +278,14 @@ class TrackingRuntime:
       actor_inputs.covariance_std_floor,
     )
 
-    def features(truth, belief, reference):
+    def features(truth, belief, reference, context):
       return build_actor_critic_goals_kernel(
         actor_inputs,
-        RpvState(truth.rotation, truth.position, truth.velocity),
+        RpvState(truth.rotation, truth.position, truth.world_velocity),
         belief.to_actor_input(),
         reference,
         constants,
+        context,
       )
 
     def actor_forward(goal, uncertainty, history):
@@ -322,8 +296,17 @@ class TrackingRuntime:
     compile_fn = compile_eit_kernel if cfg.compile_kernels else lambda f: f
     from supermimic.validation.metrics import tracking_values_kernel
 
+    def odometry(belief, truth):
+      scores = posterior_values_kernel(belief, truth)
+      return (
+        torch.cat((scores, local_posterior_values(belief, truth)), -1)
+        if local
+        else scores
+      )
+
     bundle = dict(
       wm=wm,
+      estimator_key=estimator_key,
       actor=actor,
       ecfg=ecfg,
       acfg=acfg,
@@ -334,7 +317,7 @@ class TrackingRuntime:
       inputs=actor_inputs,
       features=compile_fn(features),
       metrics=compile_fn(tracking_values_kernel),
-      odometry=compile_fn(posterior_values_kernel),
+      odometry=compile_fn(odometry),
       actor_forward=compile_fn(actor_forward),
       features_eager=features,
       actor_eager=actor_forward,
@@ -390,12 +373,16 @@ class TrackingRuntime:
     )
     build_actor_features(
       bundle["inputs"],
-      RpvState(truth.rotation, truth.position, truth.velocity),
+      RpvState(truth.rotation, truth.position, truth.world_velocity),
       belief.to_actor_input(),
       reference,
+      torch.as_tensor(contexts, device=cfg.device),
     )
     dt = raw.step_dt
-    if not np.isclose(dt, self.saved["C"]["world_model"]["dynamics"]["metadata"]["dt"]):
+    if not np.isclose(
+      dt,
+      self.saved[bundle["estimator_key"]]["world_model"]["dynamics"]["metadata"]["dt"],
+    ):
       raise ValueError("Simulation and estimator control periods differ")
     width = round(cfg.time_bin_s / dt)
     if width < 1 or not np.isclose(width * dt, cfg.time_bin_s):
@@ -458,7 +445,7 @@ class TrackingRuntime:
         if stance == "force_eager":
           scoring_input = candidate.clone()
         goal, uncertainty, _, feature_invalid = b["features"](
-          truth, candidate, reference
+          truth, candidate, reference, contexts
         )
         actions = b["actor_forward"](goal, uncertainty, history)
         ee = [
@@ -515,13 +502,19 @@ class TrackingRuntime:
     metrics = ChunkMetrics(
       cfg.num_envs, prepared["width"], cfg.transfer_chunk_steps, rows, cfg.device
     )
+    local = b["inputs"].local_control
+    odometry_names = ODOMETRY + LOCAL_METRICS if local else ODOMETRY
+    lag = round(1 / raw.step_dt)
+    poses_window = deque(maxlen=lag)
+    relative_sums = contexts.new_zeros(cfg.num_envs, 2, dtype=torch.float64)
+    relative_count = torch.zeros_like(prepared["lengths"])
     odometry = ChunkMetrics(
       cfg.num_envs,
       prepared["width"],
       cfg.transfer_chunk_steps,
       [],
       cfg.device,
-      ODOMETRY,
+      odometry_names,
     )
     ee = [command.cfg.body_names.index(name) for name in cfg.ee_body_names]
     lower, upper = normalized_action_limits(
@@ -583,7 +576,9 @@ class TrackingRuntime:
       reference = b["wm"].representation.reference_window(
         command.motion, command.time_steps, command.reference_alignment
       )
-      goal, uncertainty, _, feature_bad = b["features"](truth, belief, reference)
+      goal, uncertainty, _, feature_bad = b["features"](
+        truth, belief, reference, contexts
+      )
       actions = b["actor_forward"](goal, uncertainty, history).clamp(
         min=lower, max=upper
       )
@@ -604,11 +599,7 @@ class TrackingRuntime:
       state.reject(~torch.isfinite(values).all(-1), frame)
       active = state.active(frame)
       effective += active.sum()
-      self.monitor.compute()
-      first = self.monitor.terminated & active & (first_failure < 0)
-      first_failure.copy_(torch.where(first, frame, first_failure))
-      for i, name in enumerate(self.monitor.active_terms):
-        first_terms[:, i] |= first & self.monitor.get_term(name)
+      scoring = active & (first_failure < 0)
       ref_pose = torch.cat(
         (
           reference.position[:, 0],
@@ -625,11 +616,23 @@ class TrackingRuntime:
       poses = torch.stack((obs["full_state"][:, :36], posterior, ref_pose))[
         :, row_tensor
       ]
-      metrics.update(values, active, poses)
+      metrics.update(values, scoring, poses)
       odom_values = b["odometry"](belief, truth)
+      if local:
+        # Compare posterior odometry against the realized physical trajectory.
+        pose_pair = (
+          torch.stack((belief.mean.rotation, truth.rotation)).double(),
+          torch.stack((belief.mean.position, truth.position)).double(),
+        )
+        if len(poses_window) == lag:
+          errors = relative_pose_squared(poses_window[0], pose_pair)
+          valid = scoring & (state.posterior_invalid < 0)
+          relative_sums += torch.where(valid[:, None], errors, 0)
+          relative_count += valid.long()
+        poses_window.append(pose_pair)
       odometry.update(
         odom_values,
-        active & (state.posterior_invalid < 0) & torch.isfinite(odom_values).all(-1),
+        scoring & (state.posterior_invalid < 0) & torch.isfinite(odom_values).all(-1),
       )
       if (frame + 1) % cfg.host_check_interval_steps == 0 or frame + 1 == frames:
         # One batched read, preserving per-scenario first failure information.
@@ -651,7 +654,13 @@ class TrackingRuntime:
       if frame + 1 < frames:
         active = state.active(frame) & (frame + 1 < state.lengths)
         actions = torch.where(active[:, None], actions, 0)
-        obs = full_clip_step(raw, command, actions, active, prepared["parked_qpos"])
+        obs = full_clip_step(
+          raw, command, actions, active, prepared["parked_qpos"], self.monitor
+        )
+        first = self.monitor.terminated & active & (first_failure < 0)
+        first_failure.copy_(torch.where(first, frame + 1, first_failure))
+        for i, name in enumerate(self.monitor.active_terms):
+          first_terms[:, i] |= first & self.monitor.get_term(name)
         previous = actions
     metrics.flush()
     odometry.flush()
@@ -670,6 +679,16 @@ class TrackingRuntime:
       odom = odometry.result(selection, length)
       for field in ("full", "bins", "valid_frame_counts"):
         result["odometry_" + field] = odom[field]
+      if local:
+        counts = relative_count[selection]
+        result["relative_pose_1s"] = (
+          (relative_sums[selection] / counts[:, None].clamp_min(1))
+          .sqrt()
+          .masked_fill(counts[:, None] == 0, float("nan"))
+          .cpu()
+          .numpy()
+        )
+        result["relative_pose_1s_count"] = counts.cpu().numpy()
       selected_replay = [
         j for j, row in enumerate(rows) if offset <= row < offset + count
       ]
@@ -690,7 +709,8 @@ class TrackingRuntime:
       if selected_replay:
         for i, name in enumerate(("truth", "posterior", "reference")):
           result["replay_" + name] = replay[:length, i][:, selected_replay]
-      failed = bool((status_host[0, selection] >= 0).any())
+      expected_frames = np.where(failure[selection] < 0, length, failure[selection])
+      failed = (result["valid_frame_counts"] != expected_frames).any()
       outputs.append(
         (
           key,
@@ -703,10 +723,10 @@ class TrackingRuntime:
             clip_frames=motion["frames"],
             scored_frames=length,
             metric_names=list(TRACKING),
-            odometry_metric_names=list(ODOMETRY),
+            odometry_metric_names=list(odometry_names),
             odometry_status=(
               "invalid"
-              if (odom["valid_frame_counts"] != length).any()
+              if (odom["valid_frame_counts"] != expected_frames).any()
               else ("complete" if length == motion["frames"] else "censored")
             ),
             failure_terms=[

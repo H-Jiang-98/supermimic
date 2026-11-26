@@ -455,7 +455,7 @@ def test_runner_reads_matching_restored_frame_directly_from_provider(ready_flag)
   runner._time_index = torch.zeros_like(runner._episode_id)
   before = _build_current(runner)["goal_motion"]
   saved = real.state_dict()
-  saved["mean"][:, 0] += 2
+  saved["mean"][:, 9] += 2  # First position channel after the packed rotation.
   real.load_state_dict(saved)
   runner._posterior_ready = (
     ready_flag  # Only the legacy injection adapter may consult this flag.

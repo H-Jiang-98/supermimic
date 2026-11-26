@@ -214,8 +214,10 @@ def freeze(spec, base):
   return {**manifest, "manifest_digest": digest(manifest)}
 
 
-def admit(state, run, index, training):
-  validate_eit_checkpoint_contract(state, stage="policy", for_inference=True)
+def admit(state, run, index, training, *, archived_pilot=False):
+  validate_eit_checkpoint_contract(
+    state, stage="policy", for_inference=True, archived_pilot=archived_pilot
+  )
   counters = {
     "mean_steps": state["learner"]["mean"]["steps"],
     "cov_steps": state["learner"]["cov"]["steps"],
@@ -286,7 +288,7 @@ def admit(state, run, index, training):
   )
 
 
-def candidates(manifest):
+def candidates(manifest, *, archived_pilot=False):
   output = []
   init_by_seed = defaultdict(set)
   for run in manifest["runs"]:
@@ -304,7 +306,9 @@ def candidates(manifest):
           raise ValueError(
             "Requested frame count is unavailable in this checkpoint; specify an explicit checkpoints path"
           )
-        meta = admit(state, run, None, manifest["training"])
+        meta = admit(
+          state, run, None, manifest["training"], archived_pilot=archived_pilot
+        )
         record.update(meta, path=str(path), sha256=identity)
         init_by_seed[run["training_seed"]].add(meta["initialization_digest"])
         del state

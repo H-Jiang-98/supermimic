@@ -1,4 +1,4 @@
-"""Pure, differentiable right-local filtering on SE_2(3) x R^61.
+"""Pure, differentiable right-local filtering on SE(3) x R^64.
 
 The core consumes already sampled measurements and executed normalized actions.
 It owns no online posterior or random-number state. Stateful collection adapters
@@ -343,7 +343,8 @@ class LieBeliefFilter:
     blocks = []
     start = 0
     while start < count:
-      width = block if count - start >= block else small
+      # Reuse the full specialization for a nearly full tail after partial resets.
+      width = block if count - start > max(small, block // 2) else small
       stop = min(start + width, count)
       length = stop - start
 

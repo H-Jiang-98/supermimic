@@ -1,15 +1,10 @@
-"""RPV-belief privileged critic inputs and explicitly updated normalizers.
-
-The common prefix is [truth68, truth_goal700, history465, context]. B/C append a relative RPV mean (12) and the right-local 9x9 marginal
-covariance (45). The provider still owns the full 70-dimensional belief.
-A never reads the supplied belief, including during eval.
-"""
+"""Privileged EIT value inputs and normalization fitted on real collector frames."""
 
 from __future__ import annotations
 
 import copy
 import math
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from typing import Literal
 
 import torch
@@ -17,11 +12,18 @@ from torch import nn
 
 from supermimic.belief import BeliefState
 from supermimic.estimator_inputs import covariance_encoding_constants
+from supermimic.local_control import (
+  GOAL_DIM,
+  LOCAL_DIM,
+  VECH_DIM,
+  local_covariance_features,
+  local_state,
+)
 from supermimic.models import _CudaGraphNormalization, build_mlp
 from supermimic.utils.lie_state import TANGENT_VERSION, LieState
 from supermimic.utils.validation import check_covariance, validate_state_dict
 
-CRITIC_INPUT_VERSION = "eit_rpv_belief_critic_v3"
+CRITIC_INPUT_VERSION = "eit_se3_critic_v4"
 COMMON_DIM = 1233
 MEAN_DIM = 12
 COVARIANCE_DIM = 45
@@ -29,21 +31,24 @@ COVARIANCE_DIM = 45
 
 @dataclass(frozen=True)
 class CriticInputConfig:
-  group: Literal["A", "B", "C"] = "B"
+  group: Literal["A", "B", "C", "mean", "belief"] = "B"
   version: str = CRITIC_INPUT_VERSION
   tangent_version: str = TANGENT_VERSION
-  covariance_encoding: str = "rpv9_log_std_corr_v1"
+  covariance_encoding: str | None = None
   covariance_scales: tuple[float, ...] = (1.0,) * 3  # theta, rho, nu
   mean_scales: tuple[float, ...] = (1.0,) * 2  # position, velocity; rot6d is unitless
   epsilon_std: float = 1e-6
 
   def __post_init__(self):
-    if self.group not in ("A", "B", "C"):
+    if self.group not in ("A", "B", "C", "mean", "belief"):
       raise ValueError("Critic group must be A, B or C")
+    encoding = "local68_raw_vech_v1" if self.local_control else "rpv9_log_std_corr_v1"
+    if self.covariance_encoding is None:
+      object.__setattr__(self, "covariance_encoding", encoding)
     if (
       self.version != CRITIC_INPUT_VERSION
       or self.tangent_version != TANGENT_VERSION
-      or self.covariance_encoding != "rpv9_log_std_corr_v1"
+      or self.covariance_encoding != encoding
     ):
       raise ValueError("Unsupported critic input/covariance version")
     for name, length in (("covariance_scales", 3), ("mean_scales", 2)):
@@ -53,9 +58,15 @@ class CriticInputConfig:
     if not math.isfinite(self.epsilon_std) or self.epsilon_std <= 0:
       raise ValueError("epsilon_std must be finite and positive")
 
+  @property
+  def local_control(self):
+    return self.group in ("mean", "belief")
+
   def input_dim(self, context_dim: int) -> int:
     if type(context_dim) is not int or context_dim < 0:
       raise ValueError("context_dim must be a nonnegative integer")
+    if self.local_control:
+      return 68 + GOAL_DIM + 3 + 465 + context_dim + LOCAL_DIM + VECH_DIM
     return (
       COMMON_DIM + context_dim + (0 if self.group == "A" else MEAN_DIM + COVARIANCE_DIM)
     )
@@ -120,7 +131,7 @@ def critic_state_features(truth: LieState) -> torch.Tensor:
     (
       truth.position[..., 2:3],
       -truth.rotation[..., 2, :],
-      (truth.rotation.mT @ truth.velocity.unsqueeze(-1)).squeeze(-1),
+      truth.velocity,
       truth.omega,
       truth.joint_pos,
       truth.joint_vel,
@@ -152,7 +163,7 @@ def build_critic_features(
   if sim_ctx.ndim != len(batch) + 1 or sim_ctx.shape[:-1] != batch:
     raise ValueError("Critic context must match truth batch shape")
   for name, value, shape in (
-    ("goal", true_goal, (*batch, 700)),
+    ("goal", true_goal, (*batch, GOAL_DIM + 3 if cfg.local_control else 700)),
     ("history", history, (*batch, 5, 93)),
     ("context", sim_ctx, (*batch, sim_ctx.shape[-1])),
   ):
@@ -194,11 +205,23 @@ def build_critic_features(
 
 
 def build_critic_features_kernel(
-  truth, true_goal, history, sim_ctx, belief, *, group, constants
+  truth, true_goal, history, sim_ctx, belief, *, group, constants, actor_condition=None
 ):
   """Trusted tensor encoding; belief marginals come from covariance factors."""
   pieces = [critic_state_features(truth), true_goal, history.flatten(-2), sim_ctx]
-  if group != "A":
+  if group in ("mean", "belief"):
+    if actor_condition is None:
+      pieces.extend(
+        (
+          local_state(belief.mean),
+          local_covariance_features(belief.mean, belief.covariance_sqrt),
+        )
+      )
+    else:
+      pieces.extend(
+        (actor_condition[..., :LOCAL_DIM], actor_condition[..., -(VECH_DIM + 29) : -29])
+      )
+  elif group != "A":
     mean = belief.mean
     inverse = truth.rotation.mT
     rotation = inverse @ mean.rotation
@@ -206,7 +229,9 @@ def build_critic_features_kernel(
       (
         rotation[..., :2].flatten(-2),
         (inverse @ (mean.position - truth.position).unsqueeze(-1)).squeeze(-1),
-        (inverse @ (mean.velocity - truth.velocity).unsqueeze(-1)).squeeze(-1),
+        (inverse @ (mean.world_velocity - truth.world_velocity).unsqueeze(-1)).squeeze(
+          -1
+        ),
       ),
       -1,
     )
@@ -240,7 +265,8 @@ class BeliefCritic(nn.Module):
       raise ValueError("Critic hidden dimensions must be positive integers")
     self.input_dim = self.config.input_dim(context_dim)
     self.state_normalizer = _CudaGraphNormalization(68)
-    self.goal_normalizer = _CudaGraphNormalization(700)
+    self.goal_dim = GOAL_DIM + 3 if self.config.local_control else 700
+    self.goal_normalizer = _CudaGraphNormalization(self.goal_dim)
     self.history_normalizer = _CudaGraphNormalization(93)
     self.mlp = build_mlp(self.input_dim, self.hidden_dims, 1)
     nn.init.zeros_(self.mlp[-1].weight)
@@ -259,8 +285,10 @@ class BeliefCritic(nn.Module):
       raise ValueError("Critic features must match network dtype and device")
     return (
       features[..., :68],
-      features[..., 68:768],
-      features[..., 768:1233].reshape(*features.shape[:-1], 5, 93),
+      features[..., 68 : 68 + self.goal_dim],
+      features[..., 68 + self.goal_dim : 533 + self.goal_dim].reshape(
+        *features.shape[:-1], 5, 93
+      ),
     )
 
   def forward(self, features: torch.Tensor) -> torch.Tensor:
@@ -270,7 +298,7 @@ class BeliefCritic(nn.Module):
         self.state_normalizer(state),
         self.goal_normalizer(goal),
         self.history_normalizer(history).flatten(-2),
-        features[..., 1233:],
+        features[..., 533 + self.goal_dim :],
       ),
       -1,
     )
@@ -284,7 +312,7 @@ class BeliefCritic(nn.Module):
       raise ValueError("Critic normalization requires nonempty finite features")
     values = (
       values[0].reshape(-1, 68),
-      values[1].reshape(-1, 700),
+      values[1].reshape(-1, self.goal_dim),
       values[2][..., -1, :].reshape(-1, 93),
     )
     candidates = copy.deepcopy(self.normalizers())
@@ -335,21 +363,3 @@ class BeliefCritic(nn.Module):
   def load_checkpoint(self, checkpoint: dict) -> None:
     self.validate_checkpoint(checkpoint)
     self.load_state_dict(checkpoint["state_dict"])
-
-  @torch.no_grad()
-  def copy_common_initialization_from(self, source: BeliefCritic) -> None:
-    if (
-      replace(self.config, group="A") != replace(source.config, group="A")
-      or self.context_dim != source.context_dim
-      or self.hidden_dims != source.hidden_dims
-    ):
-      raise ValueError("Critic common initialization contracts differ")
-    for destination, origin in zip(
-      self.normalizers(), source.normalizers(), strict=True
-    ):
-      destination.load_state_dict(origin.state_dict())
-    columns = min(self.input_dim, source.input_dim)
-    self.mlp[0].weight[:, :columns].copy_(source.mlp[0].weight[:, :columns])
-    self.mlp[0].bias.copy_(source.mlp[0].bias)
-    for destination, origin in zip(self.mlp[1:], source.mlp[1:], strict=True):
-      destination.load_state_dict(origin.state_dict())

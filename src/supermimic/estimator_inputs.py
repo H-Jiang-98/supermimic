@@ -15,13 +15,22 @@ from typing import Any, Literal, Protocol
 
 import torch
 
+from supermimic.local_control import (
+  GOAL_DIM,
+  LocalReference,
+  local_covariance_features,
+  local_state,
+  privileged_goal,
+)
+from supermimic.utils.lie_state import LieState
 from supermimic.utils.validation import (
   check_covariance,
   covariance_encoding_invalid,
+  rotation_valid,
   validate_rotation,
 )
 
-INPUT_VERSION = "eit_rpv_v1"
+INPUT_VERSION = "eit_se3_inputs_v2"
 COVARIANCE_ENCODING = "log_std_corr_v1"
 NUM_REFERENCE_FRAMES = 10
 GOAL_BLOCK_ORDER = (
@@ -117,11 +126,12 @@ def _measurement_tensors(
 
 @dataclass(frozen=True)
 class EITInputConfig:
-  group: Literal["A", "B", "C"] = "A"
+  group: Literal["A", "B", "C", "mean", "belief"] = "A"
   mode: Literal["train", "eval"] = "train"
   history_length: int = 5
+  residual_actor: bool = False
   version: str = INPUT_VERSION
-  covariance_encoding: str = COVARIANCE_ENCODING
+  covariance_encoding: str | None = None
   covariance_std_floor: float = 1e-6
   covariance_scales: tuple[float, float, float] = (1.0, 1.0, 1.0)
   measurement_noise: GaussianMeasurementConfig = field(
@@ -129,13 +139,22 @@ class EITInputConfig:
   )
 
   def __post_init__(self) -> None:
-    if self.group not in ("A", "B", "C"):
+    if self.group not in ("A", "B", "C", "mean", "belief"):
       raise ValueError(f"Unknown ablation group: {self.group}")
+    if type(self.residual_actor) is not bool or (
+      self.residual_actor and not self.local_control
+    ):
+      raise ValueError("Residual control requires a local policy")
     if self.mode not in ("train", "eval"):
       raise ValueError(f"Unknown actor input mode: {self.mode}")
     if not isinstance(self.history_length, int) or self.history_length <= 0:
       raise ValueError("history_length must be a positive integer")
-    if self.version != INPUT_VERSION or self.covariance_encoding != COVARIANCE_ENCODING:
+    expected_encoding = (
+      "local68_raw_vech_v1" if self.local_control else COVARIANCE_ENCODING
+    )
+    if self.covariance_encoding is None:
+      object.__setattr__(self, "covariance_encoding", expected_encoding)
+    if self.version != INPUT_VERSION or self.covariance_encoding != expected_encoding:
       raise ValueError("Unsupported estimator actor input/covariance version")
     if not math.isfinite(self.covariance_std_floor) or self.covariance_std_floor <= 0:
       raise ValueError("covariance_std_floor must be finite and positive")
@@ -149,12 +168,20 @@ class EITInputConfig:
       raise TypeError("measurement_noise must be GaussianMeasurementConfig")
 
   @property
+  def local_control(self) -> bool:
+    return self.group in ("mean", "belief")
+
+  @property
+  def goal_dim(self) -> int:
+    return GOAL_DIM if self.local_control else 700
+
+  @property
   def uses_posterior(self) -> bool:
     return self.group != "A" or self.mode == "eval"
 
   @property
   def uses_uncertainty(self) -> bool:
-    return self.group == "C"
+    return self.group in ("C", "belief")
 
   @property
   def critic_uses_belief(self) -> bool:
@@ -169,6 +196,10 @@ class EITInputConfig:
     values = dict(values)
     if "version" not in values or "covariance_encoding" not in values:
       raise ValueError("Checkpoint lacks estimator actor input version metadata")
+    if values["version"] != INPUT_VERSION:
+      raise ValueError(
+        f"Unsupported estimator input version {values['version']!r}; expected {INPUT_VERSION}"
+      )
     missing = {item.name for item in fields(cls)} - values.keys()
     if missing:
       raise ValueError(
@@ -194,6 +225,8 @@ class RpvState:
 class PosteriorInput:
   mean: RpvState
   covariance_rpv: torch.Tensor | None = None
+  state: LieState | None = None
+  factor: torch.Tensor | None = None
 
 
 class PosteriorProvider(Protocol):
@@ -222,6 +255,17 @@ class ReferenceWindow:
   rotation: torch.Tensor
   position: torch.Tensor
   velocity: torch.Tensor
+  local: LocalReference | None = None
+
+  def index(self, rows) -> ReferenceWindow:
+    return ReferenceWindow(
+      self.joint_pos[rows],
+      self.joint_vel[rows],
+      self.rotation[rows],
+      self.position[rows],
+      self.velocity[rows],
+      self.local.index(rows) if self.local is not None else None,
+    )
 
 
 @dataclass(frozen=True)
@@ -241,6 +285,7 @@ class EpisodeAlignment:
   def apply(self, reference: ReferenceWindow) -> ReferenceWindow:
     rotation = self.rotation[:, None]
     return ReferenceWindow(
+      local=reference.local,
       joint_pos=reference.joint_pos,
       joint_vel=reference.joint_vel,
       rotation=rotation @ reference.rotation,
@@ -342,13 +387,17 @@ def build_motion_goal(
   Joint count is generic; G1's 29 joints give 700 channels.
   """
   _validate_state(state)
-  _validate_reference(state, reference)
+  validate_reference_batch(
+    reference, batch_size=len(state.position), like=state.position
+  )
   return _motion_goal(state, reference)
 
 
-def _validate_reference(state: RpvState, reference: ReferenceWindow) -> None:
-  batch = state.position.shape[0]
-  shape = (batch, NUM_REFERENCE_FRAMES)
+def validate_reference_batch(
+  reference: ReferenceWindow, *, batch_size: int, like: torch.Tensor, bodies=()
+) -> None:
+  """Check a complete reference batch with one host decision on the valid path."""
+  shape = (batch_size, 1 if reference.local is not None else NUM_REFERENCE_FRAMES)
   if (
     reference.joint_pos.ndim != 3
     or reference.joint_pos.shape[:2] != shape
@@ -367,13 +416,21 @@ def _validate_reference(state: RpvState, reference: ReferenceWindow) -> None:
     reference.position,
     reference.velocity,
   )
-  if any(
-    v.device != state.position.device or v.dtype != state.position.dtype for v in values
-  ):
+  if reference.local is not None:
+    values += (reference.local.goal, reference.local.y, reference.local.next_joint)
+  if any(v.device != like.device or v.dtype != like.dtype for v in values):
     raise ValueError("Reference and state must share dtype and device")
-  if not torch.stack([torch.isfinite(v).all() for v in values]).all():
-    raise ValueError("ReferenceWindow must contain finite values")
-  validate_rotation(reference.rotation)
+  if not reference.rotation.is_floating_point():
+    raise ValueError("Rotation must be a floating-point 3 by 3 matrix")
+  finite = torch.stack([torch.isfinite(v).all() for v in values]).all()
+  checks = [finite, rotation_valid(reference.rotation).all()]
+  if bodies:
+    checks.append(torch.stack([torch.isfinite(v).all() for v in bodies]).all())
+  if not torch.stack(checks).all():
+    if not finite:
+      raise ValueError("ReferenceWindow must contain finite values")
+    validate_rotation(reference.rotation)
+    raise ValueError("Reference bodies must be finite")
 
 
 def _motion_goal(
@@ -398,16 +455,6 @@ def _motion_goal(
     dim=-1,
   )
   return goal, position, velocity
-
-
-def normalization_motion_goals(
-  truth: RpvState, posterior: RpvState | None, reference: ReferenceWindow
-) -> tuple[torch.Tensor, torch.Tensor]:
-  """Actor and critic motion goals for the same recorded reference window."""
-  true_goal = build_motion_goal(truth, reference)[0]
-  if posterior is None:
-    return true_goal, true_goal
-  return _goal_with_checked_reference(posterior, reference), true_goal
 
 
 def _goal_with_checked_reference(
@@ -540,14 +587,30 @@ def encode_covariance_kernel(covariance, constants):
   return torch.cat((std.log(), correlation[..., rows, cols].clamp(-1.0, 1.0)), -1)
 
 
+def velocity_rotation_block(posterior, velocity_error):
+  # R.T @ v_ref_world - v_body has rotation derivative [R.T @ v_ref_world]x.
+  # The older externally supplied RPV marginal uses world velocity perturbations.
+  if posterior.state is None:
+    return velocity_error
+  return velocity_error + posterior.state.velocity[:, None]
+
+
 def build_actor_features(
   config: EITInputConfig,
   truth: RpvState | None,
   posterior: PosteriorInput | None,
   reference: ReferenceWindow,
+  context: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+  if config.local_control:
+    goal, condition = local_actor_features(posterior, reference, context)
+    if not torch.isfinite(goal).all() or not torch.isfinite(condition).all():
+      raise ValueError("Non-finite local actor input")
+    return goal, condition
   state = select_actor_state(config, truth, posterior)
-  _validate_reference(state, reference)
+  validate_reference_batch(
+    reference, batch_size=len(state.position), like=state.position
+  )
   goal, position_error, velocity_error = _motion_goal(state, reference)
   if not config.uses_uncertainty:
     # Deliberately do not even validate covariance on A/B actor paths.
@@ -555,7 +618,9 @@ def build_actor_features(
   if posterior is None or posterior.covariance_rpv is None:
     raise ValueError("Group C actor requires posterior covariance_rpv")
   covariance = task_error_covariance(
-    posterior.covariance_rpv, position_error, velocity_error
+    posterior.covariance_rpv,
+    position_error,
+    velocity_rotation_block(posterior, velocity_error),
   )
   encoded = encode_covariance(
     covariance, std_floor=config.covariance_std_floor, scales=config.covariance_scales
@@ -568,11 +633,16 @@ def build_actor_critic_goals(
   truth: RpvState,
   posterior: PosteriorInput | None,
   reference: ReferenceWindow,
+  context: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
   """Build both goals against one reference, using privilege only for the critic
   and actors configured for true-state input.
   """
-  actor, uncertainty = build_actor_features(config, truth, posterior, reference)
+  actor, uncertainty = build_actor_features(
+    config, truth, posterior, reference, context
+  )
+  if config.local_control:
+    return actor, uncertainty, privileged_goal(truth, reference)
   # Actor observations can be handed to a caller separately from the stored
   # privileged goal. Preserve independent storage even when values agree.
   critic = (
@@ -583,8 +653,14 @@ def build_actor_critic_goals(
   return actor, uncertainty, critic
 
 
-def build_actor_critic_goals_kernel(config, truth, posterior, reference, constants):
+def build_actor_critic_goals_kernel(
+  config, truth, posterior, reference, constants, context=None
+):
   """Tensor-only goals and numerical status for a fixed training configuration."""
+  if config.local_control:
+    goal, condition = local_actor_features(posterior, reference, context)
+    invalid = ~torch.isfinite(condition).all(-1) | ~torch.isfinite(goal).all(-1)
+    return goal, condition, privileged_goal(truth, reference), invalid
   state = posterior.mean if config.uses_posterior else truth
   actor, position_error, velocity_error = _motion_goal(state, reference)
   uncertainty = None
@@ -595,7 +671,7 @@ def build_actor_critic_goals_kernel(config, truth, posterior, reference, constan
     invalid = covariance_encoding_invalid(covariance, rtol=tolerance)
     covariance = (covariance + covariance.mT) * 0.5
     task_covariance = task_error_covariance_kernel(
-      covariance, position_error, velocity_error
+      covariance, position_error, velocity_rotation_block(posterior, velocity_error)
     )
     # Inspect the projected covariance before the encoder can hide numerical
     # failures with variance floors or correlation clamps.
@@ -605,3 +681,16 @@ def build_actor_critic_goals_kernel(config, truth, posterior, reference, constan
     uncertainty = encode_covariance_kernel(task_covariance, constants).flatten(1)
   critic = _motion_goal(truth, reference)[0] if config.uses_posterior else actor.clone()
   return actor, uncertainty, critic, invalid
+
+
+def local_actor_features(posterior, reference, context):
+  if posterior is None or posterior.state is None or posterior.factor is None:
+    raise ValueError("Local policy requires a full posterior mean and square root")
+  if reference.local is None or context is None:
+    raise ValueError("Local policy requires the current reference and physical context")
+  y = local_state(posterior.state)
+  covariance = local_covariance_features(posterior.state, posterior.factor)
+  condition = torch.cat(
+    (y, y - reference.local.y, context, covariance, reference.local.next_joint), -1
+  )
+  return reference.local.goal, condition

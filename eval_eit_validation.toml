@@ -3,7 +3,7 @@
 [paths]
 checkpoint_root = "logs/eit_v6_Lafan_compiled_h32_2048envs_stride1/checkpoints/iteration_2500/seed2027"
 motion_files = ["data/motions/*.npz"]
-output = "artifacts/eit-validation/joint-v3"
+output = "artifacts/eit-validation/joint-v5"
 
 [evaluation]
 # Available: A-posterior, B-posterior, C-posterior, A-truth.

@@ -12,9 +12,7 @@ from supermimic.models import MultiEncoderAE
 from supermimic.tasks.task_spec import TaskSpec
 
 
-def _actor(
-  uncertainty_dim: int = 0, *, input_version: str = "eit_rpv_v1"
-) -> MultiEncoderAE:
+def _actor(uncertainty_dim: int = 0) -> MultiEncoderAE:
   def no_goal_extraction(*args):
     raise AssertionError("Network test should receive prepared inputs")
 
@@ -28,7 +26,7 @@ def _actor(
     latent_bc_weight=0.0,
     history_length=5,
     uncertainty_dim=uncertainty_dim,
-    input_version=input_version,
+    input_version="eit_rpv_v1",
   )
 
 
@@ -47,7 +45,8 @@ def test_zero_film_and_copied_normalizers_equal_base_without_aliasing():
   base, modulated = _actor(), _actor(450)
   obs = _obs()
   base.update_normalization(obs)
-  modulated.copy_common_initialization_from(base)
+  missing, unexpected = modulated.load_state_dict(base.state_dict(), strict=False)
+  assert not unexpected and all(key.startswith("film.") for key in missing)
   base.eval()
   modulated.eval()
   assert modulated.decoder[0].in_features == 497
@@ -150,11 +149,6 @@ def test_enabled_film_requires_exact_covariance_features(bad_dim):
     obs["task_uncertainty"] = torch.zeros(4, bad_dim)
   with pytest.raises(ValueError, match="task_uncertainty"):
     actor(obs)
-
-
-def test_common_initialization_rejects_different_input_version():
-  with pytest.raises(ValueError, match="different actor inputs"):
-    _actor(450).copy_common_initialization_from(_actor(input_version="legacy"))
 
 
 def test_history_shape_errors_before_flattening():

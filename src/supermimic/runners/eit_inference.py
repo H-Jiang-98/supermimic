@@ -258,6 +258,7 @@ class EITPolicyAdapter:
         representation.true_rpv(aux, rep),
         belief.to_actor_input(),
         reference,
+        context,
       )
       inputs = build_actor_obs_td(
         {"motion": goal}, self.history, task_uncertainty=uncertainty

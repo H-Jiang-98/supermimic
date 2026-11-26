@@ -87,13 +87,13 @@ def _belief_diagnostics(policy, obs):
   return {
     "rpv_error": error[:, :9],
     "position_error_w": truth.position - belief.mean.position,
-    "velocity_error_w": truth.velocity - belief.mean.velocity,
+    "velocity_error_w": truth.world_velocity - belief.mean.world_velocity,
     "error_squared": error.square(),
     "variance": belief.covariance_sqrt.square().sum(-1),
     "tracking_squared": torch.stack(
       (
         (truth.position - reference.position[:, 0]).square().mean(-1),
-        (truth.velocity - reference.velocity[:, 0]).square().mean(-1),
+        (truth.world_velocity - reference.velocity[:, 0]).square().mean(-1),
         (truth.joint_pos - reference.joint_pos[:, 0]).square().mean(-1),
       ),
       -1,

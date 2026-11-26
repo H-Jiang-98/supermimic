@@ -31,7 +31,7 @@ def graph_policy(tmp_path):
   environments = []
 
   def make(
-    group="C",
+    group="belief",
     backend="increment",
     compiled=False,
     return_training=False,
@@ -130,7 +130,7 @@ def assert_tree_close(actual, expected, *, atol, rtol, equal_nan=False):
       assert a == b
 
 
-@pytest.mark.parametrize("group", ["A", "B", "C"])
+@pytest.mark.parametrize("group", ["mean", "belief"])
 @pytest.mark.parametrize("backend", ["vmap", "increment"])
 def test_graph_updates_match_eager_and_stop_python_rollout(
   graph_policy, group, backend

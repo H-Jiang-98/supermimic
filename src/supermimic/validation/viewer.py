@@ -13,7 +13,7 @@ import viser
 from mjlab.asset_zoo.robots.unitree_g1.g1_constants import G1_XML
 from mjlab.viewer.viser import MjlabViserScene
 
-from supermimic.validation.config import VARIANTS
+from supermimic.validation.config import LOCAL_VARIANTS, VARIANTS
 
 
 class ReplayRenderer:
@@ -38,7 +38,10 @@ class ReplayRenderer:
     self.data = mujoco.MjData(original)
     mujoco.mj_forward(original, self.data)
     server.scene.add_grid("/floor", width=100, height=100)
-    for i, variant in enumerate(VARIANTS):
+    self.variants = (
+      LOCAL_VARIANTS if any(v in LOCAL_VARIANTS for v in cfg.methods) else VARIANTS
+    )
+    for i, variant in enumerate(self.variants):
       server.scene.add_label(
         f"/labels/{variant}", variant, position=(0, i * cfg.panel_spacing, 2)
       )
@@ -52,7 +55,7 @@ class ReplayRenderer:
 
   def draw(self, records, frame, visible):
     self.scene.clear()
-    for panel, variant in enumerate(VARIANTS):
+    for panel, variant in enumerate(self.variants):
       if variant not in records:
         continue
       for layer, model in self.models.items():

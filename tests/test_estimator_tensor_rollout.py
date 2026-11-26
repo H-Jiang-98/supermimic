@@ -8,8 +8,11 @@ import pytest
 import torch
 
 from supermimic.belief import BeliefState
+from supermimic.estimator_inputs import EpisodeAlignment
 from supermimic.imagined_rollout import imagine_step, observe, prepare_rollout
+from supermimic.learners.eit_policy_graph import _map_inputs
 from tests.test_estimator_belief_filter import DEVICES, on_device
+from tests.test_estimator_belief_integration import setup_env
 from tests.test_estimator_belief_policy import real_setup
 
 
@@ -55,6 +58,81 @@ def inputs_for(learner):
   starts.batch["motion_time"] = torch.tensor([0, 2, len(env.motion.joint_pos) - 1])
   noises = tuple(noise[:, :, 0] for noise in learner.draw_noises(starts))
   return starts, noises
+
+
+@pytest.mark.parametrize("group", ["C", "belief"])
+def test_prepare_rollout_views_match_per_frame_without_extra_scalar_reads(group):
+  env, _, _ = setup_env(group)
+  env.motion.motion_ends = torch.tensor([2, 10])
+  starts = env.prepare_policy_starts(torch.arange(3), torch.zeros(3, dtype=torch.long))
+  starts.batch["alignment_translation"][:, 0] += torch.arange(3)
+  alignment = EpisodeAlignment(
+    starts.batch["alignment_rotation"], starts.batch["alignment_translation"]
+  )
+  reads = []
+  for horizon in (1, 8):
+    with torch.profiler.profile(
+      activities=[torch.profiler.ProfilerActivity.CPU]
+    ) as prof:
+      prepared = prepare_rollout(
+        env, starts, horizon, torch.zeros(horizon, 3, 70), torch.zeros(horizon, 3, 64)
+      )
+    reads.append(
+      sum(e.count for e in prof.key_averages() if e.key == "aten::_local_scalar_dense")
+    )
+    reference_tensors = []
+    _map_inputs(
+      (prepared.reference, prepared.bodies, prepared.motion_times),
+      reference_tensors.append,
+      describe=True,
+    )
+    assert len(reference_tensors) == (13 if group == "belief" else 10)
+    for step in range(horizon + 1):
+      current = torch.minimum(starts.motion_times + step, torch.tensor([1, 9, 9]))
+      torch.testing.assert_close(prepared.motion_times[step], current)
+      expected = env.representation.reference_window(env.motion, current, alignment)
+      actual = prepared.reference_at(step)
+      for name in ("joint_pos", "joint_vel", "rotation", "position", "velocity"):
+        torch.testing.assert_close(getattr(actual, name), getattr(expected, name))
+      if expected.local is not None:
+        torch.testing.assert_close(vars(actual.local), vars(expected.local))
+      torch.testing.assert_close(
+        prepared.bodies_at(step),
+        env._aligned_reference_bodies(env.motion.body_state(current), alignment),
+      )
+  assert reads[0] == reads[1]
+
+
+@pytest.mark.parametrize(
+  ("field", "message"),
+  [
+    ("local", "finite values"),
+    ("rotation", "positive determinant"),
+    ("body", "bodies must be finite"),
+  ],
+)
+def test_prepare_rollout_rejects_invalid_bootstrap_reference(field, message):
+  env, _, _ = setup_env("belief")
+  starts = env.prepare_policy_starts(torch.tensor([0]), torch.tensor([0]))
+  starts.batch["motion_time"].zero_()
+  build = env.representation.reference_window
+
+  def corrupt_reference(motion, times, alignment):
+    ref = build(motion, times, alignment)
+    if field == "local":
+      ref.local.goal[times == 2] = float("nan")
+    if field == "rotation":
+      ref.rotation[times == 2] *= -1
+    return ref
+
+  if field == "body":
+    env.motion.body_ang_vel_w[2, 0, 0] = float("inf")
+    starts = replace(starts, motion_digest=env._policy_motion_digest())
+  with (
+    patch.object(env.representation, "reference_window", side_effect=corrupt_reference),
+    pytest.raises(ValueError, match=message),
+  ):
+    prepare_rollout(env, starts, 2, torch.zeros(2, 1, 70), torch.zeros(2, 1, 64))
 
 
 @pytest.mark.parametrize("group", ["A", "B", "C"])

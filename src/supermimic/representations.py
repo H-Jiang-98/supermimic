@@ -28,6 +28,7 @@ from supermimic.estimator_inputs import (
   apply_alignment,
   sample_proprio,
 )
+from supermimic.local_control import motion_reference
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
@@ -381,8 +382,20 @@ class StateRepresentation(nn.Module, ABC):
     alignment: EpisodeAlignment | None = None,
   ) -> ReferenceWindow:
     """All four goal blocks use the same clip-clamped reference indices."""
-    idx = goal_window_indices(motion, motion_times)
+    local = None
+    if getattr(self, "local_control", False):
+      last = (
+        motion.motion_ends[
+          torch.searchsorted(motion.motion_ends, motion_times, right=True)
+        ]
+        - 1
+      )
+      local = motion_reference(motion, motion_times, last)
+      idx = motion_times[:, None]
+    else:
+      idx = goal_window_indices(motion, motion_times)
     reference = ReferenceWindow(
+      local=local,
       joint_pos=motion.joint_pos[idx],
       joint_vel=motion.joint_vel[idx],
       rotation=matrix_from_quat(motion.root_quat_w[idx]),
@@ -558,7 +571,7 @@ class GenCoordRepresentation(StateRepresentation):
       (
         state.position[..., 2:3],
         -state.rotation[..., 2, :],
-        (state.rotation.mT @ state.velocity.unsqueeze(-1)).squeeze(-1),
+        state.velocity,
         state.omega,
         state.joint_pos,
         state.joint_vel,
@@ -578,11 +591,13 @@ class GenCoordRepresentation(StateRepresentation):
     # This polynomial is smooth at SO(3) and preserves tangential derivatives.
     identity = torch.eye(3, device=rotation.device, dtype=rotation.dtype)
     rotation = rotation + 0.5 * (rotation @ (identity - rotation.mT @ rotation))
-    world_dv = (state.rotation @ dv.unsqueeze(-1)).squeeze(-1)
+    world_pose_velocity = (
+      state.rotation @ (state.velocity + c * dv).unsqueeze(-1)
+    ).squeeze(-1)
     return LieState(
       rotation,
-      state.position + dt * (state.velocity + c * world_dv),
-      state.velocity + world_dv,
+      state.position + dt * world_pose_velocity,
+      (increment.mT @ (state.velocity + dv).unsqueeze(-1)).squeeze(-1),
       (increment.mT @ (state.omega + dw).unsqueeze(-1)).squeeze(-1),
       state.joint_pos + dt * (state.joint_vel + c * dj),
       state.joint_vel + dj,

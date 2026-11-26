@@ -48,11 +48,54 @@ def make_env_config(cfg, motion):
   return env_cfg, failure_terms
 
 
+def full_clip_step(raw, command, actions, active, parked_qpos, monitor):
+  """Same physics/forward/sense/observation order as ManagerBasedRlEnv.step.
+
+  Only valid for the frozen study: no live terminations, interval/step events,
+  recorders or resampling. Training/play continue to use the normal step method.
+  """
+  raw.action_manager.process_action(actions)
+  raw.sim.data.qpos.copy_(torch.where(active[:, None], raw.sim.data.qpos, parked_qpos))
+  raw.sim.data.qvel.copy_(torch.where(active[:, None], raw.sim.data.qvel, 0))
+  raw.sim.data.qacc_warmstart.copy_(
+    torch.where(active[:, None], raw.sim.data.qacc_warmstart, 0)
+  )
+  for _ in range(raw.cfg.decimation):
+    raw._sim_step_counter += 1
+    raw.action_manager.apply_action()
+    raw.scene.write_data_to_sim()
+    raw.sim.step()
+    raw.scene.update(dt=raw.physics_dt)
+  raw.episode_length_buf += 1
+  raw.common_step_counter += 1
+  # Keep ended, padded and numerically failed slots finite, including velocities
+  # and the integrator's warm start. No host-side nonzero()/index extraction.
+  raw.sim.data.qpos.copy_(torch.where(active[:, None], raw.sim.data.qpos, parked_qpos))
+  raw.sim.data.qvel.copy_(torch.where(active[:, None], raw.sim.data.qvel, 0))
+  raw.sim.data.qacc_warmstart.copy_(
+    torch.where(active[:, None], raw.sim.data.qacc_warmstart, 0)
+  )
+  raw.sim.forward()
+  # Training checks the post-physics state against the outgoing command.
+  monitor.compute()
+  command._update_command()
+  raw.sim.sense()
+  raw.obs_buf = {
+    name: raw.observation_manager.compute_group(name, update_history=True)
+    for name in ("actor", "full_state")
+  }
+  raw.observation_manager._obs_buffer = raw.obs_buf
+  return raw.obs_buf
+
+
 def load_split_models(env, estimator_saved, actor_saved, device):
   """Retain actor group/normalization while using C's frozen estimator bundle."""
   estimator_cfg = evaluation_config(estimator_saved)
   actor_cfg = evaluation_config(actor_saved)
-  if estimator_cfg.estimator_inputs.group != "C":
+  if (
+    not actor_cfg.estimator_inputs.local_control
+    and estimator_cfg.estimator_inputs.group != "C"
+  ):
     raise ValueError("This study requires a C estimator")
   for key in ("measurement_noise", "history_length"):
     if getattr(actor_cfg.estimator_inputs, key) != getattr(
@@ -172,6 +215,8 @@ def run_batch(
     posterior_status = "ok"
     initial_truth = truth.to_full().cpu().numpy()
     initial_prior = belief.mean.to_full().cpu().numpy()
+    active = torch.ones(len(ids), dtype=torch.bool, device=device)
+    parked_qpos = raw.sim.data.qpos.clone()
     for frame in range(frames):
       now = monotonic()
       if now - last_progress >= cfg.progress_interval_s:
@@ -221,14 +266,7 @@ def run_batch(
         if kind == "odometry"
         else tracking_values(truth, reference, command, ee)
       )
-      metrics.update(values)
-      monitor.compute()
-      failed = monitor.terminated.cpu().numpy()
-      for row in np.flatnonzero(failed & np.isnan(first_failure)):
-        first_failure[row] = frame * dt
-        failure_names[row] = [
-          name for name in monitor.active_terms if bool(monitor.get_term(name)[row])
-        ]
+      metrics.update(values, torch.as_tensor(np.isnan(first_failure), device=device))
       if replay_rows:
         ref_pose = torch.cat(
           (
@@ -253,9 +291,10 @@ def run_batch(
         break
       goal, uncertainty = build_actor_features(
         actor_inputs,
-        RpvState(truth.rotation, truth.position, truth.velocity),
+        RpvState(truth.rotation, truth.position, truth.world_velocity),
         belief.to_actor_input() if posterior_status == "ok" else None,
         reference,
+        torch.as_tensor(contexts, device=device),
       )
       actor_obs = build_actor_obs_td(
         {"motion": goal}, history, task_uncertainty=uncertainty
@@ -263,9 +302,13 @@ def run_batch(
       actions = actor(actor_obs).clamp(min=lower, max=upper)
       if not torch.isfinite(actions).all():
         raise ValueError("Non-finite actor action")
-      obs, _, dones, _ = env.step(actions)
-      if dones.any():
-        raise ValueError("Unexpected reset/termination in full-clip study")
+      obs = full_clip_step(raw, command, actions, active, parked_qpos, monitor)
+      failed = monitor.terminated.cpu().numpy()
+      for row in np.flatnonzero(failed & np.isnan(first_failure)):
+        first_failure[row] = (frame + 1) * dt
+        failure_names[row] = [
+          name for name in monitor.active_terms if bool(monitor.get_term(name)[row])
+        ]
       previous_action = actions
     result = metrics.result()
     result.update(

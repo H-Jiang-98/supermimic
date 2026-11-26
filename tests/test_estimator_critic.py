@@ -92,11 +92,11 @@ def test_rpv_mean_encoding_recovers_rotation_position_and_velocity_with_scales()
   position = truth.position + (
     truth.rotation @ (mean[:, 6:9] * 2).unsqueeze(-1)
   ).squeeze(-1)
-  velocity = truth.velocity + (
+  velocity = truth.world_velocity + (
     truth.rotation @ (mean[:, 9:12] * 3).unsqueeze(-1)
   ).squeeze(-1)
   torch.testing.assert_close(position, belief.mean.position)
-  torch.testing.assert_close(velocity, belief.mean.velocity)
+  torch.testing.assert_close(velocity, belief.mean.world_velocity)
   torch.testing.assert_close(
     features[:, 1249:], encode_rpv_covariance(belief.covariance[:, :9, :9], cfg)
   )
@@ -112,7 +112,6 @@ def test_horizontal_transform_preserves_all_features_and_near_pi_is_finite():
       state,
       rotation=rotation @ state.rotation,
       position=(rotation @ state.position.unsqueeze(-1)).squeeze(-1) + translation,
-      velocity=(rotation @ state.velocity.unsqueeze(-1)).squeeze(-1),
     )
 
   for group in ("A", "B", "C"):
@@ -245,24 +244,6 @@ def test_rpv_projection_has_no_direct_gradient_to_other_belief_coordinates(group
   assert torch.count_nonzero(mean_grad[:, 9:]) == 0
   assert torch.count_nonzero(covariance_grad[:, 9:, :]) == 0
   assert torch.count_nonzero(covariance_grad[:, :, 9:]) == 0
-
-
-def test_initialization_copies_bc_exactly_and_a_common_columns_without_aliases():
-  b, c, a = [BeliefCritic(group, 4, (16, 8)).double() for group in ("B", "C", "A")]
-  features = build_critic_features(*inputs())
-  b.update_normalization(features)
-  c.copy_common_initialization_from(b)
-  a.copy_common_initialization_from(b)
-  for name, value in b.state_dict().items():
-    assert torch.equal(c.state_dict()[name], value)
-    assert c.state_dict()[name].data_ptr() != value.data_ptr()
-  torch.testing.assert_close(a.mlp[0].weight, b.mlp[0].weight[:, : a.input_dim])
-  for critic in (a, b, c):
-    assert torch.count_nonzero(critic(features[:, : critic.input_dim])) == 0
-  with torch.no_grad():
-    b.mlp[-1].weight.fill_(0.1)
-  c.copy_common_initialization_from(b)
-  torch.testing.assert_close(c(features), b(features), atol=0, rtol=0)
 
 
 def test_normalization_uses_only_newest_history_and_is_atomic():

@@ -26,14 +26,20 @@ def test_ratio_resume_replays_fractional_balance_and_first_trigger(ratio):
     assert counts == [1, 2, 3, 2, 3, 2, 3]
 
 
-def test_warmup_discards_opportunities_and_multigroup_does_not_recount_normalization():
+def test_warmup_discards_opportunities_and_multigroup_does_not_recount_normalization(
+  monkeypatch,
+):
   loop = training()
+  replay = loop.runner.replay_buffer
+  enumerate_starts = Mock(wraps=replay.model_fit_starts)
+  monkeypatch.setattr(replay, "model_fit_starts", enumerate_starts)
   loop.should_train = Ratio(2.5)
   counts = []
   for _ in range(4):
     row = loop.run_step()
     counts.append(row["groups_this_step"])
   assert counts == [0, 0, 3, 2]
+  assert enumerate_starts.call_count == 4
   assert loop.skipped_update_groups == 3
   assert loop.update_groups == 5
   assert loop.learner.mean_steps == loop.policy.actor_steps == 5
@@ -47,6 +53,7 @@ def test_zero_ratio_collects_and_normalizes_without_training():
   loop = training(buffer_size=2, replay_ratio=0)
   for _ in range(10):
     loop.run_step()
+    assert loop.runner.replay_buffer._round_index is None
   assert loop.update_groups == loop.learner.cov_steps == 0
   assert int(loop.actor.obs_normalizer.count) == 20
   assert int(loop.learner.dynamics.state_normalizer.count) == 10

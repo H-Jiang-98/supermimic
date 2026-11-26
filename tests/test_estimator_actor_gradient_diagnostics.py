@@ -173,7 +173,7 @@ def test_real_record_runs_training_horizon_gradient_diagnostic(tmp_path):
   checkpoint, recording, motion = (
     tmp_path / name for name in ("training.pt", "record.pt", "motion.npz")
   )
-  with physical_runner(tmp_path, "C") as runner:
+  with physical_runner(tmp_path, "belief") as runner:
     runner.cfg.estimator_inputs = replace(runner.cfg.estimator_inputs, mode="train")
     EITTraining(runner).save(checkpoint)
   # A saved training cap must win over a newly constructed environment's bound.

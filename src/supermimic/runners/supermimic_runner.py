@@ -130,7 +130,9 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   return_sampler: ReturnSamplerCfg = field(default_factory=ReturnSamplerCfg)
 
   @classmethod
-  def for_estimator_inputs(cls, group: Literal["A", "B", "C"] = "A", **kwargs):
+  def for_estimator_inputs(
+    cls, group: Literal["A", "B", "C", "mean", "belief"] = "A", **kwargs
+  ):
     inputs = kwargs.pop("estimator_inputs", EITInputConfig(group=group))
     return cls(
       estimator_inputs=inputs,
@@ -234,6 +236,11 @@ class WorldModel:
         copy(self.representation).configure_estimator_measurement(measurement)
       self.dynamics.validate_checkpoint(bundle["dynamics"])
       dynamics_state = bundle["dynamics"]["state_dict"]
+      if getattr(self.representation, "local_control", False) and any(
+        not torch.equal(dynamics_state[key], getattr(self.dynamics, key))
+        for key in ("action_offset", "action_scale")
+      ):
+        raise ValueError("Saved PD action calibration differs from the environment")
     else:
       dynamics_state = bundle["dynamics"]
       validate_state_dict(self.dynamics, dynamics_state, "Dynamics")
@@ -308,7 +315,8 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
     if num_actions != 29 or abs(env.unwrapped.step_dt - 0.02) > 1e-8:
       raise ValueError("Estimator input v1 requires 29 actions at 50 Hz")
     representation.configure_estimator_measurement(inputs.measurement_noise)
-    num_goals = 700
+    representation.local_control = inputs.local_control
+    num_goals = inputs.goal_dim
 
   print(
     f"[INFO] Representation: {cfg.representation} "
@@ -354,11 +362,27 @@ def build_actor(
     if cfg.actor_obs == "rep_state"
     else representation.proprio_obs_dim(wm.num_actions)
   )
-  return MultiEncoderAE(
+  local = inputs is not None and inputs.local_control
+  if local:
+    from supermimic.models import LocalMotionActor
+
+    actor_type = LocalMotionActor
+    options = dict(
+      inputs=inputs,
+      context_dim=wm.dynamics.sim_ctx_dim,
+      action_scale=wm.dynamics.action_scale,
+      action_offset=wm.dynamics.action_offset,
+    )
+  else:
+    actor_type = MultiEncoderAE
+    options = dict(
+      uncertainty_dim=450 if inputs is not None and inputs.uses_uncertainty else 0
+    )
+  return actor_type(
     obs_dim=obs_dim,
     action_dim=wm.num_actions,
     task_specs=(
-      [make_estimator_motion_task()]
+      [make_estimator_motion_task(inputs.goal_dim)]
       if inputs is not None
       else resolve_task_specs(cfg.tasks, representation, wm.num_goals, device)
     ),
@@ -367,7 +391,7 @@ def build_actor(
     hidden_dims=cfg.actor_hidden_dims,
     latent_bc_weight=cfg.latent_bc_weight,
     history_length=cfg.history_length,
-    uncertainty_dim=450 if inputs is not None and inputs.uses_uncertainty else 0,
+    **options,
     input_version=inputs.version if inputs is not None else "legacy",
   ).to(device)
 
@@ -419,24 +443,12 @@ def load_actor_checkpoint(
   if checkpoint.get("architecture") != expected:
     raise ValueError("Actor architecture mismatch")
   validate_state_dict(actor, checkpoint["actor"], "Actor")
+  if inputs.local_control and any(
+    not torch.equal(checkpoint["actor"][key], getattr(actor, key))
+    for key in ("action_offset", "action_scale")
+  ):
+    raise ValueError("Actor and world model PD action calibration differ")
   actor.load_state_dict(checkpoint["actor"])
-
-
-def build_ablation_actors(
-  cfg: SuperMimicRunnerCfg, wm: WorldModel, device: str
-) -> dict[str, MultiEncoderAE]:
-  """Independent A/B/C actors with copied common weights and normalization."""
-  if cfg.estimator_inputs is None:
-    raise ValueError("build_ablation_actors requires estimator_inputs")
-  actors = {}
-  for group in ("A", "B", "C"):
-    group_cfg = replace(
-      cfg, estimator_inputs=replace(cfg.estimator_inputs, group=group)
-    )
-    actors[group] = build_actor(group_cfg, wm, device)
-    if group != "A":
-      actors[group].copy_common_initialization_from(actors["A"])
-  return actors
 
 
 @dataclass
@@ -1183,6 +1195,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         self._representation.true_rpv(aux_state, rep_state),
         posterior,
         reference,
+        sim_ctx,
       )
       actor_td = build_actor_obs_td(
         {"motion": goal}, self._sim_history, task_uncertainty=uncertainty

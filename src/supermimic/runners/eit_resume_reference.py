@@ -167,6 +167,8 @@ def _private_components(training):
     "generators",
   ):
     setattr(policy, name, cloned[name])
+  policy._encode = getattr(policy.actor, "encode_goal", None)
+  policy._decode = getattr(policy.actor, "decode_goal", None)
   policy._actor_forward = policy.actor
   policy._actor_with_aux = getattr(policy.actor, "forward_with_aux", None)
   # A shallow copy must never replay a graph referencing the live parameters.

@@ -174,7 +174,7 @@ def test_recording_and_diagnostics_preserve_physical_frames_and_rng(
   tmp_path, monkeypatch
 ):
   checkpoint = tmp_path / "training.pt"
-  with physical_runner(tmp_path, "B") as runner:
+  with physical_runner(tmp_path, "mean") as runner:
     runner.cfg.estimator_inputs = replace(runner.cfg.estimator_inputs, mode="train")
     EITTraining(runner).save(checkpoint)
   captures = []

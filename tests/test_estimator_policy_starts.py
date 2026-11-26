@@ -60,6 +60,39 @@ def test_stale_prepared_start_rejected_without_mutating_live_frame():
   assert env.num_envs == 2
 
 
+def test_loaded_motion_reuses_digest_across_updates_and_rehashes_edits(
+  tmp_path, monkeypatch
+):
+  from supermimic import motion_loader
+  from supermimic.scripts.check_estimator import stationary_motion
+
+  path = tmp_path / "stationary.npz"
+  stationary_motion(path)
+
+  def body_targets(p, r, q, v, w, qdot):
+    return tuple(x[:, None] for x in (p, r, v, w))
+
+  with torch.inference_mode():
+    motion = motion_loader.MotionLoader(str(path), body_targets, 29)
+  env, _, _ = setup_env()
+  env.motion = motion
+  digest = Mock(wraps=motion_loader.motion_content_digest)
+  monkeypatch.setattr(motion_loader, "motion_content_digest", digest)
+
+  def read():
+    with env.readonly_policy_motion():
+      return env._policy_motion_digest()
+
+  original = read()
+  assert read() == original
+  assert digest.call_count == 1
+  motion.joint_pos.add_(1)
+  changed = read()
+  assert changed != original and digest.call_count == 2
+  motion.joint_pos = motion.joint_pos.clone()
+  assert read() == changed and digest.call_count == 3
+
+
 def test_readonly_policy_motion_hashes_once_across_preparations_and_resets(monkeypatch):
   env, _, _ = setup_env()
   digest = Mock(wraps=world_model_env.motion_content_digest)

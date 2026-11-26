@@ -3,7 +3,7 @@
 A [SuperTrack](https://montreal.ubisoft.com/en/supertrack-motion-tracking-for-physically-simulated-characters-using-supervised-learning/)
 implementation for training world models and policies to mimic motion data, built on [mjlab_for_supermimic](https://github.com/H-Jiang-98/mjlab_for_supermimic).
 
-文档入口：[EIT v6 训练](README_eit.md) · [评估与可视化](README_eval.md) · [环境安装](docs/setup.md) · [普通训练 W&B](docs/wandb.md)
+文档入口：[EIT v7 训练](README_eit.md) · [评估与可视化](README_eval.md) · [环境安装](docs/setup.md) · [普通训练 W&B](docs/wandb.md)
 
 ## 快速开始：LAFAN1 G1 数据处理与训练
 
@@ -135,8 +135,8 @@ uv run src/supermimic/scripts/train.py SuperMimic-GenCoord-G1 \
 ## 训练模式
 
 - 普通训练：使用上面的 `train_config.toml`，支持 GenCoord 和 MaxCoord G1。
-- EIT v6：在线滤波、后验 replay、随机世界模型与可微策略联合训练，
-  入口及 `train_eit_config.toml` 教程见 [README_eit.md](README_eit.md)。
+- EIT v7：在线滤波、后验 replay、随机世界模型与可微策略联合训练，
+  入口及 `train_eit_v7.toml` 教程见 [README_eit.md](README_eit.md)。
 - 评估、播放与 ONNX 导出：[README_eval.md](README_eval.md)。
 
 ## Acknowledgements

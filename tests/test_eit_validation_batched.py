@@ -138,7 +138,7 @@ def test_multiclip_runtime_matches_legacy_and_padding(checkpoint):  # noqa: F811
           )
         assert meta["odometry_status"] == "complete"
         assert actual["odometry_valid_frame_counts"].tolist() == [motion["frames"]]
-        assert actual["odometry_full"].shape == (1, 5)
+        assert actual["odometry_full"].shape == (1, 11)
         pos_error = (
           actual["replay_posterior"][:, 0, :3] - actual["replay_truth"][:, 0, :3]
         )
@@ -234,13 +234,13 @@ def test_cuda_filter_capture_and_actor_parity(checkpoint):  # noqa: F811
 
 
 def test_truth_control_survives_posterior_failure(checkpoint, tmp_path):  # noqa: F811
-  from supermimic.runners.eit_training import EITTraining
+  from supermimic.runners.belief_training import BeliefModelTraining
   from tests.test_estimator_eit_inference import physical_runner
 
   root, saved = checkpoint
   with physical_runner(tmp_path, "A") as runner:
     runner.cfg.estimator_inputs = replace(runner.cfg.estimator_inputs, mode="train")
-    EITTraining(runner).save(tmp_path / "a.pt")
+    BeliefModelTraining(runner).save(tmp_path / "a.pt")
   actor_saved = torch.load(tmp_path / "a.pt", map_location="cpu", weights_only=True)
   cfg = StudyConfig(
     device="cpu", compile_kernels=False, num_envs=2, num_domain_contexts=2
@@ -285,10 +285,14 @@ def test_truth_control_survives_posterior_failure(checkpoint, tmp_path):  # noqa
       runtime.close()
 
 
-def test_first_physical_failure_keeps_first_frame_and_all_scores(checkpoint):  # noqa: F811
+def test_first_physical_failure_censors_both_scores(checkpoint):  # noqa: F811
   root, saved = checkpoint
   cfg = StudyConfig(
-    device="cpu", compile_kernels=False, num_envs=2, num_domain_contexts=2
+    device="cpu",
+    compile_kernels=False,
+    num_envs=2,
+    num_domain_contexts=2,
+    time_bin_s=0.04,
   )
   env_cfg, _ = make_env_config(cfg, root / "motion.npz")
   table = domain_table(env_cfg, 2, cfg.sobol_seed)
@@ -304,13 +308,37 @@ def test_first_physical_failure_keeps_first_frame_and_all_scores(checkpoint):  #
 
       def monitor():
         nonlocal calls
+        assert runtime.raw.episode_length_buf.tolist() == [calls + 1] * 2
+        assert runtime.command.time_steps.tolist() == [calls] * 2
         runtime.monitor._terminated_buf[:] = torch.tensor([calls in (2, 5), calls >= 4])
         calls += 1
 
       runtime.monitor.compute = monitor
       outputs, timing = runtime.execute(task, "C-posterior", p)
-      np.testing.assert_allclose(outputs[0][1]["first_failure_s"], [0.04, 0.08])
-      assert outputs[0][1]["valid_frame_counts"].tolist() == [8, 8]
+      arrays, meta = outputs[0][1:]
+      assert meta["status"] == meta["odometry_status"] == "complete"
+      np.testing.assert_allclose(arrays["first_failure_s"], [0.06, 0.10])
+      for prefix in ("", "odometry_"):
+        assert arrays[prefix + "valid_frame_counts"].tolist() == [3, 5]
+        np.testing.assert_array_equal(
+          np.isfinite(arrays[prefix + "bins"][:, :, 0]),
+          [[True, True], [True, True], [False, True], [False, False]],
+        )
+      for row, end in enumerate([3, 5]):
+        truth = arrays["replay_truth"][:end, row, :3]
+        for prefix, key in (
+          ("", "replay_reference"),
+          ("odometry_", "replay_posterior"),
+        ):
+          delta = truth - arrays[key][:end, row, :3]
+          squared = (delta**2).sum(axis=1)
+          assert arrays[prefix + "full"][row, 1] == pytest.approx(
+            np.sqrt(squared.mean()), abs=1e-6
+          )
+          populated = [np.sqrt(squared[i : i + 2].mean()) for i in range(0, end, 2)]
+          np.testing.assert_allclose(
+            arrays[prefix + "bins"][: len(populated), row, 1], populated, atol=1e-6
+          )
       assert timing["effective_frames"] == 16
     finally:
       runtime.close()

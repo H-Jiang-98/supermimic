@@ -1,0 +1,317 @@
+{
+  "device": "cpu",
+  "torch": "2.14.0+cu130",
+  "seed": 2026,
+  "train_clip": "walk1_subject1.npz",
+  "physical_envs": 4,
+  "control_dt_s": 0.02,
+  "mean_hidden_dims": [
+    16
+  ],
+  "cov_hidden_dims": [
+    16
+  ],
+  "actor_hidden_dims": [
+    16
+  ],
+  "critic_hidden_dims": [
+    256,
+    128
+  ],
+  "imagined_horizon": 2,
+  "policy_microbatch": 2,
+  "exploration_std": 0.1,
+  "train_solver_iterations": 10,
+  "train_line_search_iterations": 20,
+  "validation": {
+    "clip": "First 65 consecutive frames of walk1_subject1.npz",
+    "clip_sha256": "1ecbdafefb40aff4470b3165cc7b724878ef741afba90f49cb4eff86f8557331",
+    "domain_contexts": 2,
+    "scoring_window": "before_first_tracking_failure",
+    "paired_context_truth_and_prior_exact": true,
+    "evaluation_seed": 2718,
+    "sobol_seed": 2026
+  },
+  "methods": {
+    "mean-direct": {
+      "checkpoint_sha256": "e265af1726bdcf1c5578492544d4586425ef0f26bd48b19d2f379025ba3ce3f8",
+      "actor_sha256": "731e8f3fa9e68e816e451e837cfedca1fd3f2866c913a5d7f5c764db22bace02",
+      "estimator_sha256": "3a2a62c1755da6d516b17aa845f422c219e383da8e89f7bc3ee7203f875ffb6d",
+      "initialization_digest": "471f1945d492653a828724ab9d0496a95510b319c83be4abcd86e997fea39e1d",
+      "frames_before_resume": 20,
+      "frames_after_resume": 32,
+      "updates": {
+        "mean_updates": 6,
+        "covariance_updates": 6,
+        "actor_updates": 6,
+        "critic_updates": 6
+      },
+      "resumed_update_groups": 2,
+      "final_training_update": {
+        "Model/Loss/state": 0.9683722257614136,
+        "Model/Loss/process_nll": 18488.166015625,
+        "ModelValidation/Loss/state": 0.21994058787822723,
+        "ModelValidation/Loss/process_nll": 113534.59375,
+        "Policy/return": 0.115803062915802,
+        "Policy/critic_loss": 0.003621933748945594,
+        "Grad/actor_norm": 0.1656755656003952,
+        "Grad/critic_norm": 0.7378003001213074
+      },
+      "inference_steps": 3,
+      "scored_frames": [
+        49,
+        41
+      ],
+      "one_second_intervals": [
+        0,
+        0
+      ],
+      "tracking": {
+        "root_rotation_rmse_deg": 44.640484922704644,
+        "root_position_rmse_m": 0.26607602585603835,
+        "root_velocity_rmse_m_s": 0.8495692861582911,
+        "mpkpe_m": 0.2815135813391872,
+        "ee_position_error_m": 0.3153742495195858,
+        "ee_orientation_error_deg": 65.76399481468675,
+        "joint_position_rmse_deg": 26.68450250375053,
+        "joint_velocity_rmse_deg_s": 98.63843488182934,
+        "success_rate": 0.0
+      },
+      "odometry": {
+        "root_rotation_rmse_deg": 10.2440178778599,
+        "root_position_rmse_m": 2.7365191614916284,
+        "root_velocity_rmse_m_s": 9.825192384820662,
+        "root_nll": 1730.740533752537,
+        "root_nees": 3501.3877747483675,
+        "root_x_rmse_m": 1.978858714398549,
+        "root_y_rmse_m": 1.4546220354028623,
+        "root_z_rmse_m": 1.099378008402905,
+        "root_roll_rmse_deg": 1.3431131339019489,
+        "root_pitch_rmse_deg": 1.8236899245380913,
+        "root_yaw_rmse_deg": 10.216810575257298,
+        "gravity_direction_rmse_deg": 2.2128553944559277,
+        "height_rmse_m": 1.099378008402905,
+        "body_velocity_rmse_m_s": 9.77787959931724,
+        "body_angular_velocity_rmse_rad_s": 0.6960339552439172,
+        "posterior_joint_position_rmse_rad": 0.006283357087237397,
+        "posterior_joint_velocity_rmse_rad_s": 1.0809293393906576,
+        "local_nees": 8889.167808169159,
+        "local_nll": 4236.411479997765,
+        "success_rate": 0.0,
+        "relative_displacement_1s_rmse_m": null,
+        "relative_rotation_1s_rmse_deg": null,
+        "contexts_with_1s_support": 0
+      }
+    },
+    "mean-residual": {
+      "checkpoint_sha256": "beda88049e54bf51b1a5c6243b8ee8a500cb262bfa77a7d8ab2a0501b49fc0d2",
+      "actor_sha256": "cc4835c93801f022bb6b0a6851f34725e8750859135242f631ff8e4a86ddb619",
+      "estimator_sha256": "b894a3f02653c618888a595743c57f43ed0d6380a175862f60ade2300f2fb5a9",
+      "initialization_digest": "471f1945d492653a828724ab9d0496a95510b319c83be4abcd86e997fea39e1d",
+      "frames_before_resume": 20,
+      "frames_after_resume": 32,
+      "updates": {
+        "mean_updates": 6,
+        "covariance_updates": 6,
+        "actor_updates": 6,
+        "critic_updates": 6
+      },
+      "resumed_update_groups": 2,
+      "final_training_update": {
+        "Model/Loss/state": 0.24859468638896942,
+        "Model/Loss/process_nll": 15282.4609375,
+        "ModelValidation/Loss/state": 0.19145788252353668,
+        "ModelValidation/Loss/process_nll": 28171.466796875,
+        "Policy/return": 0.139682799577713,
+        "Policy/critic_loss": 0.006201093550771475,
+        "Grad/actor_norm": 0.19280940294265747,
+        "Grad/critic_norm": 0.9168588519096375
+      },
+      "inference_steps": 3,
+      "scored_frames": [
+        46,
+        55
+      ],
+      "one_second_intervals": [
+        0,
+        5
+      ],
+      "tracking": {
+        "root_rotation_rmse_deg": 29.961018593056558,
+        "root_position_rmse_m": 0.2819683142195095,
+        "root_velocity_rmse_m_s": 0.8485177797738809,
+        "mpkpe_m": 0.2389351951617994,
+        "ee_position_error_m": 0.2354686707032076,
+        "ee_orientation_error_deg": 27.384712365127676,
+        "joint_position_rmse_deg": 10.813763644017541,
+        "joint_velocity_rmse_deg_s": 40.63153490578456,
+        "success_rate": 0.0
+      },
+      "odometry": {
+        "root_rotation_rmse_deg": 4.219216064269402,
+        "root_position_rmse_m": 3.6201788591986706,
+        "root_velocity_rmse_m_s": 11.752195707629332,
+        "root_nll": 3219.295384688733,
+        "root_nees": 6476.7042372203505,
+        "root_x_rmse_m": 2.1717692795718797,
+        "root_y_rmse_m": 1.4645937155060382,
+        "root_z_rmse_m": 2.497919738328633,
+        "root_roll_rmse_deg": 0.7844948851845088,
+        "root_pitch_rmse_deg": 0.9158366245351526,
+        "root_yaw_rmse_deg": 4.240537137419667,
+        "gravity_direction_rmse_deg": 1.151726961630403,
+        "height_rmse_m": 2.497919738328633,
+        "body_velocity_rmse_m_s": 11.754592356752717,
+        "body_angular_velocity_rmse_rad_s": 0.55922570512391,
+        "posterior_joint_position_rmse_rad": 0.005247945961603868,
+        "posterior_joint_velocity_rmse_rad_s": 0.8311260903722825,
+        "local_nees": 10632.912126775216,
+        "local_nll": 5108.677814808718,
+        "success_rate": 0.0,
+        "relative_displacement_1s_rmse_m": 12.05009525445974,
+        "relative_rotation_1s_rmse_deg": 9.252127753057195,
+        "contexts_with_1s_support": 1
+      }
+    },
+    "belief-direct": {
+      "checkpoint_sha256": "4da3b2ab357888c2bf16aa7830303c43891e172e7adfcb1d6d211947bc3b018d",
+      "actor_sha256": "8ffc3276c3f5ece22bff7ea24643ba72a29d9b3a782c9e399c89e8bf5501593c",
+      "estimator_sha256": "60747833e558af4a779b38d0f4251234816b201818c370a643e1d0858cefed2f",
+      "initialization_digest": "471f1945d492653a828724ab9d0496a95510b319c83be4abcd86e997fea39e1d",
+      "frames_before_resume": 20,
+      "frames_after_resume": 32,
+      "updates": {
+        "mean_updates": 6,
+        "covariance_updates": 6,
+        "actor_updates": 6,
+        "critic_updates": 6
+      },
+      "resumed_update_groups": 2,
+      "final_training_update": {
+        "Model/Loss/state": 0.967982292175293,
+        "Model/Loss/process_nll": 18479.08984375,
+        "ModelValidation/Loss/state": 0.21996809542179108,
+        "ModelValidation/Loss/process_nll": 113464.8515625,
+        "Policy/return": 0.11583217978477478,
+        "Policy/critic_loss": 0.0036243165377527475,
+        "Grad/actor_norm": 0.16580258309841156,
+        "Grad/critic_norm": 0.738124430179596
+      },
+      "inference_steps": 3,
+      "scored_frames": [
+        49,
+        41
+      ],
+      "one_second_intervals": [
+        0,
+        0
+      ],
+      "tracking": {
+        "root_rotation_rmse_deg": 44.33276139078555,
+        "root_position_rmse_m": 0.26538907022339175,
+        "root_velocity_rmse_m_s": 0.8462450908852936,
+        "mpkpe_m": 0.281237609970274,
+        "ee_position_error_m": 0.3151023380005895,
+        "ee_orientation_error_deg": 65.59228307803237,
+        "joint_position_rmse_deg": 26.69437368426705,
+        "joint_velocity_rmse_deg_s": 98.67723879769494,
+        "success_rate": 0.0
+      },
+      "odometry": {
+        "root_rotation_rmse_deg": 10.53384789492951,
+        "root_position_rmse_m": 2.78309747365142,
+        "root_velocity_rmse_m_s": 9.879014853008268,
+        "root_nll": 1735.661047851041,
+        "root_nees": 3511.2043773786118,
+        "root_x_rmse_m": 2.0363722205307155,
+        "root_y_rmse_m": 1.4335032397995686,
+        "root_z_rmse_m": 1.1226703654337902,
+        "root_roll_rmse_deg": 1.3380473176037337,
+        "root_pitch_rmse_deg": 1.8011330354999124,
+        "root_yaw_rmse_deg": 10.520188032468916,
+        "gravity_direction_rmse_deg": 2.191326487464098,
+        "height_rmse_m": 1.1226703654337902,
+        "body_velocity_rmse_m_s": 9.833226019961582,
+        "body_angular_velocity_rmse_rad_s": 0.6940571565744897,
+        "posterior_joint_position_rmse_rad": 0.0062657343097552555,
+        "posterior_joint_velocity_rmse_rad_s": 1.082350672616639,
+        "local_nees": 8917.729782711933,
+        "local_nll": 4250.7003329770005,
+        "success_rate": 0.0,
+        "relative_displacement_1s_rmse_m": null,
+        "relative_rotation_1s_rmse_deg": null,
+        "contexts_with_1s_support": 0
+      }
+    },
+    "belief-residual": {
+      "checkpoint_sha256": "da4c475ddd4ad46a062605cd183b9a4682ce2084a26a93c35ee287487e4db751",
+      "actor_sha256": "10cecf028a70eec450191ff7773c7363aa2c56d21c526026ec44be8ba799b925",
+      "estimator_sha256": "a196804f89d4ef40532284c2965c3777f78a891e602e078c5b17b5e20a1d2416",
+      "initialization_digest": "471f1945d492653a828724ab9d0496a95510b319c83be4abcd86e997fea39e1d",
+      "frames_before_resume": 20,
+      "frames_after_resume": 32,
+      "updates": {
+        "mean_updates": 6,
+        "covariance_updates": 6,
+        "actor_updates": 6,
+        "critic_updates": 6
+      },
+      "resumed_update_groups": 2,
+      "final_training_update": {
+        "Model/Loss/state": 0.24877505004405975,
+        "Model/Loss/process_nll": 15292.9072265625,
+        "ModelValidation/Loss/state": 0.19159306585788727,
+        "ModelValidation/Loss/process_nll": 28159.994140625,
+        "Policy/return": 0.13967865705490112,
+        "Policy/critic_loss": 0.006201564334332943,
+        "Grad/actor_norm": 0.1927492320537567,
+        "Grad/critic_norm": 0.9169049263000488
+      },
+      "inference_steps": 3,
+      "scored_frames": [
+        46,
+        55
+      ],
+      "one_second_intervals": [
+        0,
+        5
+      ],
+      "tracking": {
+        "root_rotation_rmse_deg": 29.890390986724768,
+        "root_position_rmse_m": 0.28187955297820944,
+        "root_velocity_rmse_m_s": 0.8477072106603949,
+        "mpkpe_m": 0.23888346239910252,
+        "ee_position_error_m": 0.23539039867253697,
+        "ee_orientation_error_deg": 27.33832244021582,
+        "joint_position_rmse_deg": 10.811874271240496,
+        "joint_velocity_rmse_deg_s": 40.53642135071947,
+        "success_rate": 0.0
+      },
+      "odometry": {
+        "root_rotation_rmse_deg": 4.24442636492288,
+        "root_position_rmse_m": 3.6160084552085907,
+        "root_velocity_rmse_m_s": 11.751158698250373,
+        "root_nll": 3218.661970961426,
+        "root_nees": 6475.442462259703,
+        "root_x_rmse_m": 2.1724009260219814,
+        "root_y_rmse_m": 1.466034079184911,
+        "root_z_rmse_m": 2.4905049234080137,
+        "root_roll_rmse_deg": 0.7883456267670503,
+        "root_pitch_rmse_deg": 0.9158394352499815,
+        "root_yaw_rmse_deg": 4.274761776612363,
+        "gravity_direction_rmse_deg": 1.1531534079061267,
+        "height_rmse_m": 2.4905049234080137,
+        "body_velocity_rmse_m_s": 11.753768404527325,
+        "body_angular_velocity_rmse_rad_s": 0.5583217077214832,
+        "posterior_joint_position_rmse_rad": 0.005250283235097018,
+        "posterior_joint_velocity_rmse_rad_s": 0.8322972976968466,
+        "local_nees": 10645.55096610373,
+        "local_nll": 5114.99512475627,
+        "success_rate": 0.0,
+        "relative_displacement_1s_rmse_m": 12.01939762177112,
+        "relative_rotation_1s_rmse_deg": 9.323076554225667,
+        "contexts_with_1s_support": 1
+      }
+    }
+  }
+}

@@ -9,8 +9,8 @@
 ```bash
 WANDB_MODE=offline OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.train_eit \
   --motion-file data/motions/walk1_subject1.npz --device cuda:0 \
-  --group B --output logs/eit-v6/B --max-iterations 1000 \
-  --wandb-project supermimic --run-name eit-B-seed2026
+  --group belief --output logs/eit-v7/belief-direct --max-iterations 1000 \
+  --wandb-project supermimic --run-name eit-belief-direct-seed2026
 ```
 
 项目和名称写入公共 runner 配置。`--output` 为运行目录；`--log-interval` 默认 10，`--save-interval` 默认 1000，二者均以累计物理采集步为单位。旧的 `--wandb-mode`、`--wandb-log-models`、`--wandb-group` 和固定 run ID 管理已移除。
@@ -62,32 +62,17 @@ JSONL 追加 4、5，新 run 日志序号为 0、1。
 公共 Logger 添加的 episode 指标、Train/* 和 total_fps 不补入 metrics.jsonl。
 历史日志与 checkpoint 格式不变；新展示规则在下次启动或续训时生效。
 
-## 短程 pilot 与恢复验证
+## 短程训练与恢复验证
 
-当前 `run_eit_pilot` 使用 `eit_pilot_v4` 元数据与 `eit_training_v6` checkpoint。它按累计物理步运行 A/B/C，共享初始化；默认 1024 环境、1000 容量、replay ratio 16、mean 10×2048×8、policy 4096×1×32、critic 5×4。covariance 每组抽样 143,360 对，8192 batch，18 次更新；验证独立抽 8192 对。
-
-pilot 的默认目标为累计 100 步，在 50 步保存现场下一次更新参考，独立验证优化器恢复后继续到 100。这个短流程不代表收敛实验，也不能测量满 replay 的稳态索引成本。warmup 及恢复后跳过的机会由实际计数报告，不按 round 推算优化次数。
+`check_eit_training` 用小规模 MuJoCo 环境训练 mean 和 belief 两组，核对固定输入下模型与策略的下一次更新，并在独立进程中评估保存的 checkpoint。
 
 ```bash
-WANDB_MODE=offline OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.run_eit_pilot \
-  --motion-file data/motions/walk1_subject1.npz --device cuda:0 \
-  --online-device cpu --output artifacts/eit-pilot-v6
-.venv/bin/python -m supermimic.scripts.report_eit_pilot \
-  --pilot artifacts/eit-pilot-v6 --output artifacts/eit-pilot-v6/report
+WANDB_MODE=disabled OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.check_eit_training --device cpu
 ```
 
-每次训练启动/恢复均创建新离线 run；可用 `WANDB_MODE=disabled` 做无 SDK 的本地训练检查，报告中应保留模式。`--phase train` 只训练和验证恢复，`--phase evaluate` 只评估；已存在的协议必须完全匹配，不迁移旧 round 协议。
+历史 A/B/C pilot 的归档报告仍可用 `report_eit_pilot` 审阅。
 
-保存复用公共 `runner.cfg.save_interval`，初始、周期和结束保存最新四文件和同一 model artifact。每组第二段启动前，pilot 在 `resume/<组别>-midpoint.pt` 保留中点 checkpoint，并用对应现场参考验证恢复。第二段即使在采到新的一步之前中断，重启也可复用中点和验证回执。最终候选为各组 `training.pt`，验证采用独立 seed，保留测试集供后续使用。
-
-独立诊断保留最终策略梯度、A 的 truth-input critic、共同策略记录和 reference-controller 记录。共同记录仅用于 process/posterior 比较，不计为独立闭环表现。记录、评分及 benchmark 各自运行在子进程；失败时保留命令日志和源码摘要。
-
-critic 完整回报误差只使用物理失败的 episode；v6 的片尾完成属于回报删失。全部正常完成时，报告保留零样本和空误差，并将 `A_truth_critic_status` 标为 `unscorable_censored`，不阻塞 pilot 完成。超时、外部截断及缺失记录仍会使报告待补齐。
-
-v4 pilot 报告从 v6 checkpoint 核对累计物理预算、实际训练组及每组更新数，汇总 `Logger` 曲线、阶段时间、CUDA peak 和本地离线存储字节数。报告校验各组的中点参考和回执摘要，并按冻结清单从原始 episode 重算验证分数及入选 checkpoint。可在报告的 `pending` 和 `failures` 中查看缺失的证据和身份不匹配的文件。
-
-
-## 固定轨迹诊断
+## 历史实验的固定轨迹诊断
 
 在独立评估 seed 的真实仿真中，每个环境槽从片头记录一个 episode。相同的过程模型或滤波器比较应复用同一份 recording 和窗口长度。critic 的真实回报比较则要求由被评估的快照产生动作。训练集内部的验证划分继续用于模型拟合。评分入口用展开的训练文件 SHA-256、加载的 motion 摘要及训练 seed 检查记录来源。与训练共享 seed 和 motion 的记录会被拒绝。历史快照缺少训练 seed 或同 seed 时缺少文件清单，会在 training_overlap_check 中标明无法核验。
 

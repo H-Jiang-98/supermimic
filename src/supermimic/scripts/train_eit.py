@@ -14,8 +14,10 @@ import torch
 from mjlab.tasks.registry import load_env_cfg
 
 import supermimic.tasks  # noqa: F401
+from supermimic.belief import GaussianStatePrior
 from supermimic.critic_inputs import CRITIC_INPUT_VERSION
 from supermimic.estimator import FilterConfig
+from supermimic.estimator_inputs import EITInputConfig
 from supermimic.learners.belief_policy_learner import BeliefPolicyLearnerCfg
 from supermimic.models import ProcessNoiseConfig
 from supermimic.motion_command import MotionCommandCfg
@@ -97,12 +99,16 @@ def main():
     "--initialization",
     type=Path,
     help=(
-      "Shared A/B/C initial weights (default: output parent/"
+      "Shared mean/belief initial weights (default: output parent/"
       f"{EIT_INITIALIZATION_VERSION}_{CRITIC_INPUT_VERSION}_"
       "noise<fingerprint>_seed<seed>.pt)"
     ),
   )
-  parser.add_argument("--group", choices=("A", "B", "C"), default="B")
+  parser.add_argument("--group", choices=("mean", "belief"), default="mean")
+  parser.add_argument("--residual-actor", action="store_true")
+  parser.add_argument("--stepwise-motion-encoder", action="store_true")
+  for name, std in zip(GaussianStatePrior.names, GaussianStatePrior().std, strict=True):
+    parser.add_argument("--prior-" + name.replace("_", "-"), type=float, default=std)
   parser.add_argument(
     "--device", default="cuda:0" if torch.cuda.is_available() else "cpu"
   )
@@ -293,6 +299,12 @@ def main():
     mean, cov = model_fit_configs(args)
     runner_cfg = SuperMimicRunnerCfg.for_estimator_inputs(
       args.group,
+      estimator_inputs=EITInputConfig(
+        group=args.group, residual_actor=args.residual_actor
+      ),
+      initial_prior=GaussianStatePrior(
+        tuple(getattr(args, "prior_" + name) for name in GaussianStatePrior.names)
+      ),
       dynamics_hidden_dims=tuple(args.mean_hidden_dims),
       actor_hidden_dims=tuple(args.actor_hidden_dims),
       critic_hidden_dims=tuple(args.critic_hidden_dims),
@@ -319,6 +331,7 @@ def main():
       num_samples=args.samples,
       microbatch_size=args.policy_microbatch_size,
       horizon=args.policy_horizon,
+      batch_motion_encoder=not args.stepwise_motion_encoder,
       num_batches=args.policy_updates,
       critic_epochs=args.critic_epochs,
       critic_minibatches=args.critic_minibatches,

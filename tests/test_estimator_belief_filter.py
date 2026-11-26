@@ -283,13 +283,13 @@ def test_analytic_reset_matches_exponential_values_and_two_derivatives(
     delta[:, :3] = 0
     delta[0, 0], delta[1, 1] = boundary_angle, -boundary_angle
   delta.requires_grad_()
-  theta, rho, nu = (skew(delta[..., i : i + 3]) for i in (0, 3, 6))
+  theta, rho = (skew(delta[..., i : i + 3]) for i in (0, 3))
   zero = torch.zeros_like(theta)
   ad = torch.cat(
     (
       torch.cat((theta, zero, zero), -1),
       torch.cat((rho, theta, zero), -1),
-      torch.cat((nu, zero, theta), -1),
+      torch.cat((zero, zero, zero), -1),
     ),
     -2,
   )

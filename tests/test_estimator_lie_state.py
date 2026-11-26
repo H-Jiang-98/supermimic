@@ -39,14 +39,13 @@ def _state(batch=2):
 
 
 def _matrix_exp(delta):
-  """Independent 5x5 SE_2(3) implementation, only for test reference."""
-  matrix = delta.new_zeros(*delta.shape[:-1], 5, 5)
+  """Independent 4x4 SE(3) implementation, only for test reference."""
+  matrix = delta.new_zeros(*delta.shape[:-1], 4, 4)
   x, y, z = delta[..., :3].unbind(-1)
   matrix[..., 0, 1], matrix[..., 0, 2] = -z, y
   matrix[..., 1, 0], matrix[..., 1, 2] = z, -x
   matrix[..., 2, 0], matrix[..., 2, 1] = -y, x
   matrix[..., :3, 3] = delta[..., 3:6]
-  matrix[..., :3, 4] = delta[..., 6:9]
   return torch.matrix_exp(matrix)
 
 
@@ -62,7 +61,7 @@ def _near_identity_log(matrix):
     ),
     -1,
   )
-  return torch.cat((orientation, matrix[..., :3, 3], matrix[..., :3, 4]), -1)
+  return torch.cat((orientation, matrix[..., :3, 3]), -1)
 
 
 def test_exp_matches_matrix_exponential_and_retains_coupling():
@@ -76,11 +75,8 @@ def test_exp_matches_matrix_exponential_and_retains_coupling():
   torch.testing.assert_close(
     state.position, expected[..., :3, 3], atol=1e-12, rtol=1e-12
   )
-  torch.testing.assert_close(
-    state.velocity, expected[..., :3, 4], atol=1e-12, rtol=1e-12
-  )
+  torch.testing.assert_close(state.velocity, delta[..., 6:9], atol=1e-12, rtol=1e-12)
   assert not torch.allclose(state.position, delta[..., 3:6])
-  assert not torch.allclose(state.velocity, delta[..., 6:9])
   torch.testing.assert_close(log(state), delta, atol=1e-12, rtol=1e-12)
 
 
@@ -190,7 +186,7 @@ def test_reset_jacobian_against_independent_group_finite_difference():
   h = 1e-6
   columns = []
   inverse_exp = _matrix_exp(-delta)
-  for j in range(9):
+  for j in range(6):
     direction = torch.zeros_like(delta)
     direction[j] = h
     positive = _near_identity_log(inverse_exp @ _matrix_exp(delta + direction))
@@ -198,10 +194,11 @@ def test_reset_jacobian_against_independent_group_finite_difference():
     columns.append((positive - negative) / (2 * h))
   expected = torch.stack(columns, -1)
   jacobian = reset_jacobian(delta)
-  torch.testing.assert_close(jacobian[:9, :9], expected, atol=4e-10, rtol=4e-8)
+  torch.testing.assert_close(jacobian[:6, :6], expected, atol=4e-10, rtol=4e-8)
   assert jacobian[3:6, :3].abs().max() > 0.1
-  assert jacobian[6:9, :3].abs().max() > 0.1
-  torch.testing.assert_close(jacobian[9:, 9:], torch.eye(61, dtype=delta.dtype))
+  assert jacobian[6:, :6].count_nonzero() == 0
+  assert jacobian[:6, 6:].count_nonzero() == 0
+  torch.testing.assert_close(jacobian[6:, 6:], torch.eye(64, dtype=delta.dtype))
   torch.testing.assert_close(
     reset_jacobian(torch.zeros_like(delta)), torch.eye(70, dtype=delta.dtype)
   )
@@ -234,14 +231,16 @@ def test_belief_projection_features_and_tensor_lifecycle():
   belief.validate()
   projected = belief.to_actor_input()
   explicit = PosteriorInput(
-    RpvState(state.rotation, state.position, state.velocity), covariance[:, :9, :9]
+    RpvState(state.rotation, state.position, state.world_velocity),
+    covariance[:, :9, :9],
+    state=state,
   )
   references = ReferenceWindow(
     torch.zeros(2, 10, 29, dtype=covariance.dtype),
     torch.ones(2, 10, 29, dtype=covariance.dtype),
     state.rotation[:, None].expand(-1, 10, -1, -1),
     state.position[:, None].expand(-1, 10, -1),
-    state.velocity[:, None].expand(-1, 10, -1),
+    state.world_velocity[:, None].expand(-1, 10, -1),
   )
   actual = build_actor_features(
     EITInputConfig(group="C"), explicit.mean, projected, references

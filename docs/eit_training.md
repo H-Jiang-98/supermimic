@@ -1,4 +1,6 @@
-# EIT v6 模型与策略训练实现
+# 历史归档：EIT v6 模型与策略训练实现
+
+本页记录历史实验。当前分支的训练配置、启动及恢复命令见 [EIT v7 训练说明](../README_eit.md)。
 
 [配置教程](../README_eit.md) · [输入](eit_inputs.md) · [Replay](eit_replay.md) · [CUDA Graph](eit_cuda_graphs.md)
 

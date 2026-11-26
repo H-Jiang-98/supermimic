@@ -232,7 +232,7 @@ def test_real_cpu_checkpoint_live_reference_and_independent_restore(tmp_path):
   from tests.test_estimator_eit_inference import physical_runner
 
   checkpoint, reference = tmp_path / "training.pt", tmp_path / "live-reference.pt"
-  with physical_runner(tmp_path, "C") as runner:
+  with physical_runner(tmp_path, "belief") as runner:
     runner.cfg.estimator_inputs = replace(runner.cfg.estimator_inputs, mode="train")
     runner.cfg.mean = MeanFitCfg(num_batches=1, batch_size=2, window_frames=3)
     runner.cfg.cov = CovarianceFitCfg(batch_size=2, validation_pairs=4)

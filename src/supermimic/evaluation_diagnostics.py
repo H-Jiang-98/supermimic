@@ -151,9 +151,14 @@ class EpisodeRecorder:
     reference = rep.reference_window(
       command.motion, command.time_steps, command.reference_alignment
     )
-    goal, _, _ = build_motion_goal(
-      RpvState(truth.rotation, truth.position, truth.velocity), reference
-    )
+    if reference.local is None:
+      goal, _, _ = build_motion_goal(
+        RpvState(truth.rotation, truth.position, truth.world_velocity), reference
+      )
+    else:
+      from supermimic.local_control import privileged_goal
+
+      goal = privileged_goal(truth, reference)
     values = {
       "time_index": state.time_index,
       "full_state": obs["full_state"],

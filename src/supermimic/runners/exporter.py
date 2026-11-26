@@ -388,6 +388,15 @@ class _EITMotionActor(nn.Module):
     return hidden
 
 
+class _LocalEITMotionActor(nn.Module):
+  def __init__(self, actor):
+    super().__init__()
+    self.actor = actor
+
+  def forward(self, history, goal, condition):
+    return self.actor.decode_goal(self.actor.encode_goal(goal), history, condition)[0]
+
+
 def export_eit_actor(actor, env, wm, cfg, checkpoint_sha, path):
   """Export a fixed batch-one raw-action graph and embed the runtime contract."""
   import json
@@ -409,8 +418,11 @@ def export_eit_actor(actor, env, wm, cfg, checkpoint_sha, path):
   lower, upper = normalized_action_limits(env, 29)
   joint_term = env.unwrapped.action_manager.get_term("joint_pos")
   names = ["history", "goal"]
-  samples = [torch.zeros(1, 5, 93), torch.zeros(1, 700)]
-  if inputs.uses_uncertainty:
+  samples = [torch.zeros(1, 5, 93), torch.zeros(1, actor.task_specs[0].goal_dim)]
+  if inputs.local_control:
+    names.append("condition")
+    samples.append(torch.zeros(1, actor.condition_normalizer._mean.shape[-1] + 29))
+  elif inputs.uses_uncertainty:
     names.append("uncertainty")
     samples.append(torch.zeros(1, 450))
   contract = dict(
@@ -428,7 +440,18 @@ def export_eit_actor(actor, env, wm, cfg, checkpoint_sha, path):
       "joint_velocity",
       "previous_action",
     ],
-    goal_order=GOAL_BLOCK_ORDER,
+    goal_order=(
+      (
+        "heading_position",
+        "heading_rot6d",
+        "velocity_b",
+        "omega_b",
+        "joint_pos",
+        "joint_vel",
+      )
+      if inputs.local_control
+      else GOAL_BLOCK_ORDER
+    ),
     action_output="normalized_before_limits",
     joint_names=joint_term.target_names,
     joint_target_scale=scale.flatten().tolist(),
@@ -439,7 +462,12 @@ def export_eit_actor(actor, env, wm, cfg, checkpoint_sha, path):
   path.parent.mkdir(parents=True, exist_ok=True)
   with TemporaryDirectory(dir=path.parent) as staging:
     staged = _export_module(
-      _EITMotionActor(actor), tuple(samples), names, ["actions"], staging, "actor.onnx"
+      (_LocalEITMotionActor(actor) if inputs.local_control else _EITMotionActor(actor)),
+      tuple(samples),
+      names,
+      ["actions"],
+      staging,
+      "actor.onnx",
     )
     attach_metadata_to_onnx(
       staged, {"eit_contract": json.dumps(contract, allow_nan=False)}
@@ -455,7 +483,9 @@ class EITOnnxBackend:
 
     self.runtime = ReferenceEvaluator(model)
     self.inputs = {"history": "history", "goal": "goal_motion"}
-    if group == "C":
+    if group in ("mean", "belief"):
+      self.inputs["condition"] = "task_uncertainty"
+    elif group == "C":
       self.inputs["uncertainty"] = "task_uncertainty"
     if self.runtime.input_names != list(self.inputs) or self.runtime.output_names != [
       "actions"

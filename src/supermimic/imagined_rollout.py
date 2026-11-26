@@ -19,9 +19,9 @@ from supermimic.estimator import LieBeliefFilter
 from supermimic.estimator_inputs import (
   EpisodeAlignment,
   ReferenceWindow,
-  _validate_reference,
   build_actor_critic_goals_kernel,
   covariance_encoding_constants,
+  validate_reference_batch,
 )
 from supermimic.tasks.task_spec import build_actor_obs_td
 from supermimic.utils.lie_state import LieState
@@ -43,13 +43,20 @@ class PreparedRollout:
   state: ImaginedState
   estimator: LieBeliefFilter
   context: torch.Tensor
-  references: tuple[ReferenceWindow, ...]
-  bodies: tuple[tuple[torch.Tensor, ...], ...]
-  motion_times: tuple[torch.Tensor, ...]
+  reference: ReferenceWindow  # Flattened time-major reference batch.
+  bodies: tuple[torch.Tensor, ...]  # One (H+1, B, ...) tensor per body channel.
+  motion_times: torch.Tensor
   measurement_std: torch.Tensor
   actor_encoding: tuple | None
   critic_encoding: tuple | None
   critic_group: str
+
+  def reference_at(self, step):
+    batch = self.context.shape[0]
+    return self.reference.index(slice(step * batch, (step + 1) * batch))
+
+  def bodies_at(self, step):
+    return tuple(value[step] for value in self.bodies)
 
 
 @dataclass(frozen=True)
@@ -89,9 +96,6 @@ def prepare_rollout(env, start, horizon, process_noise, measurement_noise):
     ):
       raise ValueError(f"Invalid rollout {name} noise")
   aux, rep = env._unpack_initial_states(batch)
-  alignment = EpisodeAlignment(
-    batch["alignment_rotation"], batch["alignment_translation"]
-  )
   times = batch["motion_time"]
   ends = env.motion.motion_ends
   if (
@@ -104,19 +108,19 @@ def prepare_rollout(env, start, horizon, process_noise, measurement_noise):
   ):
     raise ValueError("Invalid reference clip ends")
   last = ends[torch.searchsorted(ends, times, right=True)] - 1
-  references, bodies, motion_times = [], [], []
-  truth = env.representation.true_rpv(aux, rep)
-  for step in range(horizon + 1):
-    current = torch.minimum(times + step, last)
-    reference = env.representation.reference_window(env.motion, current, alignment)
-    _validate_reference(truth, reference)
-    body = env._aligned_reference_bodies(env.motion.body_state(current), alignment)
-    if not all(torch.isfinite(value).all() for value in body):
-      raise ValueError("Reference bodies must be finite")
-    references.append(reference)
-    bodies.append(body)
-    motion_times.append(current)
+  grid = torch.minimum(
+    times + torch.arange(horizon + 1, device=times.device)[:, None], last
+  )
+  frames = grid.flatten()
+  alignment = EpisodeAlignment(
+    batch["alignment_rotation"].repeat(horizon + 1, 1, 1),
+    batch["alignment_translation"].repeat(horizon + 1, 1),
+  )
+  windows = env.representation.reference_window(env.motion, frames, alignment)
+  body = env._aligned_reference_bodies(env.motion.body_state(frames), alignment)
+  validate_reference_batch(windows, batch_size=frames.numel(), like=rep, bodies=body)
   config = env.estimator_input_config
+  local = config.local_control
   critic_config = env._eit_critic_config()
   if critic_config.group != config.group:
     raise ValueError("Critic group and input configuration disagree")
@@ -129,17 +133,17 @@ def prepare_rollout(env, start, horizon, process_noise, measurement_noise):
     ),
     env.posterior_provider.estimator,
     batch["sim_ctx"],
-    tuple(references),
-    tuple(bodies),
-    tuple(motion_times),
+    windows,
+    tuple(value.unflatten(0, grid.shape) for value in body),
+    grid,
     std,
     covariance_encoding_constants(
       rep, config.covariance_scales, config.covariance_std_floor
     )
-    if config.uses_uncertainty
+    if config.uses_uncertainty and not local
     else None,
     critic_feature_constants(rep, critic_config)
-    if critic_config.group != "A"
+    if critic_config.group != "A" and not local
     else None,
     critic_config.group,
   )
@@ -159,8 +163,9 @@ def observe(env, prepared, state, step):
     env.estimator_input_config,
     truth,
     state.belief.to_actor_input(),
-    prepared.references[step],
+    prepared.reference_at(step),
     prepared.actor_encoding,
+    prepared.context,
   )
   critic = build_critic_features_kernel(
     LieState.from_rep(state.aux, state.rep),
@@ -170,6 +175,7 @@ def observe(env, prepared, state, step):
     state.belief,
     group=prepared.critic_group,
     constants=prepared.critic_encoding,
+    actor_condition=uncertainty,
   )
   obs = build_actor_obs_td(
     {"motion": actor}, state.history, critic=critic, task_uncertainty=uncertainty
@@ -187,7 +193,7 @@ def imagine_step(env, prepared, state, actions, process_noise, measurement_noise
     executed,
     state.last_action,
     prepared.context,
-    prepared.bodies[step],
+    prepared.bodies_at(step),
     process_noise=process_noise,
   )
   sensor = env.representation.compute_actor_sensor(

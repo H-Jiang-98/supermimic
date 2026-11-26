@@ -1,0 +1,98 @@
+{
+  "eager": {
+    "device": "cpu",
+    "torch_version": "2.14.0+cu130",
+    "horizon": 8,
+    "microbatch": 4,
+    "compile": false,
+    "cuda_graphs": false,
+    "actor_hidden_dims": [
+      64,
+      32
+    ],
+    "critic_hidden_dims": [
+      256,
+      128
+    ],
+    "stepwise": {
+      "encoder_calls_per_microbatch": 8,
+      "median_full_update_ms": 310.3820192627609,
+      "samples_ms": [
+        308.17949306219816,
+        310.3820192627609,
+        317.6953727379441,
+        312.81081587076187,
+        306.38421420007944
+      ],
+      "peak_cuda_allocated_bytes": null
+    },
+    "batched": {
+      "encoder_calls_per_microbatch": 1,
+      "median_full_update_ms": 319.0292180515826,
+      "samples_ms": [
+        316.7022760026157,
+        323.6440010368824,
+        319.0292180515826,
+        316.92444905638695,
+        321.56667299568653
+      ],
+      "peak_cuda_allocated_bytes": null
+    },
+    "max_absolute_difference": {
+      "latent": 0.0,
+      "action": 0.0,
+      "returns": 0.0,
+      "encoders": 7.450580596923828e-09,
+      "decoder": 0.0,
+      "film": 0.0
+    }
+  },
+  "compiled": {
+    "device": "cpu",
+    "torch_version": "2.14.0+cu130",
+    "horizon": 8,
+    "microbatch": 4,
+    "compile": true,
+    "cuda_graphs": false,
+    "actor_hidden_dims": [
+      64,
+      32
+    ],
+    "critic_hidden_dims": [
+      256,
+      128
+    ],
+    "stepwise": {
+      "encoder_calls_per_microbatch": 8,
+      "median_full_update_ms": 226.82062024250627,
+      "samples_ms": [
+        226.82062024250627,
+        225.1984109170735,
+        227.3786747828126,
+        228.7548640742898,
+        226.09737794846296
+      ],
+      "peak_cuda_allocated_bytes": null
+    },
+    "batched": {
+      "encoder_calls_per_microbatch": 1,
+      "median_full_update_ms": 236.58349085599184,
+      "samples_ms": [
+        230.03498744219542,
+        237.6138591207564,
+        236.58349085599184,
+        236.54550826177,
+        236.70786898583174
+      ],
+      "peak_cuda_allocated_bytes": null
+    },
+    "max_absolute_difference": {
+      "latent": 0.0,
+      "action": 0.0,
+      "returns": 0.0,
+      "encoders": 2.2351741790771484e-08,
+      "decoder": 0.0,
+      "film": 0.0
+    }
+  }
+}

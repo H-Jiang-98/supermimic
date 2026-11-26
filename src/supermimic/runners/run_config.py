@@ -15,21 +15,28 @@ from supermimic.estimator_inputs import EITInputConfig, GaussianMeasurementConfi
 from supermimic.runners.eit_snapshots import checkpoint_snapshot_interval
 from supermimic.runners.supermimic_runner import SuperMimicRunnerCfg
 
-EIT_TRAINING_VERSION = "eit_model_training_v4"
-EIT_POLICY_TRAINING_VERSION = "eit_training_v6"
+EIT_TRAINING_VERSION = "eit_model_training_v5"
+EIT_POLICY_TRAINING_VERSION = "eit_training_v7"
 _LEGACY_POLICY_VERSION = "eit_training_v5"
-EIT_INITIALIZATION_VERSION = "eit_initialization_v4"
+EIT_INITIALIZATION_VERSION = "eit_initialization_v5"
 
 
 def validate_eit_checkpoint_contract(
-  saved: dict, *, stage: str | None = None, for_inference: bool = False
+  saved: dict,
+  *,
+  stage: str | None = None,
+  for_inference: bool = False,
+  archived_pilot: bool = False,
 ) -> None:
   """Validate the EIT format and the joint trainer's critic layout before loading."""
   version = saved.get("version") if isinstance(saved, dict) else None
   legacy = for_inference and version == _LEGACY_POLICY_VERSION
-  if version not in (EIT_TRAINING_VERSION, EIT_POLICY_TRAINING_VERSION) and not legacy:
+  archive = archived_pilot and version == "eit_training_v6"
+  if version not in (EIT_TRAINING_VERSION, EIT_POLICY_TRAINING_VERSION) and not (
+    legacy or archive
+  ):
     raise ValueError(
-      f"Expected {EIT_TRAINING_VERSION} or {EIT_POLICY_TRAINING_VERSION} checkpoint"
+      f"Expected {EIT_TRAINING_VERSION} or {EIT_POLICY_TRAINING_VERSION} checkpoint, got {version!r}"
     )
   if saved["version"] == EIT_TRAINING_VERSION:
     checkpoint_snapshot_interval(saved)
@@ -64,7 +71,12 @@ def validate_eit_checkpoint_contract(
       compatible = (
         kind == "policy"
         and (
-          saved.get("posterior_replay_protocol") == POSTERIOR_REPLAY_VERSION
+          saved.get("posterior_replay_protocol")
+          == (
+            "incremental_posterior_sqrt_tril_f32_v2"
+            if archive
+            else POSTERIOR_REPLAY_VERSION
+          )
           or for_inference
           and saved.get("posterior_replay_protocol")
           == "incremental_posterior_tril_f32_v1"
@@ -84,6 +96,8 @@ def validate_eit_checkpoint_contract(
       raise ValueError("Model-stage checkpoint contains policy training state")
     return
   critic_version = "eit_rpv_belief_critic_v2" if legacy else CRITIC_INPUT_VERSION
+  if archive:
+    critic_version = "eit_rpv_belief_critic_v3"
   error = f"EIT checkpoint requires the {critic_version} critic contract"
   try:
     contract = saved["critic"]["contract"]
@@ -98,6 +112,19 @@ def validate_eit_checkpoint_contract(
       ):
         raise ValueError(error)
       config_data["version"] = CRITIC_INPUT_VERSION
+    if archive:
+      if (
+        config_data["version"] != critic_version
+        or config_data["group"] not in ("A", "B", "C")
+        or config_data["tangent_version"] != "right_se23_theta_rho_nu_omega_q_qdot_v1"
+      ):
+        raise ValueError(error)
+      # The archived A/B/C critic layout has the same widths. Validate its
+      # stored identifiers above before reusing the numeric width/scale checks.
+      config_data.update(
+        version=CRITIC_INPUT_VERSION,
+        tangent_version=CriticInputConfig().tangent_version,
+      )
     config = CriticInputConfig(**config_data)
     group = saved["runner_config"]["estimator_inputs"]["group"]
     context_dim = contract["context_dim"]

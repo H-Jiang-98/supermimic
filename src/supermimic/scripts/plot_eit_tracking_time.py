@@ -25,6 +25,9 @@ LABELS = {
 
 
 def load_curves(root, variant="A-posterior"):
+  from supermimic.validation.config import PRE_FAILURE_VERSIONS
+  from supermimic.validation.report import available_mean, validate_score_support
+
   manifest = json.loads((root / "manifest.json").read_text())
   motions = {m["name"]: m["frames"] for m in manifest["motions"]}
   contexts = manifest["config"]["num_domain_contexts"]
@@ -40,10 +43,10 @@ def load_curves(root, variant="A-posterior"):
     indices = [meta["metric_names"].index(key) for key in LABELS]
     with np.load(path.with_suffix(".npz")) as data:
       scores = data["bins"][:, :, indices]
-      if (
-        data["bin_counts"].sum() != motions[name]
-        or not np.all(data["valid_frame_counts"] == motions[name])
-        or not np.isfinite(scores).all()
+      validate_score_support(manifest, meta, data)
+      if data["bin_counts"].sum() != motions[name] or (
+        manifest["version"] not in PRE_FAILURE_VERSIONS
+        and not np.all(data["valid_frame_counts"] == motions[name])
       ):
         raise ValueError(f"Incomplete scores: {name}")
       rows = clips.setdefault(name, {})
@@ -56,7 +59,7 @@ def load_curves(root, variant="A-posterior"):
   ):
     raise ValueError("Expected all clips and contexts in the manifest")
   names = sorted(clips)
-  curves = [np.mean(list(clips[name].values()), axis=0) for name in names]
+  curves = [available_mean(np.stack(list(clips[name].values()))) for name in names]
   return names, width, pad_curves(curves)
 
 
@@ -71,7 +74,10 @@ def plot_curves(names, width, values, folder, variant, dpi):
   folder.mkdir(parents=True, exist_ok=True)
   t = np.arange(values.shape[1]) * width
   count = np.isfinite(values[:, :, 0]).sum(axis=0)
-  low, med, high = np.nanpercentile(values, [25, 50, 75], axis=0)
+  bands = np.full((3, *values.shape[1:]), np.nan)
+  if (count > 0).any():
+    bands[:, count > 0] = np.nanpercentile(values[:, count > 0], [25, 50, 75], axis=0)
+  low, med, high = bands
   ink, band = "#124967", "#8ad2cf"
   fig = plt.figure(figsize=(13, 13), layout="constrained")
   grid = fig.add_gridspec(5, 2, height_ratios=[1, 1, 1, 1, 0.42])

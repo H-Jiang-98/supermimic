@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from supermimic.belief_provider import BeliefProvider
+from supermimic.posterior_replay import pack_mean
 from supermimic.replay_buffer import ReplayBuffer
 from supermimic.runners.supermimic_runner import InputStagePolicy, build_actor
 from tests.test_estimator_belief_integration import BATCH, setup_env
@@ -76,7 +77,7 @@ def test_restore_real_heads_before_collection_and_after_partial_reset():
     for i, row in enumerate(expected_head_rows):
       recorded, _ = runner.replay_buffer.episode_prefix(episodes[row].item(), 0)
       torch.testing.assert_close(
-        recorded.mean.to_full(), snapshot["head_priors"]["mean"][i]
+        pack_mean(recorded.mean), snapshot["head_priors"]["mean"][i]
       )
     runner.wm_env.reset(episode_id=episodes, time_index=times)
     for row in expected_head_rows:

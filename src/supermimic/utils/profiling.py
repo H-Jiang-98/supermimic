@@ -66,7 +66,7 @@ class StreamTimer:
     return totals
 
 
-def runtime_metadata(parameter, *, reset_peak=False):
+def runtime_metadata(parameter, *, reset_peak=False, synchronize=True):
   device = parameter.device
   result = {
     "device": str(device),
@@ -74,7 +74,7 @@ def runtime_metadata(parameter, *, reset_peak=False):
     "cpu_threads": torch.get_num_threads(),
     "cpu_interop_threads": torch.get_num_interop_threads(),
     "torch_version": str(torch.__version__),
-    "cuda_synchronized": device.type == "cuda",
+    "cuda_synchronized": device.type == "cuda" and synchronize,
     "cuda_peak_allocated_bytes": None,
     "cuda_peak_reserved_bytes": None,
     "cuda_allocated_bytes": None,
@@ -89,7 +89,8 @@ def runtime_metadata(parameter, *, reset_peak=False):
     "cuda_total_bytes": None,
   }
   if device.type == "cuda":
-    torch.cuda.synchronize(device)
+    if synchronize:
+      torch.cuda.synchronize(device)
     if reset_peak:
       torch.cuda.reset_peak_memory_stats(device)
     stats = torch.cuda.memory_stats(device)

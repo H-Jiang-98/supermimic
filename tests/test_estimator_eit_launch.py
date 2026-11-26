@@ -1,6 +1,8 @@
 import asyncio
 import json
 import sys
+import tomllib
+from pathlib import Path
 
 import pytest
 
@@ -19,8 +21,8 @@ def config():
     },
     "training": {"mean_lr": 0.003, "hidden_dims": [32, 16]},
     "methods": {
-      "A": {"gpus": [3, 1], "seeds": [9, 2, 4]},
-      "C": {"gpus": [1], "seeds": [2, 5]},
+      "mean": {"gpus": [3, 1], "seeds": [9, 2, 4]},
+      "belief": {"gpus": [1], "seeds": [2, 5]},
     },
   }
 
@@ -96,14 +98,14 @@ with busy.open("x"):
   assert args[args.index("--hidden-dims")+1:args.index("--hidden-dims")+3] == ["32", "16"]
   init = Path(value("--initialization"))
   if "--prepare-initialization" in args:
-    assert value("--group") == "B"
+    assert value("--group") == "mean"
     init.parent.mkdir(parents=True, exist_ok=True)
     init.touch(exist_ok=False)
   else:
     group, seed = value("--group"), value("--seed")
     assert init.is_file() and init.stem == f"seed{seed}"
     output = Path(value("--output"))
-    assert output == root / "ckpt/walk" / f"seed{seed}" / group
+    assert output == root / "ckpt/walk" / f"seed{seed}" / f"{group}-direct"
     with (root / f"jobs-{gpu}").open("a") as log:
       print(json.dumps([group, int(seed)]), file=log)
   time.sleep(.02)
@@ -117,8 +119,8 @@ busy.unlink()
     for f in tmp_path.glob("jobs-*")
   }
   assert jobs == {
-    "jobs-3": [["A", 9], ["A", 4]],
-    "jobs-1": [["A", 2], ["C", 2], ["C", 5]],
+    "jobs-3": [["mean", 9], ["mean", 4]],
+    "jobs-1": [["mean", 2], ["belief", 2], ["belief", 5]],
   }
   assert len(list((tmp_path / "ckpt/walk/init").glob("*.pt"))) == 4
 
@@ -133,9 +135,58 @@ busy.unlink()
   ],
 )
 def test_invalid_method(config, tmp_path, key, value):
-  config["methods"]["A"][key] = value
-  with pytest.raises(ValueError, match=rf"methods\.A\.{key}"):
+  config["methods"]["mean"][key] = value
+  with pytest.raises(ValueError, match=rf"methods\.mean\.{key}"):
     plan(config, tmp_path)
+
+
+@pytest.mark.parametrize("group", ["A", "B", "C"])
+def test_retired_groups_rejected_by_launcher_and_worker(
+  config, tmp_path, monkeypatch, group
+):
+  from supermimic.scripts import train_eit
+
+  config["methods"] = {group: {"gpus": [0], "seeds": [1]}}
+  with pytest.raises(ValueError, match="EIT method"):
+    plan(config, tmp_path)
+  monkeypatch.setattr(
+    sys, "argv", ["train_eit", "--group", group, "--motion-file", "unused.npz"]
+  )
+  with pytest.raises(SystemExit) as rejected:
+    train_eit.main()
+  assert rejected.value.code == 2
+
+
+def test_checked_in_v7_config_has_four_variants_per_seed():
+  root = Path(__file__).resolve().parents[1]
+  with (root / "train_eit_v7.toml").open("rb") as stream:
+    config = tomllib.load(stream)
+  _, _, (prepare, train) = plan(config, root)
+
+  def commands(queues):
+    return [cmd for jobs in queues.values() for cmd in jobs]
+
+  jobs = commands(train)
+  by_seed = {}
+  for cmd in jobs:
+    seed = cmd[cmd.index("--seed") + 1]
+    group = cmd[cmd.index("--group") + 1]
+    mode = "residual" if "--residual-actor" in cmd else "direct"
+    assert Path(cmd[cmd.index("--output") + 1]).name == f"{group}-{mode}"
+    by_seed.setdefault(seed, []).append((group, mode))
+  assert by_seed and all(
+    sorted(variants)
+    == [
+      ("belief", "direct"),
+      ("belief", "residual"),
+      ("mean", "direct"),
+      ("mean", "residual"),
+    ]
+    for variants in by_seed.values()
+  )
+  assert sorted(cmd[cmd.index("--seed") + 1] for cmd in commands(prepare)) == sorted(
+    by_seed
+  )
 
 
 def test_output_cannot_be_overridden_by_training_options(config, tmp_path):

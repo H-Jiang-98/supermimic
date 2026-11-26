@@ -89,8 +89,10 @@ class BeliefState:
 
   def to_actor_input(self) -> PosteriorInput:
     return PosteriorInput(
-      RpvState(self.mean.rotation, self.mean.position, self.mean.velocity),
+      RpvState(self.mean.rotation, self.mean.position, self.mean.world_velocity),
       self.covariance_rpv,
+      self.mean,
+      self.covariance_sqrt,
     )
 
   @property
@@ -138,7 +140,16 @@ def to_actor_input(belief: BeliefState) -> PosteriorInput:
 class GaussianStatePrior:
   """Initialization noise in right-local theta, rho, nu, omega, q, qdot units."""
 
-  std: tuple[float, ...] = (0.01, 0.01, 0.05, 0.05, 0.005, 0.05)
+  std: tuple[float, ...] = (0.03, 0.03, 0.20, 0.12, 0.006, 0.30)
+
+  names = (
+    "attitude",
+    "position",
+    "body_linear_velocity",
+    "angular_velocity",
+    "joint_position",
+    "joint_velocity",
+  )
 
   def __post_init__(self):
     if len(self.std) != 6 or any(not math.isfinite(s) or s <= 0 for s in self.std):

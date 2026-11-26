@@ -55,7 +55,7 @@ def parse_args(argv=None):
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--device", default="cpu")
   parser.add_argument(
-    "--groups", nargs="+", choices=("A", "B", "C"), default=["A", "B", "C"]
+    "--groups", nargs="+", choices=("mean", "belief"), default=["mean", "belief"]
   )
   parser.add_argument("--full-width", action="store_true")
   parser.add_argument("--policy-horizon", "--horizon", type=int, default=4)

@@ -1,0 +1,76 @@
+[paths]
+environment_root = "/mnt/cpfs/zbl-cpfs-new/USERS/leojiang/supermimic_ws" # 使用 .venv/bin/python
+dataset_root = "/mnt/cpfs/zbl-cpfs-new/dataset/leojiang/supermimic_ws"
+motion_file = "motions/*.npz" # 相对 dataset_root；支持单个 NPZ 或 glob。
+checkpoint_root = "/mnt/cpfs/zbl-cpfs-new/CKPT/leojiang/supermimic_ws"
+experiment = "eit_v7_local_Lafan_compiled_h32_2048envs_stride1" # 输出：checkpoint_root/experiment/seed<seed>/<方法>/
+
+[training]
+jacobian_backend = "increment" # 35 维网络增量求导，再通过积分组装 70x70 Jacobian。
+eager = false # CUDA 默认编译训练热点，true 用于 eager 对照。
+policy_cuda_graphs = true # 完整 actor–critic 更新单图回放；actor 尾批整次回退，eager=true 关闭。
+num_envs = 2048
+max_iterations = 300_000 # 每个环境的累计物理步数
+buffer_size = 1000
+replay_ratio = 16
+sampling_mode = "return"
+log_interval = 10
+save_interval = 1000
+posterior_save_stride = 1
+
+mean_lr = 2e-4
+mean_updates = 10
+mean_batch_size = 2048
+mean_window_frames = 8
+cov_lr = 2e-4
+cov_batch_size = 8192
+# cov_pair_budget = 143360 # 省略时按 mean_updates × mean_batch_size × (mean_window_frames − 1) 推导
+
+policy_lr = 2e-4
+critic_lr = 2e-4
+policy_updates = 1
+policy_batch_size = 2048
+policy_microbatch_size = 1024
+policy_horizon = 32
+samples = 1
+critic_epochs = 5
+critic_minibatches = 4
+# critic_microbatch_size = 128
+exploration = 0.0 # std of action noise
+mean_hidden_dims = [2048, 2048, 2048] # World model mean head
+cov_hidden_dims = [128, 64] # World model process covariance head
+actor_hidden_dims = [2048, 1024, 512, 256]
+critic_hidden_dims = [256, 128]
+jacobian_batch_chunk_size = 512
+
+# 仅划分 world model fitting 的训练/在线验证数据；policy 使用所有有效后验起点。
+# 验证与训练均从有效窗口/相邻转移对中均匀、有放回抽样。
+["wm validation"]
+validation_stride = 5 # episode_id % validation_stride == 0 留作 world model 验证；>= 2。
+validation_batch_size = 4 # 每组验证窗口数；窗口长度沿用 training.mean_window_frames。
+cov_validation_pairs = 8192 # 每组验证相邻转移对数量。
+
+[env.sim.mujoco]
+iterations = 20 # 当前任务默认：10； 约束求解器的外层迭代上限。
+ls_iterations = 50 # 当前任务默认：20；每次线搜索的迭代上限。
+
+# 使用 nvidia-smi 的物理 GPU 编号。每个方法的 seeds 按顺序轮流分给 gpus。
+# 方法可共用 GPU；每张卡同时只跑一个进程。删除整个方法表即可跳过该方法。
+
+[initial_belief]
+attitude = 0.03
+position = 0.03
+body_linear_velocity = 0.20
+angular_velocity = 0.12
+joint_position = 0.006
+joint_velocity = 0.30
+
+[methods.mean]
+gpus = [0]
+seeds = [2027]
+residual_actor = [false, true]
+
+[methods.belief]
+gpus = [1]
+seeds = [2027]
+residual_actor = [false, true]

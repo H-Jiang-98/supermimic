@@ -151,7 +151,7 @@ def test_real_record_checkpoint_identity_and_optional_imagined_rollout(tmp_path)
   recording = tmp_path / "record.pt"
   motion = tmp_path / "motion.npz"
   model_checkpoint = tmp_path / "model.pt"
-  with physical_runner(tmp_path, "B") as runner:
+  with physical_runner(tmp_path, "mean") as runner:
     runner.cfg.estimator_inputs = replace(runner.cfg.estimator_inputs, mode="train")
     BeliefModelTraining(runner).save(model_checkpoint)
     EITTraining(runner).save(checkpoint)

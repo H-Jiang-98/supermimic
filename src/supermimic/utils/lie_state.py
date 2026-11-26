@@ -1,4 +1,4 @@
-"""Right-local geometry for the G1 state on SE_2(3) x R^61.
+"""Right-local geometry for the G1 state on SE(3) x R^64.
 
 The 71-vector interchange format uses wxyz quaternions, world linear velocity,
 and body angular velocity. The 70-vector tangent is (theta, rho, nu, omega,
@@ -18,8 +18,8 @@ from supermimic.utils.validation import validate_rotation
 NUM_JOINTS = 29
 FULL_STATE_DIM = 71
 TANGENT_DIM = 70
-STATE_LAYOUT_VERSION = "gencoord71_v1"
-TANGENT_VERSION = "right_se23_theta_rho_nu_omega_q_qdot_v1"
+STATE_LAYOUT_VERSION = "gencoord71_world_io_body_state_v2"
+TANGENT_VERSION = "right_se3_additive_body_twist_q_qdot_v2"
 
 
 def skew(vector: torch.Tensor) -> torch.Tensor:
@@ -171,14 +171,19 @@ class LieState:
   def from_full(cls, full: torch.Tensor) -> LieState:
     if full.shape[-1] != FULL_STATE_DIM:
       raise ValueError("G1 full state must have 71 components")
+    rotation = _matrix_from_quat(full[..., 3:7])
     return cls(
-      _matrix_from_quat(full[..., 3:7]),
+      rotation,
       full[..., :3],
-      full[..., 36:39],
+      _mv(rotation.mT, full[..., 36:39]),
       full[..., 39:42],
       full[..., 7:36],
       full[..., 42:71],
     )
+
+  @property
+  def world_velocity(self) -> torch.Tensor:
+    return _mv(self.rotation, self.velocity)
 
   def to_full(self) -> torch.Tensor:
     return torch.cat(
@@ -186,7 +191,7 @@ class LieState:
         self.position,
         matrix_to_quat(self.rotation),
         self.joint_pos,
-        self.velocity,
+        self.world_velocity,
         self.omega,
         self.joint_vel,
       ),
@@ -203,7 +208,7 @@ class LieState:
     return cls(
       rotation,
       position,
-      _mv(rotation, rep[..., 4:7]),
+      rep[..., 4:7],
       rep[..., 7:10],
       rep[..., 10:39],
       rep[..., 39:68],
@@ -211,14 +216,13 @@ class LieState:
 
   def to_rep(self) -> tuple[torch.Tensor, torch.Tensor]:
     aux = torch.cat((self.position, matrix_to_quat(self.rotation)), -1)
-    inverse_rotation = self.rotation.transpose(-1, -2)
     # R.T @ (0,0,-1), avoiding an allocated/broadcasted gravity vector.
     gravity = -self.rotation[..., 2, :]
     rep = torch.cat(
       (
         self.position[..., 2:3],
         gravity,
-        _mv(inverse_rotation, self.velocity),
+        self.velocity,
         self.omega,
         self.joint_pos,
         self.joint_vel,
@@ -259,7 +263,7 @@ def compose(left: LieState, right: LieState) -> LieState:
   return LieState(
     left.rotation @ right.rotation,
     left.position + _mv(left.rotation, right.position),
-    left.velocity + _mv(left.rotation, right.velocity),
+    left.velocity + right.velocity,
     left.omega + right.omega,
     left.joint_pos + right.joint_pos,
     left.joint_vel + right.joint_vel,
@@ -271,7 +275,7 @@ def inverse(state: LieState) -> LieState:
   return LieState(
     rotation,
     -_mv(rotation, state.position),
-    -_mv(rotation, state.velocity),
+    -state.velocity,
     -state.omega,
     -state.joint_pos,
     -state.joint_vel,
@@ -286,7 +290,7 @@ def exp(delta: torch.Tensor) -> LieState:
   return LieState(
     so3_exp(theta),
     _mv(jacobian, delta[..., 3:6]),
-    _mv(jacobian, delta[..., 6:9]),
+    delta[..., 6:9],
     delta[..., 9:12],
     delta[..., 12:41],
     delta[..., 41:70],
@@ -300,7 +304,7 @@ def log(state: LieState) -> torch.Tensor:
     (
       theta,
       _mv(jacobian_inverse, state.position),
-      _mv(jacobian_inverse, state.velocity),
+      state.velocity,
       state.omega,
       state.joint_pos,
       state.joint_vel,
@@ -320,7 +324,7 @@ def local_error(base: LieState, state: LieState) -> torch.Tensor:
     LieState(
       inverse_rotation @ state.rotation,
       _mv(inverse_rotation, state.position - base.position),
-      _mv(inverse_rotation, state.velocity - base.velocity),
+      state.velocity - base.velocity,
       state.omega - base.omega,
       state.joint_pos - base.joint_pos,
       state.joint_vel - base.joint_vel,
@@ -331,7 +335,7 @@ def local_error(base: LieState, state: LieState) -> torch.Tensor:
 def reset_jacobian(delta: torch.Tensor) -> torch.Tensor:
   """d Log(Exp(-delta) Exp(delta+e)) / de at zero, including cross blocks.
 
-  Closed-form SE(3) cross blocks also apply independently to rho and nu.
+  Only the six pose coordinates require a chart reset.
   See Sola et al., A micro Lie theory, Eq. (149):
   https://arxiv.org/abs/1812.01537
   All branches are tensor selections; no adaptive matrix_exp or host reads.
@@ -401,19 +405,18 @@ def reset_jacobian(delta: torch.Tensor) -> torch.Tensor:
   zero = torch.zeros_like(cross)
   right_jacobian = torch.cat(
     (
-      torch.cat((rotation, zero, zero), -1),
-      torch.cat((translation(delta[..., 3:6]), rotation, zero), -1),
-      torch.cat((translation(delta[..., 6:9]), zero, rotation), -1),
+      torch.cat((rotation, zero), -1),
+      torch.cat((translation(delta[..., 3:6]), rotation), -1),
     ),
     -2,
   )
-  trailing = TANGENT_DIM - 9
+  trailing = TANGENT_DIM - 6
   upper = torch.cat(
-    (right_jacobian, delta.new_zeros(*delta.shape[:-1], 9, trailing)), -1
+    (right_jacobian, delta.new_zeros(*delta.shape[:-1], 6, trailing)), -1
   )
   lower = torch.cat(
     (
-      delta.new_zeros(*delta.shape[:-1], trailing, 9),
+      delta.new_zeros(*delta.shape[:-1], trailing, 6),
       _eye(trailing, delta).expand(*delta.shape[:-1], trailing, trailing),
     ),
     -1,

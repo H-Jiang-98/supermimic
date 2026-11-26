@@ -26,8 +26,7 @@ from supermimic.critic_inputs import BeliefCritic, critic_state_features
 from supermimic.envs.world_model_env import BeliefRolloutStart
 from supermimic.estimator_inputs import (
   EpisodeAlignment,
-  RpvState,
-  normalization_motion_goals,
+  build_actor_critic_goals,
 )
 from supermimic.learners.belief_policy_learner import (
   BeliefActorCriticPolicyLearner,
@@ -35,7 +34,10 @@ from supermimic.learners.belief_policy_learner import (
   policy_metrics_for_json,
 )
 from supermimic.models import _CudaGraphNormalization
-from supermimic.posterior_replay import POSTERIOR_REPLAY_VERSION, unpack_mean
+from supermimic.posterior_replay import (
+  POSTERIOR_REPLAY_VERSION,
+  unpack_belief,
+)
 from supermimic.representations import GenCoordRepresentation
 from supermimic.runners.belief_training import (
   BeliefModelTraining,
@@ -51,7 +53,6 @@ from supermimic.runners.supermimic_runner import (
   Ratio,
   SuperMimicRunner,
   actor_checkpoint,
-  build_ablation_actors,
   build_actor,
   load_actor_checkpoint,
 )
@@ -158,6 +159,11 @@ class EITTraining(BeliefModelTraining):
   ):
     if runner.replay_buffer.replay_mode != "full":
       raise ValueError("EIT policy starts require full replay")
+    if (
+      runner.cfg.estimator_inputs is None
+      or not runner.cfg.estimator_inputs.local_control
+    ):
+      raise ValueError("EIT v7 training requires the mean or belief group")
     if (
       runner.cfg.replay_ratio != 0
       and runner.replay_buffer.buffer_size < runner.cfg.mean.window_frames
@@ -277,30 +283,32 @@ class EITTraining(BeliefModelTraining):
     if not count:
       return starts
 
-    replay.finish_collection_round()
-    inputs = env.estimator_input_config
-    assert inputs is not None
     live = (
       self.actor.obs_normalizer,
       cast(_CudaGraphNormalization, self.actor.goal_normalizers["motion"]),
       *cast(BeliefCritic, self.policy.critic).normalizers(),
+      self.actor.condition_normalizer,
     )
     staged = deepcopy(live)
     for module in staged:
       module.train()
     storage = replay._storage.select(
-      "state", "actor_obs", "motion_time", "alignment_rotation", "alignment_translation"
+      "state",
+      "actor_obs",
+      "sim_ctx",
+      "motion_time",
+      "alignment_rotation",
+      "alignment_translation",
     )
     rows, slots, pslots = fresh_locations
     try:
       with timer.measure("posterior_cache_read_seconds"):
         batch = cast(TensorDict, storage[rows, slots])
-        posterior = None
-        if inputs.uses_posterior:
-          mean = unpack_mean(cache.storage["posterior_mean"][rows, pslots]).to(
-            dtype=batch["state"].dtype
-          )
-          posterior = RpvState(mean.rotation, mean.position, mean.velocity)
+        posterior = unpack_belief(
+          cache.storage["posterior_mean"][rows, pslots],
+          cache.storage["posterior_sqrt_tril"][rows, pslots],
+          dtype=batch["state"].dtype,
+        ).to_actor_input()
       values = self._normalization_inputs(batch, posterior)
       for module, value in zip(staged, values, strict=True):
         module.update(value)
@@ -317,7 +325,7 @@ class EITTraining(BeliefModelTraining):
       self.policy.critic.eval()
 
   def _normalization_inputs(self, batch, posterior):
-    """Construct the five fitted channels in actor/critic normalizer order."""
+    """Construct the fitted channels in actor/critic normalizer order."""
     env = self.runner.wm_env
     representation, motion = (
       cast(GenCoordRepresentation, env.representation),
@@ -338,12 +346,18 @@ class EITTraining(BeliefModelTraining):
     reference = representation.reference_window(motion, times, alignment)
     aux = representation.extract_aux_state(state)
     rep = representation.represent(state)
-    actor_goal, critic_goal = normalization_motion_goals(
-      representation.true_rpv(aux, rep), posterior, reference
+    truth = LieState.from_rep(aux, rep)
+    goal, condition, critic_goal = build_actor_critic_goals(
+      env.estimator_input_config, truth, posterior, reference, batch["sim_ctx"]
     )
-    critic_state = critic_state_features(LieState.from_rep(aux, rep))
-    # Both history normalizers count only the latest physical measurement.
-    return sensor, actor_goal, critic_state, critic_goal, sensor
+    return (
+      sensor,
+      goal,
+      critic_state_features(truth),
+      critic_goal,
+      sensor,
+      condition[..., :-29],
+    )
 
   def policy_episode_ids(self) -> list[int]:
     """Include all retained episodes, including model validation and singletons."""
@@ -403,8 +417,8 @@ class EITTraining(BeliefModelTraining):
   @staticmethod
   def _check_checkpoint_version(state: dict) -> None:
     validate_eit_checkpoint_contract(state, stage="policy")
-    if state.get("version") != EIT_POLICY_TRAINING_VERSION:
-      raise ValueError("EIT step training requires the current checkpoint protocol")
+    if state["runner_config"]["estimator_inputs"]["group"] not in ("mean", "belief"):
+      raise ValueError("EIT v7 training requires the mean or belief group")
 
   def load_state_dict(self, state: dict) -> None:
     self._check_checkpoint_version(state)
@@ -580,7 +594,7 @@ class EITTraining(BeliefModelTraining):
   def run_step(self) -> dict:
     """One physical collection step and every group due under the common Ratio."""
     runner, learner = self.runner, self.learner
-    timer = PhaseTimer(runner.device)
+    timer = StreamTimer(runner.device)
     if not self._ready:
       self.refresh_collection()
     with timer.measure("physical_collection_seconds"):
@@ -588,7 +602,6 @@ class EITTraining(BeliefModelTraining):
     step = self.collected_steps
     self.collected_steps += 1
     self.collected_frames += runner.env.num_envs
-    runner.finish_collection_round()
     # Count new physical inputs exactly once, including during warmup and steps
     # with zero training groups. Multiple groups below see frozen normalization.
     with timer.measure("model_normalization_seconds"):
@@ -598,15 +611,19 @@ class EITTraining(BeliefModelTraining):
     self.update_input_normalization()
     due = self.should_train(step)
     logs = []
+    update_seconds = {}
     if due:
+      runner.finish_collection_round()
       lengths = runner.replay_buffer.training_episode_lengths()
       train_ids = [e for e in lengths if e % self.cfg.validation_stride]
       valid_ids = [e for e in lengths if not e % self.cfg.validation_stride]
-      windows, _, _, held_out = runner.replay_buffer.model_fit_starts(
+      fit_starts = runner.replay_buffer.model_fit_starts(
         train_ids, valid_ids, learner.mean_cfg.window_frames
       )
       ready = bool(
-        len(windows) and len(held_out) and self._cache_budget["available_policy_starts"]
+        len(fit_starts[0])
+        and len(fit_starts[3])
+        and self._cache_budget["available_policy_starts"]
       )
       if not ready:
         self.skipped_update_groups += due
@@ -619,13 +636,14 @@ class EITTraining(BeliefModelTraining):
               valid_ids,
               fresh[:0],
               self.cfg.validation_batch_size,
+              fit_starts=fit_starts,
             )
           for name, seconds in learner.last_profile.items():
-            timer.seconds[name] = timer.seconds.get(name, 0.0) + seconds
+            update_seconds[name] = update_seconds.get(name, 0.0) + seconds
           with timer.measure("policy_seconds"):
             policy = self._update_policy()
           for name, seconds in self._policy_profile.items():
-            timer.seconds[name] = timer.seconds.get(name, 0.0) + seconds
+            update_seconds[name] = update_seconds.get(name, 0.0) + seconds
           self.update_groups += 1
           logs.append(
             {
@@ -659,8 +677,8 @@ class EITTraining(BeliefModelTraining):
       "updates": logs,
       "normalization_samples": self._cache_budget["normalization_samples"],
       "profiling": {
-        "seconds": {**timer.seconds, **self._normalization_profile},
-        "runtime": runtime_metadata(next(self.actor.parameters()))
+        "seconds": {**timer.seconds(), **update_seconds, **self._normalization_profile},
+        "runtime": runtime_metadata(next(self.actor.parameters()), synchronize=False)
         | {"policy_cuda_graph": self.policy.graph_status},
       },
     }
@@ -1018,7 +1036,7 @@ class EITTraining(BeliefModelTraining):
       return history
 
   def initialization_bundle(self) -> dict:
-    """Export explicit, independently allocated common A/B/C initial weights."""
+    """Export explicit, independently allocated common mean/belief initial weights."""
     if (
       self.update_groups
       or self.learner.mean_steps
@@ -1028,45 +1046,26 @@ class EITTraining(BeliefModelTraining):
     ):
       raise ValueError("Common initialization can only be exported before training")
     runner = self.runner
-    source = self.actor
-    parameter = next(source.parameters())
-    # Creating the shared file must leave the same collection RNG as loading it.
-    with torch.random.fork_rng(devices=[parameter.device] if parameter.is_cuda else []):
-      actors = build_ablation_actors(runner.cfg, runner._wm, runner.device)
-      for actor in actors.values():
-        actor.to(parameter)
-        actor.copy_common_initialization_from(source)
-      critics = {}
-      for group in ("A", "B", "C"):
-        critic = BeliefCritic(
-          group, runner._sim_context.output_dim, runner.cfg.critic_hidden_dims
-        ).to(parameter)
-        critic.copy_common_initialization_from(self.policy.critic)
-        critics[group] = critic
-    # B/C include identical extra belief columns even when the source was A.
-    critics["C"].copy_common_initialization_from(critics["B"])
-    world_model = runner._wm.bundle()
-    # Shared initial weights retain their v3 identity across training protocols.
+    actors, critics = {}, {}
+    for group in ("mean", "belief"):
+      # The two local controllers differ only in how they use these weights.
+      inputs = replace(runner.cfg.estimator_inputs, group=group, residual_actor=False)
+      actors[group] = deepcopy(
+        actor_checkpoint(self.actor, replace(runner.cfg, estimator_inputs=inputs))
+      )
+      critic = self.policy.critic.checkpoint()
+      critic["contract"]["config"]["group"] = group
+      critics[group] = critic
+    world_model = deepcopy(runner._wm.bundle())
     world_model["dynamics"].pop("model_revision", None)
-    return deepcopy(
-      {
-        "version": EIT_INITIALIZATION_VERSION,
-        "generation_group": runner.cfg.estimator_inputs.group,
-        "generation_seed": self.training_seed,
-        "world_model": world_model,
-        "actors": {
-          group: actor_checkpoint(
-            actor,
-            replace(
-              runner.cfg,
-              estimator_inputs=replace(runner.cfg.estimator_inputs, group=group),
-            ),
-          )
-          for group, actor in actors.items()
-        },
-        "critics": {group: critic.checkpoint() for group, critic in critics.items()},
-      }
-    )
+    return {
+      "version": EIT_INITIALIZATION_VERSION,
+      "generation_group": runner.cfg.estimator_inputs.group,
+      "generation_seed": self.training_seed,
+      "world_model": world_model,
+      "actors": actors,
+      "critics": critics,
+    }
 
   def load_initialization(self, bundle: dict) -> None:
     if (
@@ -1094,10 +1093,13 @@ class EITTraining(BeliefModelTraining):
       raise ValueError(
         "Initialization estimator settings disagree with runner configuration"
       )
-    if set(bundle.get("actors", {})) != {"A", "B", "C"} or set(
+    groups = ("mean", "belief")
+    if set(bundle.get("actors", {})) != set(groups) or set(
       bundle.get("critics", {})
-    ) != {"A", "B", "C"}:
-      raise ValueError("Common initialization requires all three actors and critics")
+    ) != set(groups):
+      raise ValueError(
+        f"Common initialization requires actors and critics for {groups}"
+      )
     device = torch.device(runner.device)
     devices = (
       [device.index if device.index is not None else torch.cuda.current_device()]
@@ -1106,12 +1108,16 @@ class EITTraining(BeliefModelTraining):
     )
     # Constructors draw fresh weights; preserve caller RNG even on failed preflight.
     with torch.random.fork_rng(devices=devices):
-      for key in ("A", "B", "C"):
+      for key in groups:
         config = replace(
           runner.cfg, estimator_inputs=replace(runner.cfg.estimator_inputs, group=key)
         )
         actor = build_actor(config, wm, runner.device).to(next(self.actor.parameters()))
-        load_actor_checkpoint(actor, config, bundle["actors"][key])
+        init_config = replace(
+          config,
+          estimator_inputs=replace(config.estimator_inputs, residual_actor=False),
+        )
+        load_actor_checkpoint(actor, init_config, bundle["actors"][key])
         critic = BeliefCritic(
           key, runner._sim_context.output_dim, runner.cfg.critic_hidden_dims
         ).to(next(self.actor.parameters()))
@@ -1119,7 +1125,11 @@ class EITTraining(BeliefModelTraining):
     # Hash every group's weights/config and the context, before mutating anything.
     identity = initialization_fingerprint(bundle)
     runner._wm.load_bundle(bundle["world_model"])
-    load_actor_checkpoint(self.actor, runner.cfg, bundle["actors"][group])
+    init_config = replace(
+      runner.cfg,
+      estimator_inputs=replace(runner.cfg.estimator_inputs, residual_actor=False),
+    )
+    load_actor_checkpoint(self.actor, init_config, bundle["actors"][group])
     self.policy.critic.load_checkpoint(bundle["critics"][group])
     self.initialization_digest = identity
     runner.wm_env.clear_rollout()

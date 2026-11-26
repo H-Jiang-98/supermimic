@@ -25,7 +25,7 @@ from tests.test_estimator_world_model_env import _env
 
 
 def training(seed=31, *, buffer_size=8, replay_ratio=1):
-  runner = _RoundRunner(seed)
+  runner = _RoundRunner(seed, group="mean")
   runner.cfg.critic_hidden_dims = (12,)
   runner.cfg.buffer_size = buffer_size
   runner.cfg.replay_ratio = replay_ratio
@@ -56,7 +56,7 @@ def training(seed=31, *, buffer_size=8, replay_ratio=1):
   runner.replay_buffer = ReplayBuffer(
     runner._schema, buffer_size, 2, initial_prior=runner._wm.initial_prior
   )
-  env = _env("B")
+  env = _env("mean")
   # All simulated measurements/replay/prefix/model interfaces stay real; only
   # physics and reward use the deterministic stream and analytic test function.
   runner._representation.compute_wm_reward_from_reference = (
@@ -226,6 +226,12 @@ def test_restore_reproduces_next_model_and_policy_updates(tmp_path):
 def test_initialization_copies_exact_weights_and_rejects_after_training():
   source, target = training(31), training(81)
   bundle = source.initialization_bundle()
+  for section, key in (("actors", "actor"), ("critics", "state_dict")):
+    mean, belief = (bundle[section][group][key] for group in ("mean", "belief"))
+    assert_tree(mean, belief)
+    assert all(
+      value.data_ptr() != belief[name].data_ptr() for name, value in mean.items()
+    )
   source.load_initialization(bundle)
   target.load_initialization(bundle)
   assert_tree(target.actor.state_dict(), source.actor.state_dict())
@@ -300,6 +306,13 @@ def test_policy_training_requires_full_replay_before_collection():
   assert runner.replay_buffer.num_transitions == 0
 
 
+def test_joint_training_rejects_retired_group_before_collection():
+  runner = _RoundRunner(group="B")
+  with pytest.raises(ValueError, match="mean or belief"):
+    EITTraining(runner)
+  assert runner.reset_count == 0
+
+
 def test_model_validation_frames_update_policy_but_not_model_normalizers():
   loop = training()
   loop.cfg = replace(loop.cfg, validation_stride=5)
@@ -320,13 +333,13 @@ def test_initialization_preflights_all_groups_before_any_mutation(component):
   source, target = training(31), training(81)
   bundle = source.initialization_bundle()
   if component == "unused_actor":
-    bundle["actors"]["C"]["actor"]["decoder.0.weight"][0, 0] = float("nan")
+    bundle["actors"]["belief"]["actor"]["decoder.0.weight"][0, 0] = float("nan")
   elif component == "unused_critic":
-    bundle["critics"]["C"]["state_dict"]["mlp.0.weight"][0, 0] = float("nan")
+    bundle["critics"]["belief"]["state_dict"]["mlp.0.weight"][0, 0] = float("nan")
   elif component == "critic_version":
-    bundle["critics"]["C"]["contract"]["version"] = "unknown_critic_version"
+    bundle["critics"]["belief"]["contract"]["version"] = "unknown_critic_version"
   else:
-    bundle["actors"].pop("A")
+    bundle["actors"].pop("mean")
   before = target.state_dict()
   with pytest.raises(ValueError):
     target.load_initialization(bundle)
@@ -356,7 +369,7 @@ def test_normalization_late_failure_preserves_all_live_statistics(field):
   assert loop.runner.imagined_posterior_provider.state is None
 
 
-@pytest.mark.parametrize("group", ["A", "B", "C"])
+@pytest.mark.parametrize("group", ["mean", "belief"])
 def test_replay_normalization_matches_full_reset_statistics_without_rollout(group):
   # Two environments yield 18 fresh frames, exceeding the former 16-frame chunk.
   loop = training(buffer_size=9)
@@ -381,6 +394,7 @@ def test_replay_normalization_matches_full_reset_statistics_without_rollout(grou
     for chunk in env.iter_cached_policy_starts(locations, batch_size=len(locations[0])):
       obs = env.reset_prepared(chunk)
       expected_actor.update_normalization(obs)
+      expected_actor.condition_normalizer.update(obs["task_uncertainty"][..., :-29])
       expected_critic.update_normalization(obs["critic"])
   env.clear_rollout()
   with (

@@ -46,10 +46,10 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
     self.task_specs = task_specs
     assert task_specs[0].name == "motion", "task_specs[0] must be the motion task"
     if estimator_input_config is not None and (
-      len(task_specs) != 1 or task_specs[0].goal_dim != 700
+      len(task_specs) != 1 or task_specs[0].goal_dim != estimator_input_config.goal_dim
     ):
       raise ValueError(
-        "Estimator input v1 supports only the 700-dimensional motion task"
+        f"Expected a single {estimator_input_config.goal_dim}-dimensional motion task"
       )
     super().__init__(
       dynamics=dynamics,

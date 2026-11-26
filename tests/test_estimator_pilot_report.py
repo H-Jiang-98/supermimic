@@ -406,7 +406,7 @@ def fixture(root, monkeypatch):
         },
       )
   monkeypatch.setattr(
-    batch_eval_eit, "candidates", lambda manifest: deepcopy(candidates)
+    batch_eval_eit, "candidates", lambda manifest, **kwargs: deepcopy(candidates)
   )
   monkeypatch.setattr(batch_eval_eit, "validate_scene", lambda scene: None)
   records = [
@@ -869,11 +869,10 @@ def test_checkpoint_configuration_rejects_small_network_as_default_width(tmp_pat
 
 def test_initialization_audit_compares_baseline_parameters(tmp_path):
   from supermimic.runners.eit_training import initialization_fingerprint
-  from supermimic.runners.run_config import EIT_INITIALIZATION_VERSION
   from supermimic.scripts.report_eit_pilot import Audit, _initialization_identity
 
   bundle = {
-    "version": EIT_INITIALIZATION_VERSION,
+    "version": "eit_initialization_v3",
     "generation_seed": 7,
     "world_model": {"weight": torch.ones(1)},
     "actors": {g: {"weight": torch.ones(1)} for g in "ABC"},
@@ -1113,25 +1112,72 @@ def test_online_null_sections_do_not_crash_audit(tmp_path, monkeypatch, field):
   assert result["status"] in ("pending", "failed")
 
 
-def test_current_step_report_checks_actual_updates_and_profiles(tmp_path, monkeypatch):
-  from supermimic.scripts.run_eit_pilot import protocol
-  from tests.test_estimator_eit_training import training
-
-  monkeypatch.setenv("WANDB_MODE", "disabled")
-  motion = tmp_path / "motion.npz"
-  motion.write_bytes(b"fixture")
-  p = protocol(motion, 2026, "cpu", "cpu")
-  p.update(
-    num_envs=2,
-    max_iterations=4,
-    resume_after_step=3,
-    covariance_pair_budget=4,
-    updates_per_training_group={"mean": 1, "covariance": 2, "actor": 1, "critic": 1},
-  )
+def test_archived_step_report_checks_updates_and_profiles(tmp_path):
+  p = {
+    "version": "eit_pilot_v4",
+    "training_seed": 2026,
+    "device": "cpu",
+    "num_envs": 2,
+    "max_iterations": 4,
+    "resume_after_step": 3,
+    "covariance_pair_budget": 4,
+    "updates_per_training_group": {"mean": 1, "covariance": 2, "actor": 1, "critic": 1},
+  }
   write(tmp_path / "protocol.json", p)
-  loop = training()
-  loop.training_seed = p["training_seed"]
-  loop.run(4, tmp_path / "B")
+  critic_version = "eit_rpv_belief_critic_v3"
+  state = {
+    "version": "eit_training_v6",
+    "stage": "policy",
+    "replay_mode": "full",
+    "runner_config": {"estimator_inputs": {"group": "B"}, "buffer_size": 8},
+    "posterior_replay_protocol": "incremental_posterior_sqrt_tril_f32_v2",
+    "loop_config": {"posterior_save_stride": 1},
+    "model_revision": 1,
+    "world_model": {
+      "dynamics": {"model_revision": 1},
+      "sim_context": {"scale": torch.ones(1)},
+    },
+    "critic": {
+      "contract": {
+        "version": critic_version,
+        "input_dim": 1291,
+        "context_dim": 1,
+        "config": {
+          "group": "B",
+          "version": critic_version,
+          "tangent_version": "right_se23_theta_rho_nu_omega_q_qdot_v1",
+          "covariance_encoding": "rpv9_log_std_corr_v1",
+          "covariance_scales": (1.0,) * 3,
+          "mean_scales": (1.0,) * 2,
+          "epsilon_std": 1e-6,
+        },
+      },
+      "state_dict": {"mlp.0.weight": torch.zeros(1, 1291)},
+    },
+    "learner": {
+      "mean": {"steps": 1},
+      "cov": {"steps": 2, "config": {"pair_budget": 4}},
+    },
+    "policy": {"actor_steps": 1, "critic_steps": 1},
+    "training_seed": 2026,
+    "initialization_digest": "init",
+    "motion_digest": "walk",
+    "update_groups": 1,
+    "collected_steps": 4,
+    "collected_frames": 8,
+  }
+  write(
+    tmp_path / "B/metrics.jsonl",
+    [{"step": 3, "Counters/collected_frames": 8}],
+    lines=True,
+  )
+  write(
+    tmp_path / "B/profiling.jsonl",
+    [{"step": 3, "seconds": {"covariance_fit_seconds": 0.1}, "runtime": {}}],
+    lines=True,
+  )
+  checkpoint = tmp_path / "B/training.pt"
+  torch.save(state, checkpoint)
   write(tmp_path / "resume/B.json", {"status": "passed", "collected_steps": 3})
   write(tmp_path / "evaluation/validation.json", {"complete": True})
   report = build_report(tmp_path)
@@ -1142,7 +1188,6 @@ def test_current_step_report_checks_actual_updates_and_profiles(tmp_path, monkey
   assert group["collected_steps"] == 4 and group["updates"]["covariance"] == 2
   assert group["phase_seconds"]["covariance_fit_seconds"] > 0
   assert group["cuda_peak_allocated_bytes"] is None
-  checkpoint = tmp_path / "B/training.pt"
   saved = torch.load(checkpoint, weights_only=True)
   torch.save({"group": "A", "collected_steps": 3}, tmp_path / "resume/B-reference.pt")
   assert any(
@@ -1172,7 +1217,7 @@ def test_step_validation_requires_the_raw_final_episodes_and_actor_updates(
     for candidate in batch_eval_eit.candidates(manifest)
     if candidate["collected_frames"] == final_frames
   ]
-  monkeypatch.setattr(batch_eval_eit, "candidates", lambda _: candidates)
+  monkeypatch.setattr(batch_eval_eit, "candidates", lambda _, **kwargs: candidates)
   records = [
     batch_eval_eit.evaluate_candidate(
       c, manifest["validation"], tmp_path / "evaluation", False
@@ -1230,3 +1275,120 @@ def test_report_accepts_single_graph_and_legacy_policy_timings(
     write(path, rows, lines=True)
   report = build_report(tmp_path)
   assert report["status"] == "complete", report
+
+
+def write_midpoint_evidence(checkpoint, reference, path, identity=None):
+  from supermimic.runners.eit_resume_contract import REFERENCE_VERSION
+
+  execution = {
+    "torch_compile": "force_eager",
+    "torchscript_optimized_execution": False,
+    "torchscript_import_mode": "disabled_before_import",
+    "deterministic_algorithms": True,
+    "fixed_input_assembly": "cpu_contiguous_then_shared_device_constructors_v1",
+    "discarded_private_policy_warmup_updates": 1,
+    "cublas_workspace_config": None,
+    "expected_optimizer_origin": "deepcopy_of_live_parameter_optimizer_graph",
+  }
+  live = {
+    "version": REFERENCE_VERSION,
+    "device": "cpu",
+    "verification_execution": execution,
+    "source": "live_training_before_checkpoint_commit",
+    "checkpoint_sha256": file_sha256(checkpoint),
+    "group": "A",
+    "collected_steps": 5,
+  }
+  live.update(identity or {})
+  torch.save(live, reference)
+  row = {
+    "version": "eit_fixed_input_resume_v2",
+    "status": "passed",
+    "checkpoint_sha256": file_sha256(checkpoint),
+    "group": "A",
+    "collected_steps": 5,
+    "device": "cpu",
+    "fixed_input_policy_resume_exact": True,
+    "fixed_input_model_resume_exact": True,
+    "live_optimizer_reference": True,
+    "expected_source": "live_training_before_checkpoint_commit",
+    "reference_version": REFERENCE_VERSION,
+    "reference_sha256": file_sha256(reference),
+    "verification_execution": execution,
+  }
+  write(path, row)
+  return live, row
+
+
+def test_resume_cache_requires_successful_exact_checks_and_valid_json(tmp_path):
+  from supermimic.scripts.report_eit_pilot import resume_result_matches
+
+  checkpoint, path, reference = (
+    tmp_path / name for name in ("checkpoint.pt", "resume.json", "reference.pt")
+  )
+  checkpoint.write_bytes(b"unchanged")
+  live, row = write_midpoint_evidence(checkpoint, reference, path)
+  execution = live["verification_execution"]
+  environment = {"PYTORCH_JIT": "0"}
+
+  def matches():
+    return resume_result_matches(
+      path, checkpoint, "A", 5, "cpu", reference, environment
+    )
+
+  assert matches()
+  assert not resume_result_matches(path, checkpoint, "A", 5, "cpu")
+  for key, invalid in (
+    ("status", "failed"),
+    ("fixed_input_model_resume_exact", False),
+    ("group", "B"),
+    ("device", "cuda:0"),
+    ("reference_version", "eit_live_update_reference_v2"),
+  ):
+    write(path, {**row, key: invalid})
+    assert not matches()
+  for key, invalid in (
+    ("discarded_private_policy_warmup_updates", 0),
+    ("deterministic_algorithms", False),
+    ("torchscript_import_mode", "enabled"),
+    ("cublas_workspace_config", ":4096:8"),
+  ):
+    damaged = {**execution, key: invalid}
+    # Matching, correctly hashed artifacts still cannot override the protocol.
+    torch.save({**live, "verification_execution": damaged}, reference)
+    write(
+      path,
+      {
+        **row,
+        "verification_execution": damaged,
+        "reference_sha256": file_sha256(reference),
+      },
+    )
+    assert not matches()
+  for source in ("receipt", "live"):
+    missing_warmup = {
+      key: value
+      for key, value in execution.items()
+      if key != "discarded_private_policy_warmup_updates"
+    }
+    torch.save(
+      {
+        **live,
+        "verification_execution": missing_warmup if source == "live" else execution,
+      },
+      reference,
+    )
+    write(
+      path,
+      {
+        **row,
+        "verification_execution": missing_warmup if source == "receipt" else execution,
+        "reference_sha256": file_sha256(reference),
+      },
+    )
+    assert not matches()
+  torch.save({**live, "device": "cuda:0"}, reference)
+  write(path, {**row, "reference_sha256": file_sha256(reference)})
+  assert not matches()
+  path.write_text("{truncated")
+  assert not matches()

@@ -8,7 +8,7 @@ from tensordict import TensorDict
 from supermimic.belief import BeliefState
 from supermimic.utils.lie_state import LieState
 
-POSTERIOR_REPLAY_VERSION = "incremental_posterior_sqrt_tril_f32_v2"
+POSTERIOR_REPLAY_VERSION = "se3_body_posterior_sqrt_tril_f32_v3"
 
 
 def pack_mean(mean):
@@ -26,6 +26,8 @@ def pack_mean(mean):
 
 
 def unpack_mean(mean):
+  if mean.shape[-1] != 76:
+    raise ValueError("Packed posterior mean requires 76 entries")
   return LieState(
     mean[..., :9].reshape(*mean.shape[:-1], 3, 3),
     mean[..., 9:12],

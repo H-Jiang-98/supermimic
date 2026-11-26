@@ -372,7 +372,7 @@ def test_real_checkpoint_evaluates_new_motion_until_every_first_episode_finishes
 ):
   torch.manual_seed(2501)
   checkpoint = tmp_path / "training.pt"
-  with physical_runner(tmp_path, "C") as runner:
+  with physical_runner(tmp_path, "belief") as runner:
     runner.cfg.estimator_inputs = replace(runner.cfg.estimator_inputs, mode="train")
     EITTraining(runner).save(checkpoint)
   before = checkpoint.read_bytes()
@@ -399,7 +399,7 @@ def test_real_checkpoint_evaluates_new_motion_until_every_first_episode_finishes
     episode["reason"] in {"failure", "clip_complete", "timeout"}
     for episode in result["episodes"]
   )
-  assert result["group"] == "C" and result["mode"] == "eval"
+  assert result["group"] == "belief" and result["mode"] == "eval"
   assert len(result["posterior_rmse"]) == 70
   assert json.loads(json.dumps(result, allow_nan=False)) == result
   assert checkpoint.read_bytes() == before

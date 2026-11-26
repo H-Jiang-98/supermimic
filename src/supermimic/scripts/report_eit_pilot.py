@@ -18,13 +18,13 @@ from typing import Any, Literal, overload
 import torch
 
 from supermimic.runners.eit_resume_contract import (
+  REFERENCE_VERSION,
   RESUME_EXECUTION_FIELDS,
   SUPPORTED_REFERENCE_VERSIONS,
   resume_execution_matches,
 )
 from supermimic.runners.eit_snapshots import file_sha256
 from supermimic.runners.eit_training import initialization_fingerprint
-from supermimic.runners.run_config import EIT_INITIALIZATION_VERSION
 from supermimic.scripts import batch_eval_eit
 from supermimic.scripts.benchmark_eit_online import _summarize as summarize_latency
 from supermimic.scripts.pilot_report_diagnostics import (
@@ -195,7 +195,12 @@ def _initialization_identity(audit, p):
   try:
     bundle = torch.load(path, weights_only=True, mmap=True, map_location="cpu")
     audit.require(
-      bundle.get("version") == EIT_INITIALIZATION_VERSION
+      bundle.get("version")
+      == (
+        "eit_initialization_v4"
+        if p.get("version") == "eit_pilot_v4"
+        else "eit_initialization_v3"
+      )
       and bundle.get("generation_seed") == p["training_seed"],
       "Initialization package version/seed differs from pilot protocol",
     )
@@ -382,7 +387,7 @@ def _validated_sources(audit, p, saved_validation, *, frames=None):
   try:
     # Existing admission checks load actual tensors, optimizer counters and critic
     # contracts and compare them to each indexed immutable checkpoint.
-    candidates = batch_eval_eit.candidates(manifest)
+    candidates = batch_eval_eit.candidates(manifest, archived_pilot=True)
     records = []
     for candidate in candidates:
       if "error" in candidate:
@@ -1031,11 +1036,68 @@ def _audit_group(audit, group, p, validation, commands):
   }
 
 
+def resume_result_matches(
+  path,
+  checkpoint,
+  group,
+  collected_steps,
+  device,
+  reference=None,
+  process_environment=None,
+  *,
+  expected_identity=None,
+):
+  if reference is None or not path.is_file() or not Path(reference).is_file():
+    return False
+  try:
+    result = json.loads(path.read_text())
+    live = torch.load(reference, weights_only=True, mmap=True, map_location="cpu")
+    identity = live.get("checkpoint_sha256")
+    if (
+      not isinstance(identity, str)
+      or len(identity) != 64
+      or any(c not in "0123456789abcdef" for c in identity)
+      or (checkpoint is not None and file_sha256(checkpoint) != identity)
+      or live.get("version") != REFERENCE_VERSION
+      or live.get("source") != "live_training_before_checkpoint_commit"
+      or live.get("group") != group
+      or live.get("collected_steps") != collected_steps
+      or any(live.get(k) != v for k, v in (expected_identity or {}).items())
+    ):
+      return False
+    return resume_execution_matches(result, live, process_environment) and all(
+      type(result.get(key)) is type(expected) and result[key] == expected
+      for key, expected in {
+        "version": "eit_fixed_input_resume_v2",
+        "status": "passed",
+        "checkpoint_sha256": identity,
+        "group": group,
+        "collected_steps": collected_steps,
+        "device": device,
+        "fixed_input_policy_resume_exact": True,
+        "fixed_input_model_resume_exact": True,
+        "live_optimizer_reference": True,
+        "expected_source": "live_training_before_checkpoint_commit",
+        "reference_version": live["version"],
+        "reference_sha256": file_sha256(Path(reference)),
+      }.items()
+    )
+  except (
+    OSError,
+    ValueError,
+    AttributeError,
+    RuntimeError,
+    TypeError,
+    EOFError,
+    pickle.UnpicklingError,
+  ):
+    return False
+
+
 def _step_report(audit, protocol):
   """Audit v5 checkpoints and cumulative Logger rows without snapshot indexes."""
   from supermimic.runners.eit_inference import load_hashed_checkpoint
   from supermimic.runners.run_config import validate_eit_checkpoint_contract
-  from supermimic.scripts.run_eit_pilot import resume_result_matches
 
   groups = {}
   identities = set()
@@ -1050,7 +1112,7 @@ def _step_report(audit, protocol):
       continue
     try:
       state, checkpoint_sha = load_hashed_checkpoint(path, "cpu")
-      validate_eit_checkpoint_contract(state, stage="policy")
+      validate_eit_checkpoint_contract(state, stage="policy", archived_pilot=True)
       steps, updates = state["collected_steps"], state["update_groups"]
       audit.require(
         steps <= protocol["max_iterations"], f"{group}: exceeded cumulative budget"

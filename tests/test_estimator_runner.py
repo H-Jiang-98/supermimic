@@ -22,7 +22,6 @@ from supermimic.runners.supermimic_runner import (
   SuperMimicRunnerCfg,
   WorldModel,
   actor_checkpoint,
-  build_ablation_actors,
   build_actor,
   load_actor_checkpoint,
 )
@@ -417,20 +416,6 @@ def test_eit_fit_config_requires_both_complete_stage_configs(section, key):
   del raw[section][key]
   with pytest.raises(ValueError, match="configuration fields"):
     load_runner_cfg({"runner_cfg": raw})
-
-
-def test_ablation_factory_copies_common_weights_without_shared_storage():
-  runner = _runner()
-  actors = build_ablation_actors(runner.cfg, runner._wm, "cpu")
-  for group in ("B", "C"):
-    for name in ("obs_normalizer", "goal_normalizers", "encoders", "decoder"):
-      first = getattr(actors["A"], name).state_dict()
-      other = getattr(actors[group], name).state_dict()
-      for key in first:
-        assert torch.equal(first[key], other[key])
-        assert first[key].data_ptr() != other[key].data_ptr()
-  assert actors["A"].film is None and actors["B"].film is None
-  assert actors["C"].film is not None
 
 
 def test_versioned_actor_checkpoint_roundtrip_and_explicit_eval_mode():

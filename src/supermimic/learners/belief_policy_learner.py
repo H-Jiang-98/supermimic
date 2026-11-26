@@ -29,7 +29,7 @@ from supermimic.learners.learner_utils import (
 )
 from supermimic.learners.policy_learner import discounted_bootstrap, gae_returns
 from supermimic.utils.compile import compile_eit_kernel
-from supermimic.utils.profiling import PhaseTimer, StreamTimer
+from supermimic.utils.profiling import StreamTimer
 
 
 @dataclass(frozen=True)
@@ -50,6 +50,7 @@ class BeliefPolicyLearnerCfg:
   lam: float = 0.95
   max_grad_norm: float = 1.0
   value_clipping: bool = True
+  batch_motion_encoder: bool = True
 
   def __post_init__(self):
     for key in (
@@ -123,6 +124,11 @@ class BeliefActorCriticPolicyLearner:
       if compile_kernels and forward_with_aux
       else forward_with_aux
     )
+    self._encode = getattr(actor, "encode_goal", None)
+    self._decode = getattr(actor, "decode_goal", None)
+    if compile_kernels and self._encode is not None:
+      self._encode = compile_eit_kernel(self._encode)
+      self._decode = compile_eit_kernel(self._decode)
     self.critic: nn.Module = critic
     self.wm_env = wm_env
     self.wm_env.eit_critic = True
@@ -436,11 +442,23 @@ class BeliefActorCriticPolicyLearner:
       if prepared is not None
       else belief_rollout(getattr(env, "posterior_provider", None))
     )
+    latents = None
+    if prepared is not None and self._encode is not None and cfg.batch_motion_encoder:
+      goals = prepared.reference.local.goal[: horizon * count]
+      latents = self._encode(goals).reshape(horizon, count, -1)
     with scope:
       for t in range(horizon):
         observations.append(obs["critic"].detach())
         weights.append(survival.detach())
-        if prepared is not None:
+        if self._encode is not None:
+          latent = (
+            latents[t] if latents is not None else self._encode(obs["goal_motion"])
+          )
+          actions, scale, shift = self._decode(
+            latent, obs["history"], obs["task_uncertainty"]
+          )
+          aux = 0.0
+        elif prepared is not None:
           assert self._actor_with_aux is not None
           actions, aux = self._actor_with_aux(obs)
         else:
@@ -450,7 +468,8 @@ class BeliefActorCriticPolicyLearner:
         with torch.no_grad():
           saturation += (env.limit_actions(actions) != actions).float().mean()
           if getattr(self.actor, "film", None) is not None:
-            scale, shift = self.actor.film(obs["task_uncertainty"]).chunk(2, -1)
+            if self._decode is None:
+              scale, shift = self.actor.film(obs["task_uncertainty"]).chunk(2, -1)
             film_scale += torch.stack((scale.abs().mean(), shift.abs().mean()))
         if prepared is None:
           obs, reward, done, _ = env.step(
@@ -566,8 +585,7 @@ class BeliefActorCriticPolicyLearner:
       raise
 
   def _update_from_eager(self, starts, process_noise, measurement_noise):
-    timer = PhaseTimer(next(self.actor.parameters()).device)
-    self.last_profile = timer.seconds
+    timer = StreamTimer(next(self.actor.parameters()).device)
     cfg, env = self.cfg, self.wm_env
     starts = starts.repeat_interleave(cfg.num_samples)
     process_noise = process_noise.detach().flatten(1, 2)
@@ -585,94 +603,89 @@ class BeliefActorCriticPolicyLearner:
       for module in (self.critic, env.dynamics, env.representation):
         module.eval().requires_grad_(False)
         module.zero_grad(set_to_none=True)
-      actor_start = timer.now()
       try:
-        for optimizer in self.actor_optimizers:
-          optimizer.zero_grad(set_to_none=True)
-        stream_timer = StreamTimer(process_noise.device)
-        for offset in range(0, count, cfg.microbatch_size):
-          selected = slice(offset, offset + cfg.microbatch_size)
-          batch = starts.index(selected)
-          with stream_timer.measure("policy_prepare_seconds"):
-            prepared = None
-            if self._uses_tensor_rollout:
-              prepared = prepare_rollout(
-                env,
-                batch,
-                cfg.horizon,
+        with timer.measure("policy_rollout_backward_seconds"):
+          for optimizer in self.actor_optimizers:
+            optimizer.zero_grad(set_to_none=True)
+          for offset in range(0, count, cfg.microbatch_size):
+            selected = slice(offset, offset + cfg.microbatch_size)
+            batch = starts.index(selected)
+            with timer.measure("policy_prepare_seconds"):
+              prepared = None
+              if self._uses_tensor_rollout:
+                prepared = prepare_rollout(
+                  env,
+                  batch,
+                  cfg.horizon,
+                  process_noise[:, selected],
+                  measurement_noise[:, selected],
+                )
+            with timer.measure("policy_backward_seconds"):
+              arguments = (
+                prepared,
                 process_noise[:, selected],
                 measurement_noise[:, selected],
+                count,
               )
-          with stream_timer.measure("policy_backward_seconds"):
-            arguments = (
-              prepared,
-              process_noise[:, selected],
-              measurement_noise[:, selected],
-              count,
-            )
-            regression, metrics, failed = self._actor_backward(*arguments, starts=batch)
-          if failed.any():
-            raise FloatingPointError("Invalid imagined rollout; actor step rejected")
-          data.append(regression)
-          for name, value in metrics.items():
-            totals[name] = totals.get(name, 0) + value
-          del prepared, arguments, regression, metrics, failed
-          self._clear_rollout()
+              regression, metrics, failed = self._actor_backward(
+                *arguments, starts=batch
+              )
+            if failed.any():
+              raise FloatingPointError("Invalid imagined rollout; actor step rejected")
+            data.append(regression)
+            for name, value in metrics.items():
+              totals[name] = totals.get(name, 0) + value
+            del prepared, arguments, regression, metrics, failed
+            self._clear_rollout()
 
-        if self._uses_tensor_rollout:
-          env.check_policy_start_identity(starts)
-        self._check_gradients(self.actor)
-        actor_norm = torch.nn.utils.clip_grad_norm_(
-          self.actor.parameters(), cfg.max_grad_norm, error_if_nonfinite=True
-        )
-        if cfg.grad_clip_value:
-          torch.nn.utils.clip_grad_value_(self.actor.parameters(), cfg.grad_clip_value)
-        for optimizer in self.actor_optimizers:
-          optimizer.step()
-        self.actor_steps += 1
-        timer.seconds["policy_rollout_backward_seconds"] = timer.now() - actor_start
-        timer.seconds.update(
-          {
-            "policy_prepare_seconds": 0.0,
-            "policy_backward_seconds": 0.0,
-            **stream_timer.seconds(),
-          }
-        )
-        critic_start = timer.now()
-        self.actor.requires_grad_(False)
-        self.critic.requires_grad_(True)
-        # Join the trajectory axis before flattening, preserving time-major sample order.
-        features, targets = (
-          torch.cat(chunks, dim=1).flatten(0, 1) for chunks in zip(*data, strict=True)
-        )
-        del data
-        critic_loss, critic_norm, updates = fit_critic(
-          self.critic,
-          self.critic_optimizers,
-          features,
-          targets,
-          epochs=cfg.critic_epochs,
-          minibatches=cfg.critic_minibatches,
-          microbatch_size=cfg.critic_microbatch_size,
-          generator=self.generators["critic"],
-          max_norm=cfg.max_grad_norm,
-          check_finite=True,
-        )
-        self.critic_steps += updates
-        with torch.no_grad():
-          variance = targets.var(unbiased=False)
-          if variance > 0:
-            # The fitted targets are private and no longer needed. Reuse their
-            # storage for residuals and keep each critic forward bounded.
-            residuals = targets
-            size = cfg.critic_microbatch_size or len(targets)
-            for start in range(0, len(targets), size):
-              chunk = slice(start, start + size)
-              residuals[chunk].sub_(self.critic(features[chunk]).squeeze(-1))
-            explained = 1 - residuals.var(unbiased=False) / variance
-          else:
-            explained = targets.new_tensor(float("nan"))
-        timer.seconds["critic_regression_seconds"] = timer.now() - critic_start
+          if self._uses_tensor_rollout:
+            env.check_policy_start_identity(starts)
+          self._check_gradients(self.actor)
+          actor_norm = torch.nn.utils.clip_grad_norm_(
+            self.actor.parameters(), cfg.max_grad_norm, error_if_nonfinite=True
+          )
+          if cfg.grad_clip_value:
+            torch.nn.utils.clip_grad_value_(
+              self.actor.parameters(), cfg.grad_clip_value
+            )
+          for optimizer in self.actor_optimizers:
+            optimizer.step()
+          self.actor_steps += 1
+        with timer.measure("critic_regression_seconds"):
+          self.actor.requires_grad_(False)
+          self.critic.requires_grad_(True)
+          # Join the trajectory axis before flattening, preserving time-major sample order.
+          features, targets = (
+            torch.cat(chunks, dim=1).flatten(0, 1) for chunks in zip(*data, strict=True)
+          )
+          del data
+          critic_loss, critic_norm, updates = fit_critic(
+            self.critic,
+            self.critic_optimizers,
+            features,
+            targets,
+            epochs=cfg.critic_epochs,
+            minibatches=cfg.critic_minibatches,
+            microbatch_size=cfg.critic_microbatch_size,
+            generator=self.generators["critic"],
+            max_norm=cfg.max_grad_norm,
+            check_finite=True,
+          )
+          self.critic_steps += updates
+          with torch.no_grad():
+            variance = targets.var(unbiased=False)
+            if variance > 0:
+              # The fitted targets are private and no longer needed. Reuse their
+              # storage for residuals and keep each critic forward bounded.
+              residuals = targets
+              size = cfg.critic_microbatch_size or len(targets)
+              for start in range(0, len(targets), size):
+                chunk = slice(start, start + size)
+                residuals[chunk].sub_(self.critic(features[chunk]).squeeze(-1))
+              explained = 1 - residuals.var(unbiased=False) / variance
+            else:
+              explained = targets.new_tensor(float("nan"))
+        self.last_profile = timer.seconds()
         return self._policy_metrics(
           totals, count, actor_norm, critic_loss, critic_norm, explained
         )
@@ -688,8 +701,7 @@ class BeliefActorCriticPolicyLearner:
 
   def _update_with_graph(self, graph, starts, process_noise, measurement_noise):
     cfg, env = self.cfg, self.wm_env
-    timer = PhaseTimer(process_noise.device)
-    self.last_profile = timer.seconds
+    timer = StreamTimer(process_noise.device)
     modules = (self.actor, self.critic, env.dynamics, env.representation)
     with env.readonly_policy_motion(), env.dynamics.readonly(), _module_modes(modules):
       for module in (env.dynamics, env.representation):
@@ -741,7 +753,9 @@ class BeliefActorCriticPolicyLearner:
           raise FloatingPointError(
             "Invalid EIT policy update after execution; parameters may have changed"
           )
-        return {name: value.clone() for name, value in metrics.items()}
+        metrics = {name: value.clone() for name, value in metrics.items()}
+      self.last_profile = timer.seconds()
+      return metrics
 
   def _policy_update(
     self, prepared, process_noise, measurement_noise, count, permutation

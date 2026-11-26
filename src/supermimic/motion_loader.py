@@ -72,6 +72,8 @@ class MotionLoader:
   are wxyz and all root velocities are in the world frame.
   """
 
+  @torch.inference_mode(False)
+  @torch.no_grad()
   def __init__(
     self,
     motion_file: str | list[str],
@@ -81,6 +83,7 @@ class MotionLoader:
     expected_fps: float | None = None,
   ):
     self.fk = fk
+    self._digest_cache = None
     self.files = resolve_motion_files(motion_file)
     fields = {
       name: []
@@ -156,6 +159,21 @@ class MotionLoader:
     self.body_pos_w, self.body_quat_w, self.body_lin_vel_w, self.body_ang_vel_w = (
       torch.cat([state[i] for state in states]) for i in range(4)
     )
+
+  def training_digest(self, versions):
+    """Reuse the digest of loader-owned references between policy updates.
+
+    Changes through tensor operations advance PyTorch's mutation counter. Writers
+    using external storage aliases must call torch.autograd.graph.increment_version
+    on the affected tensors. Checkpoints independently hash the actual contents.
+    """
+    if any(version is None for _, version in versions):
+      return motion_content_digest(self)
+    if self._digest_cache is None or self._digest_cache[0] != versions:
+      # Keep the previous identities alive while comparing, including after replacement.
+      tensors = tuple(getattr(self, name) for name in _REFERENCE_TENSORS)
+      self._digest_cache = versions, motion_content_digest(self), tensors
+    return self._digest_cache[1]
 
   def body_state(self, frames: torch.Tensor) -> tuple[torch.Tensor, ...]:
     return tuple(

@@ -17,6 +17,8 @@ from supermimic.runners.eit_inference import load_hashed_checkpoint
 from supermimic.scripts.batch_eval_eit import cfg_json, conditions
 from supermimic.validation.config import (
   CONFIG_GROUPS,
+  LOCAL_STUDY_VERSION,
+  LOCAL_VARIANTS,
   VARIANTS,
   atomic_json,
   config_dict,
@@ -28,21 +30,27 @@ from supermimic.validation.config import (
 from supermimic.validation.domains import domain_table
 from supermimic.validation.runtime import make_env_config
 
-VERSION = "eit_joint_multiclip_v3"
+VERSION = "eit_joint_multiclip_v5"
 
 
 def freeze(cfg):
   paths = motion_paths(cfg)
-  required = {"C", *(v[0] for v in cfg.methods)}
+  local = any(v in LOCAL_VARIANTS for v in cfg.methods)
+  if local and not set(cfg.methods).issubset(LOCAL_VARIANTS):
+    raise ValueError("Local and legacy methods require separate studies")
+  required = set(cfg.methods) if local else {"C", *(v[0] for v in cfg.methods)}
   saved, checkpoints = {}, {}
-  for group in "ABC":
+  for group in LOCAL_VARIANTS if local else "ABC":
     path = Path(cfg.checkpoint_root) / group / "training.pt"
     if group not in required and not path.is_file():
       continue
     s, sha = load_hashed_checkpoint(path, "cpu")
     if group in required:
       saved[group] = s
-    if s["runner_config"]["estimator_inputs"]["group"] != group:
+    inputs = s["runner_config"]["estimator_inputs"]
+    if local and inputs["residual_actor"] != group.endswith("-residual"):
+      raise ValueError(f"Checkpoint residual mode mismatch: {path}")
+    if inputs["group"] != group.split("-")[0]:
       raise ValueError(f"Checkpoint group mismatch: {path}")
     checkpoints[group] = dict(
       path=str(path),
@@ -50,9 +58,37 @@ def freeze(cfg):
       collected_steps=s["collected_steps"],
       collected_frames=s["collected_frames"],
     )
+    if local:
+      from supermimic.runners.eit_training import initialization_fingerprint
+
+      checkpoints[group].update(
+        actor_sha256=initialization_fingerprint(s["actor"]),
+        estimator_sha256=initialization_fingerprint(s["world_model"]),
+      )
   if len({v["collected_steps"] for v in checkpoints.values()}) != 1:
     raise ValueError("A/B/C checkpoint training budgets differ")
-  train_hashes = {v["sha256"] for v in saved["C"]["training_motion_files"]}
+  if local:
+    paired = {
+      (
+        s["training_seed"],
+        s["initialization_digest"],
+        s["num_envs"],
+        s["collected_frames"],
+        s["runner_config"]["replay_ratio"],
+        digest(s["policy_config"]),
+      )
+      for s in saved.values()
+    }
+    if len(paired) != 1:
+      raise ValueError(
+        "Local study requires paired seeds, initialization and training budgets"
+      )
+  training_sets = [
+    {v["sha256"] for v in s["training_motion_files"]} for s in saved.values()
+  ]
+  train_hashes = training_sets[0]
+  if any(t != train_hashes for t in training_sets):
+    raise ValueError("Checkpoint training motion sets differ")
   motions = []
   for path in paths:
     with np.load(path, allow_pickle=False) as arrays:
@@ -82,6 +118,9 @@ def freeze(cfg):
     "estimator_inputs.py",
     "sim_context.py",
     "representations.py",
+    "local_control.py",
+    "utils/lie_state.py",
+    "models.py",
   ):
     sources[name] = file_digest(source_root / name)
   config = config_dict(cfg)
@@ -89,7 +128,7 @@ def freeze(cfg):
   # later runs request additional policies.
   del config["methods"]
   manifest = dict(
-    version=VERSION,
+    version=LOCAL_STUDY_VERSION if local else VERSION,
     kind="joint",
     config=config,
     checkpoints=checkpoints,
@@ -132,7 +171,13 @@ def resume_manifest(frozen, current):
 def tasks(manifest, variants=None):
   cfg = manifest["config"]
   if variants is None:
-    variants = ["C-posterior"] if manifest["kind"] == "odometry" else VARIANTS
+    variants = (
+      ["C-posterior"]
+      if manifest["kind"] == "odometry"
+      else (
+        LOCAL_VARIANTS if manifest.get("version") == LOCAL_STUDY_VERSION else VARIANTS
+      )
+    )
   for motion in manifest["motions"]:
     for variant in variants:
       for start in range(0, cfg["num_domain_contexts"], cfg["num_envs"]):

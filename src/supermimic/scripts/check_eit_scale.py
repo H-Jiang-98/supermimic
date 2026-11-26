@@ -94,7 +94,7 @@ def main():
     env = create_env(cfg, 2, args.device)
     try:
       runner_cfg = SuperMimicRunnerCfg.for_estimator_inputs(
-        "C",
+        "belief",
         process_noise=ProcessNoiseConfig(
           hidden_dims=(16,) if args.small_width else (128, 64)
         ),
@@ -116,7 +116,7 @@ def main():
       runner.finish_collection_round()
       actor = runner.policy_learner.actor
       critic = BeliefCritic(
-        "C", runner._sim_context.output_dim, runner_cfg.critic_hidden_dims
+        "belief", runner._sim_context.output_dim, runner_cfg.critic_hidden_dims
       ).to(args.device)
       # Exercise FiLM and terminal-value input gradients before timed fitting.
       with torch.no_grad():

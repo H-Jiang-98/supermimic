@@ -15,10 +15,11 @@ import torch
 from supermimic.belief import BeliefState, GaussianStatePrior
 from supermimic.estimator import CorrectionSummary, LieBeliefFilter
 from supermimic.estimator_inputs import GaussianMeasurementConfig
+from supermimic.posterior_replay import pack_mean, unpack_mean
 from supermimic.utils.lie_state import STATE_LAYOUT_VERSION, TANGENT_VERSION, LieState
 
 _FIELDS = ("rotation", "position", "velocity", "omega", "joint_pos", "joint_vel")
-PROVIDER_VERSION = "right_local_sqrt_provider_v4"
+PROVIDER_VERSION = "se3_body_sqrt_provider_v5"
 
 
 @dataclass(frozen=True)
@@ -480,7 +481,7 @@ class BeliefProvider:
       ids, prior = state.head_priors
       heads = {
         "episode_id": ids.detach().clone(),
-        "mean": prior.mean.to_full().detach().clone(),
+        "mean": pack_mean(prior.mean).detach().clone(),
         "covariance_sqrt": prior.covariance_sqrt.detach().clone(),
       }
     return {
@@ -495,8 +496,7 @@ class BeliefProvider:
       "filter_config": asdict(self.estimator.config),
       "measurement_config": asdict(self.estimator.measurement_config),
       "default_joint_pos": self.estimator.default_joint_pos.detach().clone(),
-      "mean": state.belief.mean.to_full().detach().clone(),
-      "rotation": state.belief.mean.rotation.detach().clone(),
+      "mean": pack_mean(state.belief.mean).detach().clone(),
       "covariance_sqrt": state.belief.covariance_sqrt.detach().clone(),
       "context": state.context.detach().clone(),
       "episode_id": state.episode_id.detach().clone(),
@@ -519,17 +519,7 @@ class BeliefProvider:
       or not torch.equal(data["default_joint_pos"], self.estimator.default_joint_pos)
     ):
       raise ValueError("Provider/filter configuration mismatch")
-    mean = LieState.from_full(data["mean"])
-    rotation = data["rotation"]
-    tol = 128 * torch.finfo(mean.rotation.dtype).eps
-    if (
-      rotation.shape != mean.rotation.shape
-      or rotation.dtype != mean.rotation.dtype
-      or rotation.device != mean.rotation.device
-      or not torch.allclose(mean.rotation, rotation, atol=tol, rtol=tol)
-    ):
-      raise ValueError("Snapshot rotation disagrees with the packed mean")
-    mean = replace(mean, rotation=rotation)
+    mean = unpack_mean(data["mean"])
     belief = BeliefState(mean, covariance_sqrt=data["covariance_sqrt"])
     heads = data["head_priors"]
     head_priors = (
@@ -538,7 +528,7 @@ class BeliefProvider:
       else (
         heads["episode_id"],
         BeliefState(
-          LieState.from_full(heads["mean"]), covariance_sqrt=heads["covariance_sqrt"]
+          unpack_mean(heads["mean"]), covariance_sqrt=heads["covariance_sqrt"]
         ),
       )
     )

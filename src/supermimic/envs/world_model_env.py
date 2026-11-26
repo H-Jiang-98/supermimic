@@ -37,7 +37,11 @@ from supermimic.estimator_inputs import (
   build_actor_critic_goals,
   sample_proprio,
 )
-from supermimic.motion_loader import motion_content_digest, motion_tensor_versions
+from supermimic.motion_loader import (
+  MotionLoader,
+  motion_content_digest,
+  motion_tensor_versions,
+)
 from supermimic.replay_buffer import ReplayBuffer
 from supermimic.utils.helpers import matrix_to_quat, normalized_action_limits
 from supermimic.utils.lie_state import LieState
@@ -468,11 +472,13 @@ class WorldModelEnv(ABC):
       self._policy_motion_digest()
       yield
       return
-    self._readonly_motion = (
-      self.motion,
-      motion_tensor_versions(self.motion),
-      motion_content_digest(self.motion),
+    versions = motion_tensor_versions(self.motion)
+    digest = (
+      self.motion.training_digest(versions)
+      if isinstance(self.motion, MotionLoader)
+      else motion_content_digest(self.motion)
     )
+    self._readonly_motion = self.motion, versions, digest
     try:
       yield
       self._policy_motion_digest()
@@ -907,7 +913,7 @@ class WorldModelEnv(ABC):
     else:
       posterior = self._resolve_posterior(posterior, sensor, actions, reset=True)
     goals = self._prepare_estimator_goals(
-      aux, rep, batch["motion_time"], alignment, posterior
+      aux, rep, batch["motion_time"], alignment, posterior, batch["sim_ctx"]
     )
     critic = None
     if self.eit_critic:
@@ -1042,6 +1048,7 @@ class WorldModelEnv(ABC):
       pending["times"],
       self.reference_alignment,
       posterior,
+      self.sim_ctx,
     )
     past = self._past_sensors
     if self.history_length > 1:
@@ -1087,7 +1094,7 @@ class WorldModelEnv(ABC):
       sensor = self._sensor_from_state(rep, aux, joints, actions, self.sim_ctx)
       posterior = self._resolve_posterior(posterior, sensor, actions, reset=False)
     goals = self._prepare_estimator_goals(
-      aux, rep, times, self.reference_alignment, posterior
+      aux, rep, times, self.reference_alignment, posterior, self.sim_ctx
     )
     # A direct injection can be validated before drawing any new measurement.
     if sensor is None:
@@ -1333,6 +1340,7 @@ class WorldModelEnv(ABC):
         self.motion_times,
         self.reference_alignment,
         self._posterior,
+        self.sim_ctx,
       )
       self._commit_estimator_goals(goals)
       return
@@ -1349,12 +1357,13 @@ class WorldModelEnv(ABC):
     times: torch.Tensor,
     alignment: EpisodeAlignment,
     posterior: PosteriorInput | None,
+    context: torch.Tensor,
   ) -> _EstimatorGoals:
     assert self.estimator_input_config is not None
     reference = self.representation.reference_window(self.motion, times, alignment)
     truth = self.representation.true_rpv(aux, rep)
     actor, uncertainty, critic = build_actor_critic_goals(
-      self.estimator_input_config, truth, posterior, reference
+      self.estimator_input_config, truth, posterior, reference, context
     )
     bodies = self._aligned_reference_bodies(self.motion.body_state(times), alignment)
     return _EstimatorGoals(bodies, actor, critic, uncertainty)

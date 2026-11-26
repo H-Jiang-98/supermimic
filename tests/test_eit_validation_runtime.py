@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from supermimic.runners.eit_training import EITTraining
+from supermimic.runners.belief_training import BeliefModelTraining
 from supermimic.validation.config import StudyConfig
 from supermimic.validation.domains import apply_domains, domain_table
 from supermimic.validation.runtime import make_env_config, run_batch
@@ -19,7 +19,7 @@ def checkpoint(tmp_path_factory):
   with physical_runner(root, "C") as runner:
     runner.cfg.estimator_inputs = replace(runner.cfg.estimator_inputs, mode="train")
     path = root / "training.pt"
-    EITTraining(runner).save(path)
+    BeliefModelTraining(runner).save(path)
   return root, torch.load(path, map_location="cpu", weights_only=True)
 
 
@@ -73,7 +73,9 @@ def test_physical_domains_and_fullclip_continuity(checkpoint, monkeypatch):
     )
   assert meta["status"] == "complete" and meta["scored_frames"] == 8
   assert arrays["bin_counts"].tolist() == [2, 2, 2, 2]
-  assert arrays["first_failure_s"].tolist() == [0.0, 0.0]
+  assert arrays["first_failure_s"].tolist() == [0.02, 0.02]
+  assert arrays["valid_frame_counts"].tolist() == [1, 1]
+  assert np.isnan(arrays["bins"][1:]).all()
   assert np.isfinite(arrays["full"]).all()
   assert len(applied) == 1
 

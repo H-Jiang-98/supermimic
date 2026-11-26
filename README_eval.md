@@ -3,11 +3,7 @@
 先完成 [环境安装](README.md#setup)，以下命令均在仓库根目录执行。
 `play.py` 加载已有模型，在单个仿真环境中观察策略跟踪效果和世界模型预测，不更新权重。
 
-`eit_rpv_v1` 的 A/B/C 组使用本地 `training.pt` 做定量评估、播放和 ONNX actor 导出。评估与播放共用 `EITPolicyAdapter`，支持 PyTorch actor 和对应快照导出的 ONNX actor。
-
-EIT v6 的短程 pilot、恢复验证、预算审计与固定轨迹诊断见 [运行与诊断](docs/eit_operations.md)。
-
-完整片段评测使用 `eval_eit_validation.toml` 选择策略，每条轨迹同时生成 tracking 和在线 odometry 两套结果。运行命令、图表路径和三层回放见 [联合评测说明](docs/eit_validation.md)。
+EIT v7 支持 mean-direct、mean-residual、belief-direct 和 belief-residual。完整片段评测通过 `eval_eit_v7.toml` 选择 checkpoint；每条轨迹同时生成 tracking 和在线 odometry 两套结果。[训练与评测入口](README_eit.md)
 
 ## EIT 定量评估和播放
 
@@ -17,24 +13,21 @@ MPKPE、root-relative MPKPE、关节速度 RMS 和末端位姿误差函数。每
 
 ```bash
 OMP_NUM_THREADS=1 .venv/bin/python -m supermimic.scripts.eval_eit \
-  --checkpoint logs/eit-v6/B/training.pt \
+  --checkpoint logs/eit-v7/seed2027/belief-direct/training.pt \
   --motion-file data/motions/walk1_subject1.npz --device cpu \
-  --num-envs 8 --output logs/eit-v6/B/evaluation.json
+  --num-envs 8 --output logs/eit-v7/seed2027/belief-direct/evaluation.json
 
 .venv/bin/python -m supermimic.scripts.play SuperMimic-GenCoord-G1 \
-  --eit-checkpoint logs/eit-v6/B/training.pt \
+  --eit-checkpoint logs/eit-v7/seed2027/belief-direct/training.pt \
   --motion-file data/motions/walk1_subject1.npz --viewer viser
 ```
 
-评估和播放在每个真实 episode 开始时按 checkpoint 的带噪真值先验初始化，随后每帧用实际执行的动作和传感测量更新后验。三组的评估目标均使用在线后验均值，C 组还读取任务 covariance。推理使用固定的归一化统计，关闭动作探索。训练参数 `--posterior-save-stride` 只控制训练 replay，评估时无需设置。
+评估和播放在每个真实 episode 开始时按 checkpoint 的带噪真值先验初始化，随后每帧用实际执行的动作和传感测量更新后验。四组均使用在线后验、固定归一化统计和确定性动作。mean 组屏蔽协方差输入，belief 组保留该输入。
 
-| 本地训练快照 | 支持的用途 |
+| 当前快照 | 用途 |
 |---|---|
-| `eit_training_v6`，`stage=policy` | `train_eit` 续训、评估、播放和 ONNX actor 导出 |
-| `eit_training_v5`，`stage=policy` | 评估、播放和 ONNX actor 导出 |
-| `eit_model_training_v4`，`stage=model` | `train_belief` 续训、固定 actor 的评估、播放和 ONNX actor 导出 |
-
-策略快照须声明 full replay 并包含相应的 critic 契约（v6 使用 `eit_rpv_belief_critic_v3`，v5 使用 `eit_rpv_belief_critic_v2`）。推理加载器核对契约与世界模型的 context 宽度及 critic 首层的输入宽度。启动训练、生成共享初始化包及继续训练的命令见[训练说明](README_eit.md)。
+| `eit_training_v7`，`stage=policy` | `train_eit` 续训、评估、播放和 ONNX actor 导出 |
+| `eit_model_training_v5`，`stage=model` | `train_belief` 续训及固定 actor 评估 |
 
 `eval_eit` 允许不同于训练数据的兼容 motion，记录训练和评估两份内容指纹；这不改变
 续训的严格 motion 校验。末端名单由 `--ee-body-names` 指定，默认使用 G1 的左右
@@ -75,8 +68,8 @@ EIT viewer 的蓝紫色半透明模型标为 `online_posterior`，显示当前�
 ```bash
 PY=.venv/bin/python
 motion=data/motions/walk1_subject1.npz
-ckpt=logs/eit-v6/B/training.pt
-out=logs/eit-v6/diagnostics
+ckpt=logs/eit-v7/seed2027/belief-direct/training.pt
+out=logs/eit-v7/diagnostics
 "$PY" -m supermimic.scripts.eval_eit --checkpoint "$ckpt" --motion-file "$motion" \
   --num-envs 1 --seed 4795 --posterior-bin-steps 50 --record "$out/episodes.pt" \
   --export-onnx "$out/actor.onnx" --output "$out/evaluation.json"
