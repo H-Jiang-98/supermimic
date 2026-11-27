@@ -72,6 +72,14 @@ class MotionLoader:
   are wxyz and all root velocities are in the world frame.
   """
 
+  # These arrays are loaded by name from the motion files.
+  joint_pos: torch.Tensor
+  joint_vel: torch.Tensor
+  root_pos_w: torch.Tensor
+  root_quat_w: torch.Tensor
+  root_lin_vel_w: torch.Tensor
+  root_ang_vel_w: torch.Tensor
+
   @torch.inference_mode(False)
   @torch.no_grad()
   def __init__(

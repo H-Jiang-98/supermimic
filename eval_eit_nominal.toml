@@ -1,0 +1,56 @@
+# Paper nominal tracking. All paths are relative to this file.
+[checkpoints]
+prop_kp = "logs/eit_v7_two_base_methods_residual_Lafan_h32_2048envs_stride1/seed2027/prop_kp-residual/checkpoints/step-5000/training.pt"
+gt = "logs/eit_v7_two_base_methods_residual_Lafan_h32_2048envs_stride1/seed2027/gt-residual/checkpoints/step-5000/training.pt"
+mean = "logs/eit_v7_two_loop_methods_residual_Lafan_h32_2048envs_stride1/seed2027/mean-residual/checkpoints/step-5000/training.pt"
+belief = "logs/eit_v7_two_loop_methods_residual_Lafan_h32_2048envs_stride1/seed2027/belief-residual/checkpoints/step-5000/training.pt"
+
+[study]
+motion_files = [
+  "data/motions/dance1_subject1.npz",
+  "data/motions/dance1_subject2.npz",
+  "data/motions/dance1_subject3.npz",
+  "data/motions/dance2_subject1.npz",
+  "data/motions/dance2_subject2.npz",
+  "data/motions/dance2_subject3.npz",
+  "data/motions/dance2_subject4.npz",
+  "data/motions/dance2_subject5.npz",
+  "data/motions/fallAndGetUp1_subject1.npz",
+  "data/motions/fallAndGetUp1_subject4.npz",
+  "data/motions/fallAndGetUp1_subject5.npz",
+  "data/motions/fallAndGetUp2_subject2.npz",
+  "data/motions/fallAndGetUp2_subject3.npz",
+  "data/motions/fallAndGetUp3_subject1.npz",
+  "data/motions/fight1_subject2.npz",
+  "data/motions/fight1_subject3.npz",
+  "data/motions/fight1_subject5.npz",
+  "data/motions/fightAndSports1_subject1.npz",
+  "data/motions/fightAndSports1_subject4.npz",
+  "data/motions/jumps1_subject1.npz",
+  "data/motions/jumps1_subject2.npz",
+  "data/motions/jumps1_subject5.npz",
+  "data/motions/run1_subject2.npz",
+  "data/motions/run1_subject5.npz",
+  "data/motions/run2_subject1.npz",
+  "data/motions/run2_subject4.npz",
+  "data/motions/sprint1_subject2.npz",
+  "data/motions/sprint1_subject4.npz",
+  "data/motions/walk1_subject1.npz",
+  "data/motions/walk1_subject2.npz",
+  "data/motions/walk1_subject5.npz",
+  "data/motions/walk2_subject1.npz",
+  "data/motions/walk2_subject3.npz",
+  "data/motions/walk2_subject4.npz",
+  "data/motions/walk3_subject1.npz",
+  "data/motions/walk3_subject2.npz",
+  "data/motions/walk3_subject3.npz",
+  "data/motions/walk3_subject4.npz",
+  "data/motions/walk3_subject5.npz",
+  "data/motions/walk4_subject1.npz",
+]
+seeds = [2718, 2719, 2720, 2721, 2722, 2723, 2724, 2725, 2726, 2727, 2728, 2729, 2730, 2731, 2732, 2733]
+output = "artifacts/eit-validation/nominal-v1"
+
+[execution]
+device = "cuda:0"
+num_envs = 160

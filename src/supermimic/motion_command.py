@@ -215,6 +215,10 @@ class MotionCommand(BaseMotionCommand):
       joint_pos,
       joint_vel,
     )
+    if getattr(self.cfg, "exact_reference_joint_reset", False):
+      # The nominal evaluation starts at the recorded pose, including joints
+      # outside the training reset's soft (comfort) limits.
+      self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
 
   def update_relative_body_poses(self) -> None:
     # Keep the hybrid reward: fixed episode references for actor/global terms,
@@ -253,6 +257,7 @@ class MotionCommandCfg(BaseMotionCommandCfg):
   sampling_mode: Literal["adaptive", "uniform", "start", "external"] = "adaptive"
   fixed_reference_alignment: bool = False
   fixed_start_frames: list[int] | None = None
+  exact_reference_joint_reset: bool = False
 
   def build(self, env: ManagerBasedRlEnv) -> MotionCommand:
     return MotionCommand(self, env)

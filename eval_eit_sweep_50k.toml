@@ -1,0 +1,15 @@
+[study]
+baseline = "artifacts/eit-validation/nominal-v7-all-50001"
+baseline_identity = "0566bbadea1173c089ea13522f6ff4c0a713c08f9ec78646d25b4da1fe73c8f5"
+motion_root = "data/motions"
+output = "artifacts/eit-validation/uncertainty-50001"
+collected_steps = 50001
+training_seed = 2027
+device = "cuda:0"
+num_envs = 3200
+
+[checkpoints]
+prop_kp = "logs/eit_v7_two_base_methods_residual_Lafan_h32_2048envs_stride1/seed2027/prop_kp-residual/checkpoints/step-50000/training.pt"
+gt = "logs/eit_v7_two_base_methods_residual_Lafan_h32_2048envs_stride1/seed2027/gt-residual/checkpoints/step-50000/training.pt"
+mean = "logs/eit_v7_two_loop_methods_residual_Lafan_h32_2048envs_stride1/seed2027/mean-residual/checkpoints/step-50000/training.pt"
+belief = "logs/eit_v7_two_loop_methods_residual_Lafan_h32_2048envs_stride1/seed2027/belief-residual/checkpoints/step-50000/training.pt"

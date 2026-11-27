@@ -5,6 +5,75 @@
 
 EIT v7 支持 mean-direct、mean-residual、belief-direct 和 belief-residual。完整片段评测通过 `eval_eit_v7.toml` 选择 checkpoint；每条轨迹同时生成 tracking 和在线 odometry 两套结果。[训练与评测入口](README_eit.md)
 
+## 50k Belief Input 不确定性扫描
+
+50k 配置固定四个 `step-50000` 快照（内部 `collected_steps=50001`）、40 个完整 clip 和 16 个配对噪声 seed。离线报告由两批 nominal 原始轨迹重建。输出根目录为 `artifacts/eit-validation/uncertainty-50001`。[配置与归档身份](eval_eit_sweep_50k.toml)
+
+```bash
+.venv/bin/python -m supermimic.scripts.eval_eit_sweep baseline
+.venv/bin/python -m supermimic.scripts.eval_eit_sweep run --pilot
+.venv/bin/python -m supermimic.scripts.eval_eit_sweep run
+.venv/bin/python -m supermimic.scripts.eval_eit_sweep report
+```
+
+`baseline` 在 CPU 上重算 nominal 主表、配对区间和时间曲线。`run --pilot` 在专用目录中验证 walk 和 fall/get-up 各 32 个动作，并保存噪声和动作以便核对。`run` 完成四个新增条件后生成全套报告。单独运行一档可用 `run --condition sensor-4`，后续用 `report` 从完整结果离线出图。重复运行会校验已存的 tracking 和同次 Belief 后验，按原批次布局续跑。
+
+| 条件 | 初始先验标准差 | 观测标准差 | 实际新增轨迹 |
+|---|---:|---:|---:|
+| prior-2 / prior-4 | 2 / 4 倍 | 1 倍 | 每档 1,920；GT-Estimated、Mean、Belief 各 640 条 |
+| sensor-2 / sensor-4 | 1 倍 | 2 / 4 倍 | 每档 3,200；五种模式各 640 条 |
+
+先验倍率同时作用于首个观测前的均值扰动与协方差平方根。观测倍率同时作用于实际传感噪声和滤波器使用的测量标准差。标准化样本由 clip 内容、评测 seed 和噪声用途确定。先验扫描中，Prop.+KP 与 GT-Oracle 的结果沿用各自 nominal 轨迹。
+
+- `report/<条件>/tracking-errors-over-time.png` 叠加五种方法的六项误差，包括骨盆中心化、heading 对齐的 MPJPE 以及全局根位置误差。横轴为动作开始后的秒数，每个 1 秒区间取实际执行帧的等权均值，含失败步。下图显示每个方法在该区间有有效帧的轨迹数；虚线给出由 clip 原始长度决定的计划轨迹数。`tracking-time.csv` 保存贡献轨迹数、帧数和各项均值，无有效帧的误差留空。
+- `report/uncertainty-sweep.png` 绘制 SR、CR、P95 MPJPE 和尾部 cost 随两种倍率的变化。`uncertainty-sweep.csv` 保存各档估计、相对 nominal 的配对差值及 95% 区间。同一组 2,000 次 clip bootstrap 抽样保留该 clip 全部方法和 seed。
+- `<条件>/posterior-report/` 使用该条件同次 rollout 的 Belief 后验和 tracking。校准按实际用于控制的帧计算，速度积分另含末动作后的终点；完成与失败轨迹分组汇总。历史 nominal 后验位于原先的 posterior 复跑目录。
+
+## Belief Input 的 nominal 五模式主表
+
+从仓库根目录运行，默认使用四个 step-5000 残差 checkpoint、40 个完整 clip 和 16 个评测 seed。五种模式共享每个场景的测量噪声，使用滤波的三种模式共享初始扰动。物理参数固定为摩擦系数 0.75、零质心偏移和零编码器偏移。每条轨迹从参考首帧起步。[权重路径和场景配置](eval_eit_nominal.toml)
+
+```bash
+.venv/bin/python -m supermimic.scripts.eval_eit_nominal --dry-run
+.venv/bin/python -m supermimic.scripts.eval_eit_nominal run
+.venv/bin/python -m supermimic.scripts.eval_eit_nominal report
+```
+
+单个 GPU 进程按模式分组做 actor 和滤波推理，再统一推进 MuJoCo。GT-Oracle 和 GT-Estimated 共用冻结的 GT actor，GT-Estimated 和 Mean-in-Loop 共用冻结的 Mean 估计器，各轨迹有独立的后验和动作。actor、仿真、评分和 CUDA 滤波重放均使用 `torch.inference_mode()`。EKF 首次捕获 CUDA 计算或使用 CPU 时，在 `no_grad` 下求协方差传播所需的单步状态 Jacobian。后验与动作均不保留跨步梯度图。
+
+`--num-envs` 控制单卡容量。缩小验证规模时可重复传入 `--clip` 和 `--seed`，并用 `--output` 指定独立目录。以 `--layout sequential` 在同一组 clip 和 seed 上测量逐方法运行时间。重复 `run` 会校验并复用已完成的场景。
+
+在 32 GB RTX 5090 上，40 个 clip 各取前 128 个动作做容量测试，1,600 和 3,200 个槽位分别达到约 3.41 万和 4.59 万有效控制步/秒。该卡的整段评测使用 `run --num-envs 3200`。完整片段包含提前失败的轨迹，实际吞吐见本次输出的 `timing.json`。
+
+`tracking.csv` 包含五模式主表，`episodes.csv` 给出每条轨迹的失败原因、计划和执行步数、SR、CR 与代价。`report.json` 保存各项指标及三组方法差值的 95% 配对 clip bootstrap 区间。`episodes/` 中的逐步数据允许离线重建 P95。`timing.json` 记录运行容量、预热时间、有效控制步吞吐和 PyTorch 峰值显存。
+
+误差按实际执行动作后的状态计算，含触发失败的动作。骨架 MPJPE 使用 G1 的骨盆、躯干及双侧髋、膝、踝、肩、肘、腕，共 14 个跟踪刚体。每套骨架分别平移到自身骨盆中心并去除自身 heading。SR、CR、Cost 和最差 10% 的 CVaR 按 episode 等权统计。失败后的剩余步每步计单位代价。
+
+### Nominal 后验重复评测和离线报告
+
+以下命令使用首次运行的四个 checkpoint 和相同噪声 seed，按原顺序将 3,200 个场景放进一个 mixed 批次。五种模式均保存 tracking。Belief-in-Loop 另存 640 个后验文件。重复评测的默认目录为 `artifacts/eit-validation/nominal-v1-posterior`。
+
+```bash
+.venv/bin/python -m supermimic.scripts.eval_eit_nominal run --record-belief-posterior --layout mixed --num-envs 3200
+.venv/bin/python -m supermimic.scripts.eval_eit_nominal posterior-report
+.venv/bin/python -m supermimic.scripts.eval_eit_nominal merge
+```
+
+`posterior-report` 和 `merge` 均可离线运行。通过 `--output` 指定重复运行目录，通过 `merge --baseline` 指定首次运行目录。续跑会按原布局重放含缺失或损坏文件的完整批次，同批次的 tracking 和后验一起更新。每个后验文件校验 checkpoint、场景、终止状态、执行帧散列和状态步号。
+
+| 输出 | 口径 |
+|---|---|
+| `merged-report/pooled-tracking.csv`、`tracking.csv` | 合并主表每模式一行。 首次、本次、合并估计和本次减首次的差值，各附 95% 区间。以 clip 为单位配对重采样 2,000 次，同一 clip 的两次重复及其全部模式和 seed 一起抽取。 |
+| `merged-report/paired-episodes.csv`、`repeat-differences.csv` | 按模式、clip、seed 对齐两次运行，列出成功翻转、执行步数和代价差异。 |
+| `posteriors/<clip>/<seed>.npz` | τ 个实际动作对应 τ + 1 个状态。首帧为初始测量校正后的后验，末帧为实际末动作和终点测量更新后的后验。世界位置单位为 m，旋转矩阵将机体系映射到世界系，速度为机体系 m/s。 |
+| `posterior-report/calibration.csv`、`validation.json` | 对本次 Belief 实际用过的 τ 个后验，误差取真值减均值。roll/pitch 使用 wrap 角差和 ZYX 边际方差。真值或后验的 ∣cos(pitch)∣ < 10⁻⁶ 时，roll 无唯一值。pitch 仍可计算点估计误差；后验在奇异姿态时，roll 和 pitch 的 Euler 方差均不可用。`accuracy_frames` 为误差统计分母，`valid_frames` 为覆盖率分母。联合 NEES 使用重力方向在后验切平面的球面对数、高度及机体系速度，以六维协方差做 Cholesky 求解。 |
+| `posterior-report/velocity-integration.csv`、`episodes.csv` | 用真值朝向旋转估计速度，以实际控制周期做梯形积分，仅在起点对齐。按成功和失败分组，对 episode 等权平均；相对漂移要求真实三维路径长度大于 1 m。逐轨迹表含本次同轨 tracking 状态和指标。 |
+| `merged-report/tracking.png` | 并列显示两次运行的点估计和合并结果的配对 clip bootstrap 95% 区间。 |
+| `posterior-report/velocity-integration.png` | 完成轨迹与失败前缀的误差累积分布，菱形标出每组的 episode 等权均值。 |
+| `posterior-report/*.png`、`coverage.csv` | 所有有效控制帧的覆盖率曲线，以及 seed 2718 的指定 walk 和 fallAndGetUp 示例时序、XY 路径和位置误差。 |
+
+复核记录开关时，先用相同的 `--clip walk1_subject1.npz --clip fallAndGetUp1_subject1.npz --seed 2718 --num-envs 10 --audit-controls` 选项分别运行两次，在两个独立目录中关闭和开启 `--record-belief-posterior`。运行 `compare-controls --baseline OFF_DIR --output ON_DIR` 可生成逐场景的首步动作、全部共享动作和噪声前缀、终止状态及 tracking 帧差异。
+
 ## EIT 定量评估和播放
 
 评估沿用 mjlab `tasks/tracking/scripts/evaluate.py` 的首个 episode 循环，直接调用其

@@ -208,6 +208,7 @@ class CapturedFilter:
         self.result = run()
     for target, value in zip(self.buffers, incoming, strict=True):
       target.copy_(value)
+    self.measurement_std.copy_(measurement_std)
     self.graph.replay()
     return self.result
 
