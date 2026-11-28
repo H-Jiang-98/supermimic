@@ -6,6 +6,7 @@ already corrected *full* posterior; history padding is never a filter update.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
@@ -200,6 +201,9 @@ class BeliefProvider:
     episode_id: torch.Tensor | None = None,
     time_index: torch.Tensor | None = None,
     reset_truth: LieState | None = None,
+    heading: torch.Tensor | None = None,
+    heading_mask: torch.Tensor | None = None,
+    heading_std: float | None = None,
   ) -> PreparedBelief:
     """Compute a candidate without mutating the current posterior.
 
@@ -220,6 +224,24 @@ class BeliefProvider:
         )
       if reset_mask.shape != (batch,) or reset_mask.dtype != torch.bool:
         raise ValueError("reset_mask must be a boolean batch vector")
+      if heading is None:
+        if heading_mask is not None or heading_std is not None:
+          raise ValueError("Heading packets require values, a mask and noise std")
+      else:
+        if (
+          heading.shape != (batch,)
+          or heading.device != measurement.device
+          or heading.dtype != measurement.dtype
+          or heading_mask is None
+          or heading_mask.shape != (batch,)
+          or heading_mask.dtype != torch.bool
+          or heading_mask.device != measurement.device
+          or heading_std is None
+          or not math.isfinite(heading_std)
+          or heading_std <= 0
+        ):
+          raise ValueError("Invalid heading packet layout or noise std")
+        heading, heading_mask = self._ordinary(heading), heading_mask.clone()
       if context is None:
         if self.state is None:
           raise ValueError("Initial provider call requires explicit context")
@@ -344,6 +366,24 @@ class BeliefProvider:
         for ids, piece in pieces:
           lower = lower.index_copy(0, ids, piece.covariance_sqrt)
         belief = BeliefState(LieState(**fields), covariance_sqrt=lower)
+      if heading is not None:
+        heading_ids = heading_mask.nonzero().flatten()
+        if len(heading_ids):
+          corrected = self.estimator.correct_heading(
+            belief.index(heading_ids), heading[heading_ids], heading_std
+          )
+          fields = {
+            name: getattr(belief.mean, name).index_copy(
+              0, heading_ids, getattr(corrected.mean, name)
+            )
+            for name in _FIELDS
+          }
+          belief = BeliefState(
+            LieState(**fields),
+            covariance_sqrt=belief.covariance_sqrt.index_copy(
+              0, heading_ids, corrected.covariance_sqrt
+            ),
+          )
       if not track_grad:
         belief, context = belief.detach(), context.detach()
       summary = {"innovation_norm": measurement.new_zeros(batch)}

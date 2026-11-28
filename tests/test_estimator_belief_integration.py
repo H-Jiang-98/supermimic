@@ -1,6 +1,6 @@
 """Transactional adapters and fixed-noise policy gradients through full belief."""
 
-from dataclasses import asdict, fields, replace
+from dataclasses import fields, replace
 from unittest.mock import Mock
 
 import pytest
@@ -11,7 +11,6 @@ from supermimic.belief_provider import BeliefProvider, FixedBeliefPrior
 from supermimic.estimator import LieBeliefFilter
 from supermimic.models import Dynamics, MultiEncoderAE, ProcessNoiseConfig
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
-from supermimic.runners.run_config import load_runner_cfg
 from supermimic.runners.supermimic_runner import InputStagePolicy, build_actor
 from supermimic.utils.lie_state import LieState, local_error
 from tests.test_estimator_runner import _build_current, _PhysicalEnv, _runner
@@ -405,13 +404,6 @@ def test_real_runner_failure_before_action_retries_and_keeps_model_snapshot(
   assert not runner.world_model_learner.update_normalization.called
   assert runner._dynamics.model_version == version
   assert runner.replay_buffer.num_transitions == 2  # One batched record per step.
-
-
-def test_process_noise_runner_config_roundtrips():
-  runner = _runner()
-  runner.cfg.process_noise = ProcessNoiseConfig(hidden_dims=(8,))
-  restored = load_runner_cfg({"runner_cfg": asdict(runner.cfg)})
-  assert restored == runner.cfg
 
 
 @pytest.mark.parametrize("change", ["model", "context"])

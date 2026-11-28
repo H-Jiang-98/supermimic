@@ -75,25 +75,16 @@ class TestMultiTaskWorldModelEnv:
     assert obs["goal_motion"].shape == (BATCH, MOTION_GOAL_DIM)
     assert obs["goal_velocity"].shape == (BATCH, VELOCITY_GOAL_DIM)
 
-  def test_step_advances_motion_times(self):
+  def test_step_advances_motion_times_and_returns_correct_shapes(self):
     env = _make_env()
     env.reset()
     times_before = env.motion_times.clone()
-    env.step(torch.zeros(BATCH, ACTION_DIM))
+    assert env.num_actions == ACTION_DIM
+    obs, rewards, dones, _ = env.step(torch.zeros(BATCH, env.num_actions))
     assert (env.motion_times == times_before + 1).all()
-
-  def test_step_returns_correct_shapes(self):
-    env = _make_env()
-    env.reset()
-    obs, rewards, dones, _ = env.step(torch.zeros(BATCH, ACTION_DIM))
     assert obs["history"].shape[0] == BATCH
     assert rewards.shape == (BATCH,)
     assert dones.shape == (BATCH,)
-
-  def test_num_actions_is_joint_dim(self):
-    """The actor outputs joint actions; env consumes them directly."""
-    env = _make_env()
-    assert env.num_actions == ACTION_DIM
 
 
 class TestHistoryRing:

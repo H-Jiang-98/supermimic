@@ -1,14 +1,19 @@
-# EIT v6 概览与配置教程：README_eit.md
-# 在仓库根目录预览调度：python3 src/supermimic/scripts/launch_eit.py --dry-run
-# 去掉 --dry-run 即启动。所有方法共用 [training]，同一 seed 共用一份初始化。
 [paths]
 environment_root = "/mnt/cpfs/zbl-cpfs-new/USERS/leojiang/supermimic_ws" # 使用 .venv/bin/python
 dataset_root = "/mnt/cpfs/zbl-cpfs-new/dataset/leojiang/supermimic_ws"
 motion_file = "motions/*.npz" # 相对 dataset_root；支持单个 NPZ 或 glob。
 checkpoint_root = "/mnt/cpfs/zbl-cpfs-new/CKPT/leojiang/supermimic_ws"
-experiment = "eit_v6_Lafan_compiled_h32_2048envs_stride1" # 输出：checkpoint_root/experiment/seed<seed>/<方法>/
+experiment = "eit_v8_three_methods_residual_Lafan_h32_2048envs_stride1" # 输出：checkpoint_root/experiment/seed<seed>/<方法>/
 
 [training]
+policy_version = "v8"
+gt_rotation_std = 0.03
+gt_position_std = 0.03
+gt_velocity_std = 0.20
+heading_dropout_probability = 0.25
+heading_min_hz = 0.5
+heading_max_hz = 5.0
+heading_std = 0.05
 jacobian_backend = "increment" # 35 维网络增量求导，再通过积分组装 70x70 Jacobian。
 eager = false # CUDA 默认编译训练热点，true 用于 eager 对照。
 policy_cuda_graphs = true # 完整 actor–critic 更新单图回放；actor 尾批整次回退，eager=true 关闭。
@@ -43,6 +48,10 @@ exploration = 0.0 # std of action noise
 mean_hidden_dims = [2048, 2048, 2048] # World model mean head
 cov_hidden_dims = [128, 64] # World model process covariance head
 actor_hidden_dims = [2048, 1024, 512, 256]
+film_hidden_dims = [128, 64] # FiLM MLP 隐藏层；列表长度控制深度，各元素控制宽度。
+# v8 输入为 45 维协方差编码，输出 gamma/beta 各 actor_hidden_dims[0] 维。
+# 三组使用相同 FiLM 形状；仅 belief 启用并训练，GT/mean 旁路。
+# 输出层保持零初始化；学习率沿用 policy_lr。
 critic_hidden_dims = [256, 128]
 jacobian_batch_chunk_size = 512
 
@@ -60,17 +69,25 @@ ls_iterations = 50 # 当前任务默认：20；每次线搜索的迭代上限。
 # 使用 nvidia-smi 的物理 GPU 编号。每个方法的 seeds 按顺序轮流分给 gpus。
 # 方法可共用 GPU；每张卡同时只跑一个进程。删除整个方法表即可跳过该方法。
 
-[methods.A]
+[initial_belief]
+attitude = 0.03
+position = 0.03
+body_linear_velocity = 0.20
+angular_velocity = 0.12
+joint_position = 0.006
+joint_velocity = 0.30
+
+[methods.gt]
+gpus = [1]
+seeds = [2027]
+residual_actor = true
+
+[methods.mean]
 gpus = [0]
 seeds = [2027]
-#seeds = [2027, 2028, 2029, 2030, 2031]
+residual_actor = true
 
-[methods.B]
-gpus = [6]
+[methods.belief]
+gpus = [1]
 seeds = [2027]
-#seeds = [2027, 2028, 2029, 2030, 2031]
-
-[methods.C]
-gpus = [7]
-seeds = [2027]
-#seeds = [2027, 2028, 2029, 2030, 2031]
+residual_actor = true

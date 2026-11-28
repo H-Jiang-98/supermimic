@@ -23,8 +23,10 @@ from supermimic.local_control import (
   local_covariance_features,
   local_state,
   privileged_goal,
+  root_tracking_covariance,
+  root_tracking_error,
 )
-from supermimic.utils.lie_state import LieState
+from supermimic.utils.lie_state import LieState, boxplus
 from supermimic.utils.validation import (
   check_covariance,
   covariance_encoding_invalid,
@@ -33,6 +35,7 @@ from supermimic.utils.validation import (
 )
 
 INPUT_VERSION = "eit_se3_inputs_v2"
+V8_INPUT_VERSION = "eit_tracking_history_v8"
 COVARIANCE_ENCODING = "log_std_corr_v1"
 NUM_REFERENCE_FRAMES = 10
 GOAL_BLOCK_ORDER = (
@@ -132,15 +135,29 @@ class EITInputConfig:
   mode: Literal["train", "eval"] = "train"
   history_length: int = 5
   residual_actor: bool = False
-  version: str = INPUT_VERSION
+  version: str | None = None
   covariance_encoding: str | None = None
   covariance_std_floor: float = 1e-6
   covariance_scales: tuple[float, float, float] = (1.0, 1.0, 1.0)
   measurement_noise: GaussianMeasurementConfig = field(
     default_factory=GaussianMeasurementConfig
   )
+  policy_version: Literal["v7", "v8"] = "v7"
+  gt_pose_std: tuple[float, float] = (0.03, 0.03)
+  gt_velocity_std: float = 0.2
 
   def __post_init__(self) -> None:
+    if self.policy_version not in ("v7", "v8"):
+      raise ValueError("Unsupported EIT policy version")
+    if self.v8 and self.group not in ("gt", "mean", "belief"):
+      raise ValueError("EIT v8 requires gt, mean or belief")
+    if self.v8 and self.history_length != 5:
+      raise ValueError("EIT v8 requires five complete history frames")
+    if len(self.gt_pose_std) != 2 or any(
+      not math.isfinite(value) or value < 0
+      for value in (*self.gt_pose_std, self.gt_velocity_std)
+    ):
+      raise ValueError("GT noise requires finite nonnegative standard deviations")
     if self.group not in ("A", "B", "C", *LOCAL_METHODS):
       raise ValueError(f"Unknown ablation group: {self.group}")
     if type(self.residual_actor) is not bool or (
@@ -151,12 +168,15 @@ class EITInputConfig:
       raise ValueError(f"Unknown actor input mode: {self.mode}")
     if not isinstance(self.history_length, int) or self.history_length <= 0:
       raise ValueError("history_length must be a positive integer")
-    expected_encoding = (
-      "local68_raw_vech_v1" if self.local_control else COVARIANCE_ENCODING
-    )
+    expected_version = V8_INPUT_VERSION if self.v8 else INPUT_VERSION
+    if self.version is None:
+      object.__setattr__(self, "version", expected_version)
+    expected_encoding = self.default_covariance_encoding
     if self.covariance_encoding is None:
       object.__setattr__(self, "covariance_encoding", expected_encoding)
-    if self.version != INPUT_VERSION or self.covariance_encoding != expected_encoding:
+    if (
+      self.version != expected_version or self.covariance_encoding != expected_encoding
+    ):
       raise ValueError("Unsupported estimator actor input/covariance version")
     if not math.isfinite(self.covariance_std_floor) or self.covariance_std_floor <= 0:
       raise ValueError("covariance_std_floor must be finite and positive")
@@ -168,6 +188,37 @@ class EITInputConfig:
       )
     if not isinstance(self.measurement_noise, GaussianMeasurementConfig):
       raise TypeError("measurement_noise must be GaussianMeasurementConfig")
+
+  @property
+  def v8(self) -> bool:
+    return self.policy_version == "v8"
+
+  @property
+  def actor_frame_dim(self) -> int:
+    return 102 if self.v8 else 93
+
+  @property
+  def observation_layout(self) -> dict:
+    return {
+      "history_length": self.history_length,
+      "frame_dim": self.actor_frame_dim,
+      "order": "oldest_first",
+      "fields": [("proprio", 64), ("previous_executed_action", 29)]
+      + (
+        [
+          ("se3_log_state_inverse_reference", 6),
+          ("reference_velocity_in_state_body_minus_body_velocity", 3),
+        ]
+        if self.v8
+        else []
+      ),
+    }
+
+  @property
+  def default_covariance_encoding(self) -> str:
+    if self.v8:
+      return "root_tracking9_log_std_corr_v1"
+    return "local68_raw_vech_v1" if self.local_control else COVARIANCE_ENCODING
 
   @property
   def local_control(self) -> bool:
@@ -183,6 +234,8 @@ class EITInputConfig:
 
   @property
   def uses_posterior(self) -> bool:
+    if self.v8:
+      return self.group != "gt" or self.mode == "eval"
     return not self.unfiltered_policy and (self.group != "A" or self.mode == "eval")
 
   @property
@@ -195,14 +248,22 @@ class EITInputConfig:
     return self.group not in ("A", *BASELINES)
 
   def to_dict(self) -> dict[str, Any]:
-    return asdict(self)
+    values = asdict(self)
+    if not self.v8:
+      for name in ("policy_version", "gt_pose_std", "gt_velocity_std"):
+        values.pop(name)
+    return values
 
   @classmethod
   def from_dict(cls, values: dict[str, Any]) -> EITInputConfig:
     values = dict(values)
+    if "policy_version" not in values:
+      values.update(policy_version="v7", gt_pose_std=(0.03, 0.03), gt_velocity_std=0.2)
     if "version" not in values or "covariance_encoding" not in values:
       raise ValueError("Checkpoint lacks estimator actor input version metadata")
-    if values["version"] != INPUT_VERSION:
+    if values["version"] != (
+      V8_INPUT_VERSION if values.get("policy_version") == "v8" else INPUT_VERSION
+    ):
       raise ValueError(
         f"Unsupported estimator input version {values['version']!r}; expected {INPUT_VERSION}"
       )
@@ -217,6 +278,8 @@ class EITInputConfig:
       )
     if "covariance_scales" in values:
       values["covariance_scales"] = tuple(values["covariance_scales"])
+    if "gt_pose_std" in values:
+      values["gt_pose_std"] = tuple(values["gt_pose_std"])
     return cls(**values)
 
 
@@ -608,6 +671,11 @@ def build_actor_features(
   reference: ReferenceWindow,
   context: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+  if config.v8:
+    goal, condition = v8_actor_features(config, posterior, reference)
+    if not torch.isfinite(goal).all() or not torch.isfinite(condition).all():
+      raise ValueError("Non-finite v8 actor input")
+    return goal, condition
   if config.local_control:
     if config.group == "gt" and not isinstance(truth, LieState):
       raise ValueError("GT modulation requires the full local ground-truth state")
@@ -665,6 +733,10 @@ def build_actor_critic_goals_kernel(
   config, truth, posterior, reference, constants, context=None
 ):
   """Tensor-only goals and numerical status for a fixed training configuration."""
+  if config.v8:
+    goal, condition = v8_actor_features(config, posterior, reference, constants)
+    invalid = ~torch.isfinite(condition).all(-1) | ~torch.isfinite(goal).all(-1)
+    return goal, condition, privileged_goal(truth, reference), invalid
   if config.local_control:
     goal, condition = local_actor_features(config, truth, posterior, reference, context)
     invalid = ~torch.isfinite(condition).all(-1) | ~torch.isfinite(goal).all(-1)
@@ -709,3 +781,56 @@ def local_actor_features(config, truth, posterior, reference, context):
     error = y - local.y
     covariance = local_covariance_features(posterior.state, posterior.factor)
   return local.goal, torch.cat((y, error, context, covariance, local.next_joint), -1)
+
+
+def perturb_gt_state(truth, noise, config):
+  """Apply caller-owned standard Gaussian noise in right SE(3)/body velocity."""
+  # Scalar arithmetic stays on device, including eager CUDA graph capture.
+  delta = torch.cat(
+    (
+      noise[..., :3] * config.gt_pose_std[0],
+      noise[..., 3:6] * config.gt_pose_std[1],
+      noise[..., 6:] * config.gt_velocity_std,
+      noise.new_zeros(*noise.shape[:-1], 61),
+    ),
+    -1,
+  )
+  return boxplus(truth, delta)
+
+
+def v8_tracking_frame(sensor, truth, posterior, reference, config, gt_noise=None):
+  if config.uses_posterior:
+    state = posterior.state
+  else:
+    if gt_noise is None:
+      raise ValueError("v8 GT frames require explicitly pre-sampled noise")
+    state = perturb_gt_state(truth, gt_noise, config)
+  error = root_tracking_error(
+    state,
+    reference.rotation[..., 0, :, :],
+    reference.position[..., 0, :],
+    reference.velocity[..., 0, :],
+  )
+  return torch.cat((sensor, error), -1)
+
+
+def v8_actor_features(config, posterior, reference, constants=None):
+  local = reference.local
+  if local is None:
+    raise ValueError("v8 requires a current and future motion reference")
+  if config.uses_uncertainty:
+    covariance = root_tracking_covariance(
+      posterior.state,
+      posterior.factor,
+      reference.rotation[..., 0, :, :],
+      reference.position[..., 0, :],
+      reference.velocity[..., 0, :],
+    )
+    if constants is None:
+      constants = covariance_encoding_constants(
+        covariance, config.covariance_scales, config.covariance_std_floor
+      )
+    features = encode_covariance_kernel(covariance, constants)
+  else:
+    features = local.goal.new_zeros(*local.goal.shape[:-1], 45)
+  return local.goal, torch.cat((features, local.next_joint), -1)

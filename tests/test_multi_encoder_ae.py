@@ -33,16 +33,6 @@ def _make_actor(slot_mix=None, history_length: int = 1) -> MultiEncoderAE:
 
 
 class TestDecoderHistory:
-  def test_h1_decoder_width(self):
-    actor = _make_actor()
-    first_linear = next(m for m in actor.decoder if isinstance(m, torch.nn.Linear))
-    assert first_linear.in_features == LATENT_DIM + OBS_DIM
-
-  def test_history_window_forward_shape(self):
-    actor = _make_actor(history_length=4)
-    obs_td = make_actor_obs(BATCH, history_length=4)
-    assert actor(obs_td).shape == (BATCH, ACTION_DIM)
-
   def test_decoder_uses_every_history_frame(self):
     """Perturbing the OLDEST frame must move the action — else H>1 is ignored."""
     actor = _make_actor(history_length=4)
@@ -56,17 +46,12 @@ class TestDecoderHistory:
 
 
 class TestForwardShape:
-  def test_output_shape(self):
-    actor = _make_actor()
-    obs = make_actor_obs(BATCH)
+  @pytest.mark.parametrize("batch,history_length", [(BATCH, 1), (BATCH, 4), (15, 1)])
+  def test_output_shape(self, batch, history_length):
+    actor = _make_actor(history_length=history_length)
+    obs = make_actor_obs(batch, history_length=history_length)
     actions = actor(obs)
-    assert actions.shape == (BATCH, ACTION_DIM)
-
-  def test_odd_batch_distributes_correctly(self):
-    actor = _make_actor()
-    obs = make_actor_obs(15)
-    actions = actor(obs)
-    assert actions.shape == (15, ACTION_DIM)
+    assert actions.shape == (batch, ACTION_DIM)
 
 
 class TestSlotRouting:

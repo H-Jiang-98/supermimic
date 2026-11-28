@@ -49,6 +49,8 @@ def evaluation_config(saved: dict) -> SuperMimicRunnerCfg:
   cfg = load_runner_cfg({"runner_cfg": saved["runner_config"]})
   if cfg.estimator_inputs is None or cfg.process_noise is None:
     raise ValueError("EIT evaluation requires estimator inputs and process noise")
+  if cfg.estimator_inputs.v8:
+    raise ValueError("EIT v8 evaluation integration is not yet supported")
   cfg.estimator_inputs = replace(cfg.estimator_inputs, mode="eval")
   cfg.policy.noise = 0.0
   cfg.wandb_run_path = None

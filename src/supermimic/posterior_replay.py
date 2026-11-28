@@ -79,6 +79,12 @@ class PosteriorReplay:
       },
       [e, h],
     )
+    self.history_fields = ("actor_obs",)
+    if "tracking_error" in replay._storage.keys():
+      self.history_fields += ("tracking_error",)
+      self.boundary["tracking_error"] = replay._storage["tracking_error"].new_zeros(
+        e, h, 9
+      )
     self.boundary_sequences = torch.full((h,), -1, dtype=torch.long, device=device)
 
   @cached_property
@@ -256,7 +262,9 @@ class PosteriorReplay:
     row_grid = rows[:, None].expand_as(wanted)
     main = wanted >= replay.insert_count - replay.num_transitions
     source_slots = wanted % replay.buffer_size
-    obs = replay._storage["actor_obs"][row_grid, source_slots].clone()
+    obs = torch.cat(
+      [replay._storage[key][row_grid, source_slots] for key in self.history_fields], -1
+    )
     got_seq = self.frame_sequences[source_slots].clone()
     got_ep = replay._storage["episode_id"][row_grid, source_slots].clone()
     got_time = replay._storage["time_index"][row_grid, source_slots].clone()
@@ -266,7 +274,13 @@ class PosteriorReplay:
         raise ValueError("Unexplained replay history gap")
       boundary_slots = wanted[~main] % h
       boundary_rows = row_grid[~main]
-      obs[~main] = self.boundary["actor_obs"][boundary_rows, boundary_slots]
+      obs[~main] = torch.cat(
+        [
+          self.boundary[key][boundary_rows, boundary_slots]
+          for key in self.history_fields
+        ],
+        -1,
+      )
       got_ep[~main] = self.boundary["episode_id"][boundary_rows, boundary_slots]
       got_time[~main] = self.boundary["time_index"][boundary_rows, boundary_slots]
       got_seq[~main] = self.boundary_sequences[boundary_slots]

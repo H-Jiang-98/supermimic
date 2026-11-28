@@ -44,24 +44,16 @@ class TestMotionTrackingEnv:
     assert obs["actor"].shape[0] == BATCH
     assert obs["critic"].shape[0] == BATCH
 
-  def test_step_advances_motion_times(self):
+  def test_step_advances_motion_times_and_returns_correct_shapes(self):
     env = _make_env()
     env.reset()
     times_before = env.motion_times.clone()
-    env.step(torch.zeros(BATCH, ACTION_DIM))
+    assert env.num_actions == ACTION_DIM
+    obs, rewards, dones, _ = env.step(torch.zeros(BATCH, env.num_actions))
     assert (env.motion_times == times_before + 1).all()
-
-  def test_step_returns_correct_shapes(self):
-    env = _make_env()
-    env.reset()
-    obs, rewards, dones, _ = env.step(torch.zeros(BATCH, ACTION_DIM))
     assert obs["actor"].shape[0] == BATCH
     assert rewards.shape == (BATCH,)
     assert dones.shape == (BATCH,)
-
-  def test_num_actions_is_joint_dim(self):
-    env = _make_env()
-    assert env.num_actions == ACTION_DIM
 
   def test_history_window_widens_actor_obs(self):
     """history_length > 1 stacks H sensor frames into the actor obs (base ring)."""

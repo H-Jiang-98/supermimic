@@ -14,6 +14,7 @@ import torch
 from tensordict import TensorDict
 
 from supermimic.estimator_inputs import EITInputConfig, EpisodeAlignment, PosteriorInput
+from supermimic.models import ProcessNoiseConfig
 from supermimic.replay_buffer import ReplayBuffer
 from supermimic.runners.run_config import load_runner_cfg
 from supermimic.runners.supermimic_runner import (
@@ -392,6 +393,7 @@ def test_two_real_collection_steps_share_measurements_actions_and_reset_history(
 
 def test_json_roundtrip_preserves_complete_input_configuration():
   cfg = _config("B")
+  cfg.process_noise = ProcessNoiseConfig(hidden_dims=(8,))
   raw = json.loads(json.dumps(asdict(cfg)))
   restored = load_runner_cfg({"runner_cfg": raw})
   restored.validate_estimator_inputs()

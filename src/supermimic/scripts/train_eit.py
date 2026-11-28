@@ -15,7 +15,7 @@ from mjlab.tasks.registry import load_env_cfg
 
 import supermimic.tasks  # noqa: F401
 from supermimic.belief import GaussianStatePrior
-from supermimic.critic_inputs import CRITIC_INPUT_VERSION
+from supermimic.critic_inputs import CRITIC_INPUT_VERSION, V8_CRITIC_INPUT_VERSION
 from supermimic.eit_methods import BASELINES, LOCAL_METHODS
 from supermimic.estimator import FilterConfig
 from supermimic.estimator_inputs import EITInputConfig
@@ -30,6 +30,7 @@ from supermimic.runners.eit_training import (
 )
 from supermimic.runners.run_config import (
   EIT_INITIALIZATION_VERSION,
+  EIT_V8_INITIALIZATION_VERSION,
   LEGACY_INITIALIZATION_VERSION,
   load_runner_cfg,
 )
@@ -117,6 +118,14 @@ def main():
     ),
   )
   parser.add_argument("--group", choices=LOCAL_METHODS)
+  parser.add_argument("--policy-version", choices=("v7", "v8"), default="v7")
+  parser.add_argument("--gt-rotation-std", type=float, default=0.03)
+  parser.add_argument("--gt-position-std", type=float, default=0.03)
+  parser.add_argument("--gt-velocity-std", type=float, default=0.20)
+  parser.add_argument("--heading-dropout-probability", type=float, default=0.25)
+  parser.add_argument("--heading-min-hz", type=float, default=0.5)
+  parser.add_argument("--heading-max-hz", type=float, default=5.0)
+  parser.add_argument("--heading-std", type=float, default=0.05)
   parser.add_argument("--residual-actor", action="store_true")
   parser.add_argument("--stepwise-motion-encoder", action="store_true")
   for name, std in zip(GaussianStatePrior.names, GaussianStatePrior().std, strict=True):
@@ -234,6 +243,13 @@ def main():
   )
   parser.add_argument("--critic-hidden-dims", type=int, nargs="+", default=[256, 128])
   parser.add_argument(
+    "--film-hidden-dims",
+    type=int,
+    nargs="+",
+    default=list(SuperMimicRunnerCfg.film_hidden_dims),
+    help="FiLM hidden widths; v8 keeps the same architecture across all three groups",
+  )
+  parser.add_argument(
     "--jacobian-backend",
     choices=("increment", "vmap", "eager"),
     default="increment",
@@ -244,7 +260,7 @@ def main():
   parser.add_argument("--wandb-project", help="Common runner W&B project")
   parser.add_argument("--run-name", help="Common runner run name")
   args = parser.parse_args()
-  for name in ("mean_hidden_dims", "cov_hidden_dims"):
+  for name in ("mean_hidden_dims", "cov_hidden_dims", "film_hidden_dims"):
     if any(width < 1 for width in getattr(args, name)):
       parser.error(f"--{name.replace('_', '-')} requires positive hidden widths")
   os.environ.setdefault("WANDB_MODE", "offline")
@@ -315,13 +331,21 @@ def main():
     runner_cfg = SuperMimicRunnerCfg.for_estimator_inputs(
       args.group,
       estimator_inputs=EITInputConfig(
-        group=args.group, residual_actor=args.residual_actor
+        group=args.group,
+        residual_actor=args.residual_actor,
+        policy_version=args.policy_version,
+        gt_pose_std=(args.gt_rotation_std, args.gt_position_std),
+        gt_velocity_std=args.gt_velocity_std,
       ),
+      heading_dropout_probability=args.heading_dropout_probability,
+      heading_rate_hz=(args.heading_min_hz, args.heading_max_hz),
+      heading_std=args.heading_std,
       initial_prior=GaussianStatePrior(
         tuple(getattr(args, "prior_" + name) for name in GaussianStatePrior.names)
       ),
       dynamics_hidden_dims=tuple(args.mean_hidden_dims),
       actor_hidden_dims=tuple(args.actor_hidden_dims),
+      film_hidden_dims=tuple(args.film_hidden_dims),
       critic_hidden_dims=tuple(args.critic_hidden_dims),
       process_noise=ProcessNoiseConfig(hidden_dims=tuple(args.cov_hidden_dims)),
       filter_config=FilterConfig(
@@ -356,13 +380,22 @@ def main():
       noise=args.exploration,
     )
     num_envs = args.num_envs
+  assert runner_cfg.estimator_inputs is not None
+  initialization_version = (
+    EIT_V8_INITIALIZATION_VERSION
+    if runner_cfg.estimator_inputs.v8
+    else EIT_INITIALIZATION_VERSION
+  )
+  critic_version = (
+    V8_CRITIC_INPUT_VERSION if runner_cfg.estimator_inputs.v8 else CRITIC_INPUT_VERSION
+  )
   if initialization is None and args.resume is None:
     assert runner_cfg.estimator_inputs is not None
     noise_fingerprint = initialization_fingerprint(
       asdict(runner_cfg.estimator_inputs.measurement_noise)
     )[:12]
     initialization = args.output.parent / (
-      f"{EIT_INITIALIZATION_VERSION}_{CRITIC_INPUT_VERSION}_"
+      f"{initialization_version}_{critic_version}_"
       f"noise{noise_fingerprint}_seed{args.seed}.pt"
     )
   reference_path = None
@@ -410,8 +443,8 @@ def main():
       if args.prepare_initialization or not initialization.exists():
         initial = training.initialization_bundle()
         if args.prepare_initialization:
-          expected[EIT_INITIALIZATION_VERSION] = _preparation_fingerprint(initial)
-          if args.group not in BASELINES:
+          expected[initialization_version] = _preparation_fingerprint(initial)
+          if not runner_cfg.estimator_inputs.v8 and args.group not in BASELINES:
             # A two-method launcher may be reusing its previously published seed.
             legacy = dict(initial, version=LEGACY_INITIALIZATION_VERSION)
             for key in ("actors", "critics"):

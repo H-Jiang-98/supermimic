@@ -718,7 +718,10 @@ class WorldModelEnv(ABC):
     reference = next(self.dynamics.parameters())
     for key, tail in (
       ("state", (71,)),
-      ("sensor_window", (self.history_length, 93)),
+      (
+        "sensor_window",
+        (self.history_length, self.estimator_input_config.actor_frame_dim),
+      ),
       ("prev_action", (29,)),
       ("sim_ctx", (self.dynamics.sim_ctx_dim,)),
       ("alignment_rotation", (3, 3)),
@@ -749,7 +752,7 @@ class WorldModelEnv(ABC):
       raise ValueError("Prepared reference frame exceeds motion bounds")
     validate_rotation(batch["alignment_rotation"])
     LieState.from_full(batch["state"]).validate()
-    if not torch.equal(batch["sensor_window"][:, -1, -29:], batch["prev_action"]):
+    if not torch.equal(batch["sensor_window"][:, -1, 64:93], batch["prev_action"]):
       raise ValueError("Stored measurement actions must equal replay prev_action")
     if self.unfiltered_policy:
       return batch, None
@@ -1273,7 +1276,8 @@ class WorldModelEnv(ABC):
     from supermimic.critic_inputs import CriticInputConfig
 
     return self.critic_input_config or CriticInputConfig(
-      group=self.estimator_input_config.group
+      group=self.estimator_input_config.group,
+      policy_version=self.estimator_input_config.policy_version,
     )
 
   def _build_eit_critic(self, aux, rep, goal, history, context, belief):

@@ -18,12 +18,14 @@ from supermimic.local_control import (
   VECH_DIM,
   local_covariance_features,
   local_state,
+  root_tracking_error,
 )
 from supermimic.models import _CudaGraphNormalization, build_mlp
 from supermimic.utils.lie_state import TANGENT_VERSION, LieState
 from supermimic.utils.validation import check_covariance, validate_state_dict
 
 CRITIC_INPUT_VERSION = "eit_se3_critic_v4"
+V8_CRITIC_INPUT_VERSION = "eit_tracking_critic_v8"
 COMMON_DIM = 1233
 MEAN_DIM = 12
 COVARIANCE_DIM = 45
@@ -32,7 +34,8 @@ COVARIANCE_DIM = 45
 @dataclass(frozen=True)
 class CriticInputConfig:
   group: EstimatorGroup = "B"
-  version: str = CRITIC_INPUT_VERSION
+  version: str | None = None
+  policy_version: str = "v7"
   tangent_version: str = TANGENT_VERSION
   covariance_encoding: str | None = None
   covariance_scales: tuple[float, ...] = (1.0,) * 3  # theta, rho, nu
@@ -42,11 +45,22 @@ class CriticInputConfig:
   def __post_init__(self):
     if self.group not in ("A", "B", "C", *LOCAL_METHODS):
       raise ValueError(f"Unknown critic group: {self.group}")
-    encoding = "local68_raw_vech_v1" if self.local_control else "rpv9_log_std_corr_v1"
+    if self.policy_version not in ("v7", "v8") or (
+      self.v8 and self.group not in ("gt", "mean", "belief")
+    ):
+      raise ValueError("Unsupported critic policy version/group")
+    expected_version = V8_CRITIC_INPUT_VERSION if self.v8 else CRITIC_INPUT_VERSION
+    if self.version is None:
+      object.__setattr__(self, "version", expected_version)
+    encoding = (
+      "local68_raw_vech_v1"
+      if self.local_control and not self.v8
+      else "rpv9_log_std_corr_v1"
+    )
     if self.covariance_encoding is None:
       object.__setattr__(self, "covariance_encoding", encoding)
     if (
-      self.version != CRITIC_INPUT_VERSION
+      self.version != expected_version
       or self.tangent_version != TANGENT_VERSION
       or self.covariance_encoding != encoding
     ):
@@ -59,12 +73,24 @@ class CriticInputConfig:
       raise ValueError("epsilon_std must be finite and positive")
 
   @property
+  def v8(self):
+    return self.policy_version == "v8"
+
+  def to_dict(self):
+    result = asdict(self)
+    if not self.v8:
+      result.pop("policy_version")
+    return result
+
+  @property
   def local_control(self):
     return self.group in LOCAL_METHODS
 
   def input_dim(self, context_dim: int) -> int:
     if type(context_dim) is not int or context_dim < 0:
       raise ValueError("context_dim must be a nonnegative integer")
+    if self.v8:
+      return 68 + GOAL_DIM + 3 + 465 + (0 if self.group == "gt" else 54)
     if self.local_control:
       common = 68 + GOAL_DIM + 3 + 465 + context_dim
       return common if self.group in BASELINES else common + LOCAL_DIM + VECH_DIM
@@ -104,7 +130,7 @@ def critic_feature_constants(reference, config):
   )
   floor = reference.new_tensor(config.epsilon_std).square()
   mean_scale = reference.new_tensor(
-    [1.0] * 6 + [s for s in config.mean_scales for _ in range(3)]
+    [1.0] * (3 if config.v8 else 6) + [s for s in config.mean_scales for _ in range(3)]
   )
   if not (
     torch.isfinite(mean_scale).all()
@@ -165,7 +191,7 @@ def build_critic_features(
     raise ValueError("Critic context must match truth batch shape")
   for name, value, shape in (
     ("goal", true_goal, (*batch, GOAL_DIM + 3 if cfg.local_control else 700)),
-    ("history", history, (*batch, 5, 93)),
+    ("history", history, (*batch, 5, 102 if cfg.v8 else 93)),
     ("context", sim_ctx, (*batch, sim_ctx.shape[-1])),
   ):
     if (
@@ -199,8 +225,9 @@ def build_critic_features(
     belief,
     group=cfg.group,
     constants=critic_feature_constants(history, cfg)
-    if cfg.group in ("B", "C")
+    if cfg.group in ("B", "C") or cfg.v8
     else None,
+    policy_version=cfg.policy_version,
   )
   if not torch.isfinite(features).all():
     raise ValueError("Critic encoding produced non-finite features")
@@ -208,9 +235,33 @@ def build_critic_features(
 
 
 def build_critic_features_kernel(
-  truth, true_goal, history, sim_ctx, belief, *, group, constants, actor_condition=None
+  truth,
+  true_goal,
+  history,
+  sim_ctx,
+  belief,
+  *,
+  group,
+  constants,
+  actor_condition=None,
+  policy_version="v7",
 ):
   """Trusted tensor encoding; belief marginals come from covariance factors."""
+  if policy_version == "v8":
+    # Stored actor errors are method-dependent and must never enter the GT critic.
+    pieces = [critic_state_features(truth), true_goal, history[..., :93].flatten(-2)]
+    if group != "gt":
+      mean = belief.mean
+      error = root_tracking_error(
+        truth, mean.rotation, mean.position, mean.world_velocity
+      )
+      pieces.extend(
+        (
+          error / constants[-1],
+          encode_rpv_covariance_kernel(belief.covariance_rpv, constants),
+        )
+      )
+    return torch.cat(pieces, -1)
   pieces = [critic_state_features(truth), true_goal, history.flatten(-2), sim_ctx]
   if group in ("mean", "belief"):
     if actor_condition is None:
@@ -330,8 +381,8 @@ class BeliefCritic(nn.Module):
 
   def contract(self) -> dict:
     return {
-      "version": CRITIC_INPUT_VERSION,
-      "config": asdict(self.config),
+      "version": self.config.version,
+      "config": self.config.to_dict(),
       "context_dim": self.context_dim,
       "hidden_dims": self.hidden_dims,
       "input_dim": self.input_dim,
@@ -343,9 +394,9 @@ class BeliefCritic(nn.Module):
   def validate_checkpoint(self, checkpoint: dict) -> None:
     contract = checkpoint.get("contract") if isinstance(checkpoint, dict) else None
     version = contract.get("version") if isinstance(contract, dict) else None
-    if version != CRITIC_INPUT_VERSION:
+    if version != self.config.version:
       raise ValueError(
-        f"Group {self.group} requires critic contract {CRITIC_INPUT_VERSION!r}, "
+        f"Group {self.group} requires critic contract {self.config.version!r}, "
         f"got {version!r}"
       )
     if contract != self.contract():

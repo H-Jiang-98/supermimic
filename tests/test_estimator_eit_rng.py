@@ -7,7 +7,10 @@ import torch
 
 from supermimic.models import ProcessNoiseConfig
 from supermimic.runners.eit_training import EITTraining
-from supermimic.runners.run_config import EIT_TRAINING_VERSION
+from supermimic.runners.run_config import (
+  EIT_INITIALIZATION_VERSION,
+  EIT_TRAINING_VERSION,
+)
 from supermimic.runners.supermimic_runner import SuperMimicRunner, SuperMimicRunnerCfg
 from supermimic.scripts.check_eit_training import parse_args
 from supermimic.scripts.check_estimator import stationary_motion
@@ -54,7 +57,7 @@ def test_resume_rejects_prior_replay_contract_without_changing_rng(make_loop):
 def test_shared_initialization_rejects_prior_replay_contract_without_changing_rng():
   loop = training()
   bundle = loop.initialization_bundle()
-  assert bundle["version"] == "eit_initialization_v5"
+  assert bundle["version"] == EIT_INITIALIZATION_VERSION
   bundle["version"] = "eit_initialization_v4"
   rng = torch.random.get_rng_state()
   with pytest.raises(ValueError, match="initialization"):

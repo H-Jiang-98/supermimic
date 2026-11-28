@@ -30,6 +30,7 @@ from supermimic.critic_inputs import (
 from supermimic.eit_methods import BASELINES, LOCAL_METHODS
 from supermimic.envs.world_model_env import BeliefRolloutStart
 from supermimic.estimator_inputs import (
+  EITInputConfig,
   EpisodeAlignment,
   build_actor_critic_goals,
 )
@@ -38,6 +39,7 @@ from supermimic.learners.belief_policy_learner import (
   BeliefPolicyLearnerCfg,
   policy_metrics_for_json,
 )
+from supermimic.local_control import privileged_goal
 from supermimic.models import _CudaGraphNormalization
 from supermimic.posterior_replay import (
   POSTERIOR_REPLAY_VERSION,
@@ -52,6 +54,8 @@ from supermimic.runners.eit_snapshots import file_sha256
 from supermimic.runners.run_config import (
   EIT_INITIALIZATION_VERSION,
   EIT_POLICY_TRAINING_VERSION,
+  EIT_V8_INITIALIZATION_VERSION,
+  EIT_V8_POLICY_TRAINING_VERSION,
   LEGACY_INITIALIZATION_VERSION,
   validate_eit_checkpoint_contract,
 )
@@ -195,6 +199,10 @@ class EITTraining(BeliefModelTraining):
       inputs.group if not inputs.unfiltered_policy else "mean",
       context_dim,
       runner.cfg.critic_hidden_dims,
+      config=CriticInputConfig(
+        group=inputs.group if not inputs.unfiltered_policy else "mean",
+        policy_version=inputs.policy_version,
+      ),
     )
     self._initial_critic_tail = None
     if inputs.unfiltered_policy:
@@ -202,7 +210,12 @@ class EITTraining(BeliefModelTraining):
       # columns on CPU to allow a baseline to generate the shared bundle.
       with torch.random.fork_rng(devices=[]):
         baseline = BeliefCritic(
-          inputs.group, context_dim, runner.cfg.critic_hidden_dims
+          inputs.group,
+          context_dim,
+          runner.cfg.critic_hidden_dims,
+          config=CriticInputConfig(
+            group=inputs.group, policy_version=inputs.policy_version
+          ),
         )
       weights = critic.state_dict()
       first = weights["mlp.0.weight"]
@@ -236,6 +249,12 @@ class EITTraining(BeliefModelTraining):
       raise ValueError("replay_ratio must be finite")
     if runner.cfg.cuda_graphs:
       raise ValueError("EIT does not support explicit learner CUDA graphs")
+
+  @property
+  def inputs(self) -> EITInputConfig:
+    inputs = self.runner.cfg.estimator_inputs
+    assert inputs is not None
+    return inputs
 
   @property
   def policy(self) -> BeliefActorCriticPolicyLearner:
@@ -311,12 +330,13 @@ class EITTraining(BeliefModelTraining):
       self.actor.obs_normalizer,
       cast(_CudaGraphNormalization, self.actor.goal_normalizers["motion"]),
       *cast(BeliefCritic, self.policy.critic).normalizers(),
-      self.actor.condition_normalizer,
+      *((self.actor.condition_normalizer,) if not self.inputs.v8 else ()),
     )
     staged = deepcopy(live)
     for module in staged:
       module.train()
     storage = replay._storage.select(
+      *(("tracking_error",) if self.inputs.v8 else ()),
       "state",
       "actor_obs",
       "sim_ctx",
@@ -330,7 +350,7 @@ class EITTraining(BeliefModelTraining):
         batch = cast(TensorDict, storage[rows, slots])
         posterior = (
           None
-          if env.unfiltered_policy
+          if env.unfiltered_policy or self.inputs.v8
           else unpack_belief(
             cache.storage["posterior_mean"][rows, pslots],
             cache.storage["posterior_sqrt_tril"][rows, pslots],
@@ -375,6 +395,17 @@ class EITTraining(BeliefModelTraining):
     aux = representation.extract_aux_state(state)
     rep = representation.represent(state)
     truth = LieState.from_rep(aux, rep)
+    if self.inputs.v8:
+      assert reference.local is not None
+      # All fitted channels are already recorded frames or truth/reference.
+      # Do not unpack posterior factors or re-project uncertainty for statistics.
+      return (
+        torch.cat((sensor, batch["tracking_error"]), -1),
+        reference.local.goal,
+        critic_state_features(truth),
+        privileged_goal(truth, reference),
+        sensor,
+      )
     goal, condition, critic_goal = build_actor_critic_goals(
       env.estimator_input_config, truth, posterior, reference, batch["sim_ctx"]
     )
@@ -430,7 +461,11 @@ class EITTraining(BeliefModelTraining):
       scheduler=self.should_train.state_dict(),
       return_sampler=sampler.state_dict() if sampler is not None else None,
       wandb_run=self._wandb_run,
-      version=EIT_POLICY_TRAINING_VERSION,
+      version=(
+        EIT_V8_POLICY_TRAINING_VERSION
+        if self.inputs.v8
+        else EIT_POLICY_TRAINING_VERSION
+      ),
       posterior_replay_protocol=POSTERIOR_REPLAY_VERSION,
       model_revision=self.runner._dynamics.model_revision,
       critic=deepcopy(self.policy.critic.checkpoint()),
@@ -440,6 +475,8 @@ class EITTraining(BeliefModelTraining):
       actor_version=parameter_digest(self.actor),
       critic_version=parameter_digest(self.policy.critic),
     )
+    if self.inputs.v8:
+      state["collection_rng"] = self.runner.collection_observations.state_dict()
     return state
 
   @staticmethod
@@ -450,6 +487,10 @@ class EITTraining(BeliefModelTraining):
 
   def load_state_dict(self, state: dict) -> None:
     self._check_checkpoint_version(state)
+    if self.inputs.v8:
+      self.runner.collection_observations.validate_state_dict(
+        state.get("collection_rng")
+      )
     scheduler = deepcopy(self.should_train)
     scheduler.load_state_dict(state.get("scheduler"))
     for name in ("collected_steps", "skipped_update_groups"):
@@ -523,6 +564,8 @@ class EITTraining(BeliefModelTraining):
     self.policy.critic.eval().requires_grad_(True)
 
   def _restart_after_restore(self, state):
+    if self.inputs.v8:
+      self.runner.collection_observations.load_state_dict(state["collection_rng"])
     sampler = getattr(self.runner, "_sampler", None)
     if sampler is not None:
       sampler.load_state_dict(state["return_sampler"])
@@ -1079,21 +1122,24 @@ class EITTraining(BeliefModelTraining):
     first = full["state_dict"]["mlp.0.weight"]
     if self._initial_critic_tail is not None:
       first = torch.cat((first, self._initial_critic_tail.to(first)), dim=1)
-    for group in LOCAL_METHODS:
-      inputs = replace(runner.cfg.estimator_inputs, group=group, residual_actor=False)
+    groups = ("gt", "mean", "belief") if self.inputs.v8 else LOCAL_METHODS
+    for group in groups:
+      inputs = replace(self.inputs, group=group, residual_actor=False)
       actors[group] = deepcopy(
         actor_checkpoint(self.actor, replace(runner.cfg, estimator_inputs=inputs))
       )
       critic = deepcopy(full)
-      config = CriticInputConfig(group=group)
+      config = CriticInputConfig(group=group, policy_version=inputs.policy_version)
       width = config.input_dim(runner._sim_context.output_dim)
-      critic["contract"].update(config=asdict(config), input_dim=width)
+      critic["contract"].update(config=config.to_dict(), input_dim=width)
       critic["state_dict"]["mlp.0.weight"] = first[:, :width].contiguous().clone()
       critics[group] = critic
     world_model = deepcopy(runner._wm.bundle())
     world_model["dynamics"].pop("model_revision", None)
     return {
-      "version": EIT_INITIALIZATION_VERSION,
+      "version": (
+        EIT_V8_INITIALIZATION_VERSION if self.inputs.v8 else EIT_INITIALIZATION_VERSION
+      ),
       "generation_group": runner.cfg.estimator_inputs.group,
       "generation_seed": self.training_seed,
       "world_model": world_model,
@@ -1111,7 +1157,11 @@ class EITTraining(BeliefModelTraining):
     ):
       raise ValueError("Initialization cannot replace an active training run")
     version = bundle.get("version")
-    if version == EIT_INITIALIZATION_VERSION:
+    if self.inputs.v8:
+      if version != EIT_V8_INITIALIZATION_VERSION:
+        raise ValueError("v8 requires v8 shared initialization")
+      groups = ("gt", "mean", "belief")
+    elif version == EIT_INITIALIZATION_VERSION:
       groups = LOCAL_METHODS
     elif version == LEGACY_INITIALIZATION_VERSION:
       groups = ("mean", "belief")
@@ -1151,9 +1201,7 @@ class EITTraining(BeliefModelTraining):
     # Constructors draw fresh weights; preserve caller RNG even on failed preflight.
     with torch.random.fork_rng(devices=devices):
       for key in groups:
-        config = replace(
-          runner.cfg, estimator_inputs=replace(runner.cfg.estimator_inputs, group=key)
-        )
+        config = replace(runner.cfg, estimator_inputs=replace(self.inputs, group=key))
         actor = build_actor(config, wm, runner.device).to(next(self.actor.parameters()))
         init_config = replace(
           config,
@@ -1161,7 +1209,12 @@ class EITTraining(BeliefModelTraining):
         )
         load_actor_checkpoint(actor, init_config, bundle["actors"][key])
         critic = BeliefCritic(
-          key, runner._sim_context.output_dim, runner.cfg.critic_hidden_dims
+          key,
+          runner._sim_context.output_dim,
+          runner.cfg.critic_hidden_dims,
+          config=CriticInputConfig(
+            group=key, policy_version=self.inputs.policy_version
+          ),
         ).to(next(self.actor.parameters()))
         critic.load_checkpoint(bundle["critics"][key])
     # Hash every group's weights/config and the context, before mutating anything.
@@ -1169,7 +1222,7 @@ class EITTraining(BeliefModelTraining):
     runner._wm.load_bundle(bundle["world_model"])
     init_config = replace(
       runner.cfg,
-      estimator_inputs=replace(runner.cfg.estimator_inputs, residual_actor=False),
+      estimator_inputs=replace(self.inputs, residual_actor=False),
     )
     load_actor_checkpoint(self.actor, init_config, bundle["actors"][group])
     self.policy.critic.load_checkpoint(bundle["critics"][group])

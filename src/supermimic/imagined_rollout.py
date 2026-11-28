@@ -21,6 +21,7 @@ from supermimic.estimator_inputs import (
   ReferenceWindow,
   build_actor_critic_goals_kernel,
   covariance_encoding_constants,
+  v8_tracking_frame,
   validate_reference_batch,
 )
 from supermimic.tasks.task_spec import build_actor_obs_td
@@ -50,6 +51,7 @@ class PreparedRollout:
   actor_encoding: tuple | None
   critic_encoding: tuple | None
   critic_group: str
+  gt_noise: torch.Tensor | None = None
 
   def reference_at(self, step):
     batch = self.context.shape[0]
@@ -79,7 +81,9 @@ class RolloutResult:
 
 @torch.inference_mode(False)
 @torch.no_grad()
-def prepare_rollout(env, start, horizon, process_noise, measurement_noise):
+def prepare_rollout(
+  env, start, horizon, process_noise, measurement_noise, gt_noise=None
+):
   """Validate/copy detached initial conditions; precompute clip-clamped references."""
   batch, belief = env.validate_policy_start(start)
   if type(horizon) is not int or horizon < 1:
@@ -95,6 +99,15 @@ def prepare_rollout(env, start, horizon, process_noise, measurement_noise):
       or not torch.isfinite(noise).all()
     ):
       raise ValueError(f"Invalid rollout {name} noise")
+  if env.estimator_input_config.v8 and env.estimator_input_config.group == "gt":
+    if (
+      gt_noise is None
+      or gt_noise.shape != (horizon, len(start), 9)
+      or gt_noise.dtype != batch["state"].dtype
+      or gt_noise.device != batch["state"].device
+      or not torch.isfinite(gt_noise).all()
+    ):
+      raise ValueError("Invalid rollout GT noise")
   aux, rep = env._unpack_initial_states(batch)
   times = batch["motion_time"]
   ends = env.motion.motion_ends
@@ -140,12 +153,13 @@ def prepare_rollout(env, start, horizon, process_noise, measurement_noise):
     covariance_encoding_constants(
       rep, config.covariance_scales, config.covariance_std_floor
     )
-    if config.uses_uncertainty and not local
+    if config.uses_uncertainty and (not local or config.v8)
     else None,
     critic_feature_constants(rep, critic_config)
-    if critic_config.group != "A" and not local
+    if critic_config.group != "A" and (not local or config.v8)
     else None,
     critic_config.group,
+    gt_noise,
   )
 
 
@@ -181,6 +195,7 @@ def observe(env, prepared, state, step):
     group=prepared.critic_group,
     constants=prepared.critic_encoding,
     actor_condition=uncertainty,
+    policy_version=env.estimator_input_config.policy_version,
   )
   obs = build_actor_obs_td(
     {"motion": actor}, state.history, critic=critic, task_uncertainty=uncertainty
@@ -226,6 +241,15 @@ def imagine_step(env, prepared, state, actions, process_noise, measurement_noise
     )
     belief = BeliefState(mean, covariance_sqrt=lower)
     invalid = invalid | filter_invalid
+  if env.estimator_input_config.v8:
+    sensor = v8_tracking_frame(
+      sensor,
+      LieState.from_rep(aux, rep),
+      belief.to_actor_input() if belief is not None else None,
+      prepared.reference_at(step + 1),
+      env.estimator_input_config,
+      prepared.gt_noise[step] if prepared.gt_noise is not None else None,
+    )
   history = torch.cat((state.history[:, 1:], sensor.unsqueeze(1)), dim=1)
   next_state = ImaginedState(
     belief,

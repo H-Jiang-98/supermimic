@@ -17,9 +17,11 @@ from supermimic.runners.supermimic_runner import SuperMimicRunnerCfg
 
 EIT_TRAINING_VERSION = "eit_model_training_v5"
 EIT_POLICY_TRAINING_VERSION = "eit_training_v7"
+EIT_V8_POLICY_TRAINING_VERSION = "eit_training_v8"
 _LEGACY_POLICY_VERSION = "eit_training_v5"
 LEGACY_INITIALIZATION_VERSION = "eit_initialization_v5"
 EIT_INITIALIZATION_VERSION = "eit_initialization_v6"
+EIT_V8_INITIALIZATION_VERSION = "eit_initialization_v8"
 
 
 def validate_eit_checkpoint_contract(
@@ -33,9 +35,11 @@ def validate_eit_checkpoint_contract(
   version = saved.get("version") if isinstance(saved, dict) else None
   legacy = for_inference and version == _LEGACY_POLICY_VERSION
   archive = archived_pilot and version == "eit_training_v6"
-  if version not in (EIT_TRAINING_VERSION, EIT_POLICY_TRAINING_VERSION) and not (
-    legacy or archive
-  ):
+  if version not in (
+    EIT_TRAINING_VERSION,
+    EIT_POLICY_TRAINING_VERSION,
+    EIT_V8_POLICY_TRAINING_VERSION,
+  ) and not (legacy or archive):
     raise ValueError(
       f"Expected {EIT_TRAINING_VERSION} or {EIT_POLICY_TRAINING_VERSION} checkpoint, got {version!r}"
     )
@@ -97,6 +101,8 @@ def validate_eit_checkpoint_contract(
       raise ValueError("Model-stage checkpoint contains policy training state")
     return
   critic_version = "eit_rpv_belief_critic_v2" if legacy else CRITIC_INPUT_VERSION
+  if version == EIT_V8_POLICY_TRAINING_VERSION:
+    critic_version = "eit_tracking_critic_v8"
   if archive:
     critic_version = "eit_rpv_belief_critic_v3"
   error = f"EIT checkpoint requires the {critic_version} critic contract"
@@ -134,8 +140,10 @@ def validate_eit_checkpoint_contract(
     input_weight = saved["critic"]["state_dict"]["mlp.0.weight"]
     compatible = (
       contract["version"] == critic_version
-      and config_data == dataclasses.asdict(config)
+      and config_data == config.to_dict()
       and config.group == group
+      and config.policy_version
+      == saved["runner_config"]["estimator_inputs"].get("policy_version", "v7")
       and contract["input_dim"] == input_dim
     )
   except (KeyError, TypeError, ValueError) as exc:
@@ -170,6 +178,15 @@ def load_runner_cfg(run_config: dict[str, Any]) -> SuperMimicRunnerCfg:
   raw = run_config.get("runner_cfg")
   if not raw:
     raise ValueError("run has no serialized runner_cfg; cannot rebuild its config")
+  raw = dict(raw)
+  # Earlier runner configs used this fixed FiLM architecture.
+  raw.setdefault("film_hidden_dims", (128, 64))
+  inputs = raw.get("estimator_inputs")
+  if isinstance(inputs, dict) and "policy_version" not in inputs:
+    raw = dict(raw)
+    defaults = SuperMimicRunnerCfg()
+    for name in ("heading_rate_hz", "heading_dropout_probability", "heading_std"):
+      raw.setdefault(name, getattr(defaults, name))
   defaulted = None if raw.get("estimator_inputs") is not None else []
   cfg = _rebuild(SuperMimicRunnerCfg, raw, defaulted, "")
   if defaulted:

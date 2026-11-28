@@ -136,7 +136,12 @@ class BeliefActorCriticPolicyLearner:
     self.cfg = cfg or BeliefPolicyLearnerCfg()
     device = str(next(actor.parameters()).device)
     self.actor_optimizers = build_optimizers(
-      [actor], self.cfg.lr, betas=(0.9, 0.95), device=device
+      actor.optimization_modules()
+      if hasattr(actor, "optimization_modules")
+      else [actor],
+      self.cfg.lr,
+      betas=(0.9, 0.95),
+      device=device,
     )
     self.critic_optimizers = build_optimizers(
       [critic], self.cfg.critic_lr, device=device
@@ -144,7 +149,10 @@ class BeliefActorCriticPolicyLearner:
     self.actor_steps = self.critic_steps = 0
     parameter = next(actor.parameters())
     self.generators = {}
-    for offset, name in enumerate(("sampling", "process", "measurement", "critic")):
+    streams = ("sampling", "process", "measurement", "critic")
+    if getattr(getattr(wm_env, "estimator_input_config", None), "v8", False):
+      streams += ("gt",)
+    for offset, name in enumerate(streams):
       generator = torch.Generator(device=parameter.device)
       generator.manual_seed((torch.initial_seed() + offset) % (2**63 - 1))
       self.generators[name] = generator
@@ -329,7 +337,24 @@ class BeliefActorCriticPolicyLearner:
       device=parameter.device,
       generator=self.generators["measurement"],
     )
+    if self._noisy_gt:
+      return process, measurement, self.draw_gt_noise(shape)
     return process, measurement
+
+  @property
+  def _noisy_gt(self):
+    config = getattr(self.wm_env, "estimator_input_config", None)
+    return config is not None and config.v8 and config.group == "gt"
+
+  def draw_gt_noise(self, shape):
+    parameter = next(self.actor.parameters())
+    return torch.randn(
+      *shape,
+      9,
+      device=parameter.device,
+      dtype=parameter.dtype,
+      generator=self.generators["gt"],
+    )
 
   def sample_start_keys(self, episode_ids):
     """Draw the logical starts for every actor update, in optimizer-step order."""
@@ -411,9 +436,15 @@ class BeliefActorCriticPolicyLearner:
       raise FloatingPointError("Invalid imagined rollout")
     return result.legacy_tuple(return_components)
 
-  def _rollout_result(self, starts, process_noise, measurement_noise, horizon):
+  def _rollout_result(
+    self, starts, process_noise, measurement_noise, horizon, gt_noise=None
+  ):
+    if self._noisy_gt and gt_noise is None:
+      gt_noise = self.draw_gt_noise((horizon, len(starts)))
     prepared = (
-      prepare_rollout(self.wm_env, starts, horizon, process_noise, measurement_noise)
+      prepare_rollout(
+        self.wm_env, starts, horizon, process_noise, measurement_noise, gt_noise
+      )
       if self._uses_tensor_rollout
       else None
     )
@@ -561,10 +592,22 @@ class BeliefActorCriticPolicyLearner:
     ):
       raise FloatingPointError("Missing or non-finite policy gradient")
 
-  def update_from(self, starts, process_noise, measurement_noise):
+  def update_from(self, starts, process_noise, measurement_noise, gt_noise=None):
     """One actor step and configured critic epochs, with fixed caller-owned noise."""
     try:
       self._validate_noises(starts, process_noise, measurement_noise)
+      if self._noisy_gt:
+        if gt_noise is None:
+          gt_noise = self.draw_gt_noise(
+            (self.cfg.horizon, len(starts), self.cfg.num_samples)
+          )
+        if (
+          gt_noise.shape != (*process_noise.shape[:-1], 9)
+          or gt_noise.dtype != process_noise.dtype
+          or gt_noise.device != process_noise.device
+          or not torch.isfinite(gt_noise).all()
+        ):
+          raise ValueError("Invalid policy GT noise")
       if self._uses_tensor_rollout:
         # Preparation and input checks run before any captured optimizer step.
         self.wm_env.validate_policy_start(starts)
@@ -573,17 +616,23 @@ class BeliefActorCriticPolicyLearner:
       count = len(starts) * self.cfg.num_samples
       graph = self._select_policy_graph(count)
       if graph is not None:
-        return self._update_with_graph(graph, starts, process_noise, measurement_noise)
+        return self._update_with_graph(
+          graph, starts, process_noise, measurement_noise, gt_noise
+        )
       stream = self._policy_graph_stream
       if stream is None:
-        return self._update_from_eager(starts, process_noise, measurement_noise)
+        return self._update_from_eager(
+          starts, process_noise, measurement_noise, gt_noise
+        )
       # Keep critic as well as actor AccumulateGrad on its original stream after
       # restore, recapture or an eager fallback.
       current = torch.cuda.current_stream(stream.device)
       stream.wait_stream(current)
       try:
         with torch.cuda.stream(stream):
-          return self._update_from_eager(starts, process_noise, measurement_noise)
+          return self._update_from_eager(
+            starts, process_noise, measurement_noise, gt_noise
+          )
       finally:
         current.wait_stream(stream)
     except Exception:
@@ -592,12 +641,14 @@ class BeliefActorCriticPolicyLearner:
         optimizer.zero_grad(set_to_none=True)
       raise
 
-  def _update_from_eager(self, starts, process_noise, measurement_noise):
+  def _update_from_eager(self, starts, process_noise, measurement_noise, gt_noise=None):
     timer = StreamTimer(next(self.actor.parameters()).device)
     cfg, env = self.cfg, self.wm_env
     starts = starts.repeat_interleave(cfg.num_samples)
     process_noise = process_noise.detach().flatten(1, 2)
     measurement_noise = measurement_noise.detach().flatten(1, 2)
+    if gt_noise is not None:
+      gt_noise = gt_noise.detach().flatten(1, 2)
     count = len(starts)
     modules = (self.actor, self.critic, env.dynamics, env.representation)
     data, totals = [], {}
@@ -627,6 +678,7 @@ class BeliefActorCriticPolicyLearner:
                   cfg.horizon,
                   process_noise[:, selected],
                   measurement_noise[:, selected],
+                  gt_noise[:, selected] if gt_noise is not None else None,
                 )
             with timer.measure("policy_backward_seconds"):
               arguments = (
@@ -707,7 +759,9 @@ class BeliefActorCriticPolicyLearner:
         if not self._uses_tensor_rollout and hasattr(self.actor, "_aux_loss"):
           self.actor._aux_loss = next(self.actor.parameters()).new_empty(0)
 
-  def _update_with_graph(self, graph, starts, process_noise, measurement_noise):
+  def _update_with_graph(
+    self, graph, starts, process_noise, measurement_noise, gt_noise=None
+  ):
     cfg, env = self.cfg, self.wm_env
     timer = StreamTimer(process_noise.device)
     modules = (self.actor, self.critic, env.dynamics, env.representation)
@@ -719,6 +773,8 @@ class BeliefActorCriticPolicyLearner:
         starts = starts.repeat_interleave(cfg.num_samples)
         process_noise = process_noise.detach().flatten(1, 2)
         measurement_noise = measurement_noise.detach().flatten(1, 2)
+        if gt_noise is not None:
+          gt_noise = gt_noise.detach().flatten(1, 2)
         count = len(starts)
         prepared = []
         for offset in range(0, count, cfg.microbatch_size):
@@ -730,6 +786,7 @@ class BeliefActorCriticPolicyLearner:
               cfg.horizon,
               process_noise[:, selected],
               measurement_noise[:, selected],
+              gt_noise[:, selected] if gt_noise is not None else None,
             )
           )
         env.check_policy_start_identity(starts)

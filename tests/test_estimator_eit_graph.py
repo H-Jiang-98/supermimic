@@ -40,6 +40,8 @@ def graph_policy(tmp_path):
     integrated=False,
     residual_actor=False,
     samples=2,
+    policy_version="v7",
+    film_hidden_dims=(128, 64),
   ):
     torch.manual_seed(2027)
     motion = tmp_path / "stationary.npz"
@@ -53,17 +55,22 @@ def graph_policy(tmp_path):
     environments.append(env)
     cfg = SuperMimicRunnerCfg.for_estimator_inputs(
       group,
-      estimator_inputs=EITInputConfig(group=group, residual_actor=residual_actor),
+      estimator_inputs=EITInputConfig(
+        group=group, residual_actor=residual_actor, policy_version=policy_version
+      ),
       process_noise=ProcessNoiseConfig(hidden_dims=(8,)),
       filter_config=FilterConfig(jacobian_backend=backend),
       dynamics_hidden_dims=(16,),
       actor_hidden_dims=(16, 12, 8),
+      film_hidden_dims=film_hidden_dims,
       critic_hidden_dims=(16, 12, 8),
       replay_ratio=3 if integrated else 0,
       mean=MeanFitCfg(num_batches=1, batch_size=2, window_frames=3),
       cov=CovarianceFitCfg(batch_size=4, pair_budget=4, validation_pairs=4),
       buffer_size=8,
       sampling_mode="start",
+      heading_dropout_probability=0 if policy_version == "v8" else 0.25,
+      heading_rate_hz=(5.0, 5.0) if policy_version == "v8" else (0.5, 5.0),
     )
     cfg.policy.batch_size = 2
     runner = SuperMimicRunner(
@@ -109,28 +116,36 @@ def reference_for(policy, compiled=False):
   return reference
 
 
-def assert_policy_close(actual, expected):
+def assert_policy_close(actual, expected, *, check_gradients=True):
   assert_tree_close(
     (actual.actor.state_dict(), actual.critic.state_dict(), actual.state_dict()),
     (expected.actor.state_dict(), expected.critic.state_dict(), expected.state_dict()),
     atol=2e-5,
     rtol=1e-3,
   )
-  torch.testing.assert_close(
-    [p.grad for p in actual.actor.parameters()],
-    [p.grad for p in expected.actor.parameters()],
-    atol=2e-5,
-    rtol=1e-3,
-  )
+  if check_gradients:
+    torch.testing.assert_close(
+      [p.grad for p in actual.actor.parameters()],
+      [p.grad for p in expected.actor.parameters()],
+      atol=2e-5,
+      rtol=1e-3,
+    )
 
 
 def assert_tree_close(actual, expected, *, atol, rtol, equal_nan=False):
-  left, left_spec = torch.utils._pytree.tree_flatten(actual)
+  left, left_spec = torch.utils._pytree.tree_flatten_with_path(actual)
   right, right_spec = torch.utils._pytree.tree_flatten(expected)
   assert left_spec == right_spec
-  for a, b in zip(left, right, strict=True):
+  for (path, a), b in zip(left, right, strict=True):
     if isinstance(a, torch.Tensor):
-      torch.testing.assert_close(a, b, atol=atol, rtol=rtol, equal_nan=equal_nan)
+      torch.testing.assert_close(
+        a,
+        b,
+        atol=atol,
+        rtol=rtol,
+        equal_nan=equal_nan,
+        msg=lambda msg, path=path: f"{path}: {msg}",
+      )
     else:
       assert a == b
 
@@ -396,11 +411,31 @@ def test_optimizer_learning_rates_are_live_or_recaptured(graph_policy):
 
 
 @pytest.mark.filterwarnings("error:The AccumulateGrad node")
-def test_online_model_policy_graph_save_and_resume(graph_policy, tmp_path):
-  training, _ = graph_policy(return_training=True, integrated=True)
+@pytest.mark.parametrize(
+  "policy_version,group",
+  [("v7", "belief"), ("v8", "gt"), ("v8", "mean"), ("v8", "belief")],
+)
+def test_online_model_policy_graph_save_and_resume(
+  graph_policy, tmp_path, policy_version, group
+):
+  training, _ = graph_policy(
+    group,
+    return_training=True,
+    integrated=True,
+    policy_version=policy_version,
+    compiled=policy_version == "v8",
+    residual_actor=policy_version == "v8",
+    samples=1 if policy_version == "v8" else 2,
+  )
   model_before = deepcopy(training.runner._dynamics.state_dict())
-  for _ in range(11):
-    training.run_step()
+  estimator = training.runner.posterior_provider.estimator
+  with patch.object(
+    estimator, "correct_heading", wraps=estimator.correct_heading
+  ) as heading:
+    for _ in range(11):
+      training.run_step()
+  if policy_version == "v8":
+    assert heading.call_count > 0
   policy = training.policy
   assert training.learner.mean_steps > 0 and training.learner.cov_steps > 0
   assert policy.actor_steps >= 4 and policy._policy_graph.captures == 1
@@ -426,6 +461,7 @@ def test_online_model_policy_graph_save_and_resume(graph_policy, tmp_path):
     training.run_step()
   assert policy.actor_steps >= before + 4
   assert policy._policy_graph.captures == 1
+  assert policy._policy_graph.replay_calls > 1
 
 
 @pytest.mark.parametrize("group", ["prop_kp", "gt"])
@@ -526,3 +562,42 @@ def test_compiled_baseline_graph_matches_eager(graph_policy, group, residual, sa
     assert_policy_close(policy, reference)
   assert policy.graph_status["captures"] == 1
   assert policy.graph_status["replay_calls"] == 2
+
+
+@pytest.mark.parametrize(
+  "group,compiled,film_hidden_dims",
+  [
+    (group, compiled, (128, 64))
+    for compiled in (False, True)
+    for group in ("gt", "mean", "belief")
+  ]
+  + [pytest.param("belief", True, (24, 12, 8), id="custom-film")],
+)
+def test_v8_complete_graph_update_matches_uncaptured(
+  graph_policy, group, compiled, film_hidden_dims
+):
+  policy, starts = graph_policy(
+    group, compiled=compiled, policy_version="v8", film_hidden_dims=film_hidden_dims
+  )
+  if group == "belief":
+    # Exercise a live covariance-to-action path. At zero FiLM initialization,
+    # tiny first hidden-layer gradients make Muon's normalization amplify FP32
+    # roundoff; the online save/resume test separately covers that initialization.
+    with torch.no_grad():
+      policy.actor.film[-1].weight.normal_(std=0.01)
+  # Isolate capture/replay from compiler fusion. Fixed-input eager/compiled
+  # returns, states and gradients are compared separately in test_estimator_v8_cuda.
+  reference = reference_for(policy, compiled=compiled)
+  policy._rollout_kernel = Mock(wraps=policy._rollout_kernel)
+  for _ in range(6):
+    noise = policy.draw_noises(starts)
+    torch.testing.assert_close(noise, reference.draw_noises(starts))
+    a = policy.update_from(starts, *noise)
+    b = reference.update_from(starts, *noise)
+    torch.testing.assert_close(a, b, atol=2e-5, rtol=1e-3, equal_nan=True)
+    # GT/mean bypass FiLM; capture preallocates zero grads where eager leaves None.
+    assert_policy_close(policy, reference, check_gradients=group == "belief")
+    starts.batch["sensor_window"][:, :, 93:].add_(0.001)
+  assert policy._policy_graph.captures == 1
+  assert policy._policy_graph.replay_calls == 3
+  assert policy._rollout_kernel.call_count == 8

@@ -363,9 +363,26 @@ class BeliefModelTraining:
       if self.continuous_collection
       else set()
     )
-    if {
-      k: v for k, v in state.get("runner_config", {}).items() if k not in operational
-    } != {k: v for k, v in asdict(runner.cfg).items() if k not in operational}:
+    saved_runner = dict(state.get("runner_config", {}))
+    # Historical v7/v8 checkpoints used the fixed [128, 64] FiLM network.
+    saved_runner.setdefault("film_hidden_dims", (128, 64))
+    if (
+      isinstance(saved_runner.get("estimator_inputs"), dict)
+      and "policy_version" not in saved_runner["estimator_inputs"]
+    ):
+      # New v8-only fields are defaults for historical v7 training checkpoints.
+      saved_runner = dict(saved_runner)
+      saved_runner["estimator_inputs"] = dict(
+        saved_runner["estimator_inputs"],
+        policy_version="v7",
+        gt_pose_std=(0.03, 0.03),
+        gt_velocity_std=0.2,
+      )
+      for name in ("heading_dropout_probability", "heading_rate_hz", "heading_std"):
+        saved_runner.setdefault(name, getattr(type(runner.cfg)(), name))
+    if {k: v for k, v in saved_runner.items() if k not in operational} != {
+      k: v for k, v in asdict(runner.cfg).items() if k not in operational
+    }:
       raise ValueError("Belief training runner configuration mismatch")
     if runner._pending_collection is not None:
       raise RuntimeError("Cannot restore during a pending collection transaction")

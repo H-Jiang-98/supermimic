@@ -219,6 +219,57 @@ class LieBeliefFilter:
     bottom = torch.cat((gravity.new_zeros(*gravity.shape[:-1], 61, 9), identity), -1)
     return torch.cat((top, bottom), -2)
 
+  def heading_observation(self, mean: LieState) -> torch.Tensor:
+    return torch.atan2(mean.rotation[..., 1, 0], mean.rotation[..., 0, 0])
+
+  def heading_jacobian(self, mean: LieState, *, validate=True) -> torch.Tensor:
+    """Absolute yaw derivative with respect to the right-local state error."""
+    rotation = mean.rotation
+    x, y = rotation[..., 0, 0], rotation[..., 1, 0]
+    horizontal = x.square() + y.square()
+    if validate and (horizontal <= torch.finfo(rotation.dtype).eps).any():
+      raise ValueError("Heading is undefined for a vertical body forward axis")
+    pitch = (y * rotation[..., 0, 2] - x * rotation[..., 1, 2]) / horizontal
+    yaw = (x * rotation[..., 1, 1] - y * rotation[..., 0, 1]) / horizontal
+    attitude = torch.stack((torch.zeros_like(x), pitch, yaw), -1)
+    return torch.cat((attitude, x.new_zeros(*x.shape, 67)), -1).unsqueeze(-2)
+
+  def correct_heading(
+    self, belief: BeliefState, heading: torch.Tensor, heading_std: float
+  ) -> BeliefState:
+    """Fuse one new heading packet per supplied row, in radians.
+
+    The collection provider selects packet-bearing rows before calling this
+    method. Imagined transitions continue to use proprioception alone.
+    """
+    self._validate_belief(belief)
+    if heading.shape != belief.mean.position.shape[:-1]:
+      raise ValueError("Heading must have shape (*belief_batch,)")
+    if (
+      heading.device != belief.covariance_sqrt.device
+      or heading.dtype != belief.covariance_sqrt.dtype
+    ):
+      raise ValueError("Heading must be finite and match the belief dtype/device")
+    if not math.isfinite(heading_std) or heading_std <= 0:
+      raise ValueError("Heading standard deviation must be finite and positive")
+    horizontal = belief.mean.rotation[..., :2, 0].square().sum(-1)
+    # One boundary decision for the selected real packets; no heading validation
+    # (or correction) is present in the imagined tensor loop.
+    if not (
+      torch.isfinite(heading) & (horizontal > torch.finfo(heading.dtype).eps)
+    ).all():
+      raise ValueError("Heading must be finite with a nonvertical body forward axis")
+    delta = heading - self.heading_observation(belief.mean)
+    innovation = torch.atan2(delta.sin(), delta.cos()).unsqueeze(-1)
+    jacobian = self.heading_jacobian(belief.mean, validate=False)
+    std = heading.new_tensor([heading_std])
+    lower, correction, *_ = self._correct_factor(
+      belief.covariance_sqrt, jacobian, std, innovation
+    )
+    result = BeliefState(boxplus(belief.mean, correction), covariance_sqrt=lower)
+    self._validate_belief(result)
+    return result
+
   def transition_jacobian(
     self,
     mean: LieState,

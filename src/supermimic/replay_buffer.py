@@ -229,7 +229,7 @@ class ReplayBuffer:
   def _validate_frame(self, frame: TensorDict, previous: TensorDict | None = None):
     """Validate one stored-dtype frame and its newly recorded successor edge."""
     invalid = {}
-    for field in ("state", "action", "sim_ctx"):
+    for field in ("state", "action", "sim_ctx", "tracking_error", "heading"):
       if field in frame.keys():
         invalid[f"Non-finite replay {field}"] = ~torch.isfinite(frame[field]).all()
     if "episode_id" in frame.keys():

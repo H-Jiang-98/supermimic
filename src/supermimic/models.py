@@ -675,3 +675,35 @@ class LocalMotionActor(MultiEncoderAE):
       obs_td["task_uncertainty"],
     )
     return action, action.new_zeros(action.shape[0])
+
+
+class TrackingMotionActor(LocalMotionActor):
+  """v8 shared motion/history decoder; only belief enables the 45-channel FiLM."""
+
+  def __init__(self, *, inputs, context_dim, action_scale, action_offset, **kwargs):
+    MultiEncoderAE.__init__(self, uncertainty_dim=45, **kwargs)
+    self.uses_covariance = inputs.uses_uncertainty
+    self.residual_actor = inputs.residual_actor
+    if (action_scale == 0).any() or not torch.isfinite(action_scale).all():
+      raise ValueError("Action scale must be finite and nonzero")
+    self.register_buffer("action_scale", action_scale.detach().clone())
+    self.register_buffer("action_offset", action_offset.detach().clone())
+
+  def optimization_modules(self):
+    # Keep the shared state_dict shape without creating optimizer moments for
+    # a branch that GT/mean never evaluate (including captured updates).
+    return [self] if self.uses_covariance else [self.encoders, self.decoder]
+
+  def decode_goal(self, latent, history, condition):
+    main = torch.cat((latent, self.obs_normalizer(history).flatten(-2)), -1)
+    hidden = self.decoder[1](self.decoder[0](main))
+    if self.uses_covariance:
+      gamma, beta = self.film(condition[..., :45]).chunk(2, -1)
+      hidden = hidden * (1 + gamma) + beta
+    else:
+      gamma = beta = torch.zeros_like(hidden)
+    for layer in self.decoder[2:]:
+      hidden = layer(hidden)
+    if self.residual_actor:
+      hidden = hidden + (condition[..., -29:] - self.action_offset) / self.action_scale
+    return hidden, gamma, beta

@@ -1,4 +1,8 @@
-# EIT v7 四方法训练
+# EIT 训练
+
+新增 [v8 三组训练](docs/eit_v8.md)：102 维跟踪误差历史、真实采集稀疏航向、GT 固定噪声，以及保留批量 motion encoder/CUDA Graph replay 的训练流程。使用 [train_eit_v8.toml](train_eit_v8.toml) 启动；v8 评估接入留待后续阶段。
+
+## EIT v7 四方法训练
 
 四种方法在真实采集时都运行 70 维平方根滤波器，并保存同一格式的 posterior replay。世界模型使用相同的训练流程。策略训练从保存帧恢复本体感知历史、动作、物理参数 ξ 和参考对齐。各方法在想象过程中的区别如下。
 

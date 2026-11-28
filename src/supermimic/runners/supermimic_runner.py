@@ -9,7 +9,7 @@ from copy import copy
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal, cast
 from uuid import uuid4
 
 import torch
@@ -102,6 +102,9 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   process_noise: ProcessNoiseConfig | None = None
   """Opt-in full right-local stochastic dynamics and two-stage model fitting."""
   filter_config: FilterConfig = field(default_factory=FilterConfig)
+  heading_dropout_probability: float = 0.25
+  heading_rate_hz: tuple[float, float] = (0.5, 5.0)
+  heading_std: float = 0.05
   initial_prior: GaussianStatePrior = field(default_factory=GaussianStatePrior)
   mean: MeanFitCfg = field(default_factory=MeanFitCfg)
   cov: CovarianceFitCfg = field(default_factory=CovarianceFitCfg)
@@ -111,6 +114,7 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   replay_ratio: int = 16
   latent_dim: int = 32
   actor_hidden_dims: tuple[int, ...] = (2048, 1024, 512, 256)
+  film_hidden_dims: tuple[int, ...] = (128, 64)
   critic_hidden_dims: tuple[int, ...] = (256, 128)
   latent_bc_weight: float = 1e-1
   """Weight on the latent BC loss pulling non-anchor encoders toward the
@@ -143,6 +147,20 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
 
   def validate_estimator_inputs(self) -> None:
     inputs = self.estimator_inputs
+    if not self.film_hidden_dims or any(
+      type(width) is not int or width < 1 for width in self.film_hidden_dims
+    ):
+      raise ValueError("FiLM hidden dimensions must be positive integers")
+    if (
+      not math.isfinite(self.heading_dropout_probability)
+      or not 0 <= self.heading_dropout_probability <= 1
+      or len(self.heading_rate_hz) != 2
+      or any(not math.isfinite(v) or v <= 0 for v in self.heading_rate_hz)
+      or self.heading_rate_hz[0] > self.heading_rate_hz[1]
+      or not math.isfinite(self.heading_std)
+      or self.heading_std <= 0
+    ):
+      raise ValueError("Invalid heading collection configuration")
     if inputs is None:
       if self.process_noise is not None:
         raise ValueError("Stochastic dynamics require the estimator input path")
@@ -362,10 +380,12 @@ def build_actor(
     else representation.proprio_obs_dim(wm.num_actions)
   )
   local = inputs is not None and inputs.local_control
-  if local:
-    from supermimic.models import LocalMotionActor
+  options: dict[str, Any]
+  if local and inputs is not None:
+    from supermimic.models import LocalMotionActor, TrackingMotionActor
 
-    actor_type = LocalMotionActor
+    actor_type = TrackingMotionActor if inputs.v8 else LocalMotionActor
+    obs_dim = inputs.actor_frame_dim
     options = dict(
       inputs=inputs,
       context_dim=wm.dynamics.sim_ctx_dim,
@@ -388,10 +408,11 @@ def build_actor(
     slot_mix={"motion": 1.0} if inputs is not None else cfg.slot_mix,
     latent_dim=cfg.latent_dim,
     hidden_dims=cfg.actor_hidden_dims,
+    film_hidden_dims=cfg.film_hidden_dims,
     latent_bc_weight=cfg.latent_bc_weight,
     history_length=cfg.history_length,
     **options,
-    input_version=inputs.version if inputs is not None else "legacy",
+    input_version=cast(str, inputs.version) if inputs is not None else "legacy",
   ).to(device)
 
 
@@ -401,11 +422,16 @@ def actor_checkpoint(actor: MultiEncoderAE, cfg: SuperMimicRunnerCfg) -> dict:
     return actor.state_dict()
   return {
     "input_config": cfg.estimator_inputs.to_dict(),
+    **(
+      {"observation_layout": cfg.estimator_inputs.observation_layout}
+      if cfg.estimator_inputs.v8
+      else {}
+    ),
     "actor": actor.state_dict(),
     "architecture": {
       "hidden_dims": list(cfg.actor_hidden_dims),
       "latent_dim": cfg.latent_dim,
-      "film_hidden_dims": [128, 64],
+      "film_hidden_dims": list(cfg.film_hidden_dims),
     },
   }
 
@@ -434,10 +460,12 @@ def load_actor_checkpoint(
     saved = replace(saved, mode="eval")
   if saved != inputs:
     raise ValueError("Actor input configuration mismatch (including group/mode/noise)")
+  if inputs.v8 and checkpoint.get("observation_layout") != inputs.observation_layout:
+    raise ValueError("Actor observation layout mismatch")
   expected = {
     "hidden_dims": list(cfg.actor_hidden_dims),
     "latent_dim": cfg.latent_dim,
-    "film_hidden_dims": [128, 64],
+    "film_hidden_dims": list(cfg.film_hidden_dims),
   }
   if checkpoint.get("architecture") != expected:
     raise ValueError("Actor architecture mismatch")
@@ -563,6 +591,13 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     )
 
   def _init_common(self) -> None:
+    inputs = getattr(self.cfg, "estimator_inputs", None)
+    if inputs is not None and inputs.v8:
+      from supermimic.collection_observations import CollectionObservations
+
+      self.collection_observations = CollectionObservations(
+        self.cfg, self.device, torch.initial_seed()
+      )
     wm = build_world_model(self.cfg, self.env, self.device)
     self._wm = wm
     self._representation = wm.representation
@@ -629,6 +664,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       self._episode_id = slots if previous is None else previous + seed.shape[0]
       self._time_index = torch.zeros_like(slots)
       self._posterior_ready = False
+      self._v8_packet = self._v8_gt_noise = self._v8_history = None
 
   def _collection_history(self, sensor: torch.Tensor) -> torch.Tensor:
     """The ``(B, history_length, sensor_dim)`` window for a real-sim actor step.
@@ -662,6 +698,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       self._measurement_reset = reset_rows.clone()
       self._posterior_ready = False
     self._sim_history = history
+    self._v8_packet = self._v8_gt_noise = None
 
   def _policy_input_dims(self) -> tuple[int, int]:
     """Compute actor and critic input dimensions from the representation."""
@@ -766,6 +803,10 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     if estimator_inputs is not None:
       schema["alignment_rotation"] = FieldSpec((3, 3))
       schema["alignment_translation"] = FieldSpec(3)
+      if estimator_inputs.v8:
+        schema["tracking_error"] = FieldSpec(9)
+        schema["heading"] = FieldSpec()
+        schema["heading_valid"] = FieldSpec(dtype=torch.bool)
     return schema
 
   def _init_policy(self) -> None:
@@ -1138,6 +1179,19 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         raise RuntimeError("Seed the measurement history after reset before collection")
       sensor = self._sim_history[:, -1]
       candidate = None
+      heading = heading_mask = None
+      heading_std = None
+      truth = LieState.from_rep(aux_state, rep_state) if inputs.v8 else None
+      if inputs.v8:
+        assert truth is not None
+        if self._v8_packet is None:
+          self._v8_packet = self.collection_observations.packet(
+            truth, self._measurement_reset, self._time_index, self._representation.dt
+          )
+        heading, heading_mask = self._v8_packet
+        heading_std = self.cfg.heading_std
+        if not inputs.uses_posterior and self._v8_gt_noise is None:
+          self._v8_gt_noise = self.collection_observations.gt_noise(truth.position)
       if isinstance(self.posterior_provider, BeliefProvider):
         provider = self.posterior_provider
         estimator = provider.estimator
@@ -1158,6 +1212,9 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         if current is None:
           reset = self._measurement_reset
           candidate = provider.prepare(
+            heading=heading,
+            heading_mask=heading_mask,
+            heading_std=heading_std,
             measurement=sensor[..., :64],
             previous_action=sensor[..., 64:],
             reset_mask=self._measurement_reset,
@@ -1198,12 +1255,33 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         reference,
         sim_ctx,
       )
+      history = self._sim_history
+      if inputs.v8:
+        from supermimic.estimator_inputs import v8_tracking_frame
+
+        if not self._posterior_ready:
+          frame = v8_tracking_frame(
+            sensor, truth, posterior, reference, inputs, self._v8_gt_noise
+          )
+          shifted = (
+            frame[:, None].expand(-1, inputs.history_length, -1)
+            if self._v8_history is None
+            else torch.cat((self._v8_history[:, 1:], frame[:, None]), 1)
+          )
+          history = torch.where(
+            self._measurement_reset[:, None, None], frame[:, None], shifted
+          )
+        else:
+          assert self._v8_history is not None
+          history = self._v8_history
       actor_td = build_actor_obs_td(
-        {"motion": goal}, self._sim_history, task_uncertainty=uncertainty
+        {"motion": goal}, history, task_uncertainty=uncertainty
       )
       if candidate is not None:
         self.posterior_provider.commit(candidate)
       self._posterior_ready = True
+      if inputs.v8:
+        self._v8_history = history
       return actor_td
     proprio = self.cfg.actor_obs == "proprio"
     sensor = self._representation.compute_actor_sensor(
@@ -1286,11 +1364,17 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     extra_fields = {"sim_ctx": sim_ctx}
     if self._stores_actor_obs:
       extra_fields["actor_obs"] = (
-        actor_td["history"][:, -1]
+        actor_td["history"][:, -1, :93]
         if self.cfg.estimator_inputs is not None
         else sim_actor_obs
       )
     if self.cfg.estimator_inputs is not None:
+      if self.cfg.estimator_inputs.v8 and self.replay_mode == "full":
+        extra_fields.update(
+          tracking_error=actor_td["history"][:, -1, 93:],
+          heading=self._v8_packet[0],
+          heading_valid=self._v8_packet[1],
+        )
       if self.replay_mode == "full":
         alignment = self.motion_cmd.reference_alignment
         extra_fields["alignment_rotation"] = alignment.rotation
